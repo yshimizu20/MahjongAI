@@ -15,6 +15,7 @@ from MahjongAI.decision import (
     ReachDecision,
     AgariDecision,
     PassDecision,
+    decision_mask,
 )
 from MahjongAI.turn import TsumoTurn, NakiTurn
 from MahjongAI.result import AgariResult, RyukyokuResult
@@ -241,14 +242,21 @@ def process(file_path: str, verbose: bool = False):
             elif eventtype[0] in ["D", "E", "F", "G"]:
                 player = ["D", "E", "F", "G"].index(eventtype[0])
                 assert curr_turn.player == player
+
                 tile = int(eventtype[1:])
                 tile_idx = TILE2IDX[tile]
                 assert hands[player, tile] == 1.0
+
                 hands[player, tile] = 0.0
+
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1
+
                 remaining_tiles_pov[player][tile_idx] += 1
                 curr_turn.discard = Discard(tile)
+                curr_turn.post_decisions = decision_mask(
+                    curr_turn, hand_tensors, tile_idx
+                )
                 turns.append(curr_turn)
                 curr_turn = None
 
