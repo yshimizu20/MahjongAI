@@ -1,38 +1,40 @@
-from MahjongAI.draw import Naki
 import numpy as np
+from MahjongAI.draw import Naki
 
 
 class Decision:
     NAKI = 1
     REACH = 2
     AGARI = 3
+    PASS = 4
 
-    def __init__(self, player: int):
+    def __init__(self, player: int, type_: int):
         self.player = player
+        self.type = type_
 
 
 class NakiDecision(Decision):
     def __init__(self, player: int, naki: Naki, executed: bool):
-        super().__init__(player)
+        super().__init__(player, Decision.NAKI)
         self.naki = naki
         self.executed = executed
 
 
 class ReachDecision(Decision):
     def __init__(self, player: int, executed: bool):
-        super().__init__(player)
+        super().__init__(player, Decision.REACH)
         self.executed = executed
 
 
 class AgariDecision(Decision):
     def __init__(self, player: int, executed: bool):
-        super().__init__(player)
+        super().__init__(player, Decision.AGARI)
         self.executed = executed
 
 
 class PassDecision(Decision):
     def __init__(self, player: int, executed: bool):
-        super().__init__(player)
+        super().__init__(player, Decision.PASS)
         self.executed = executed
 
 
@@ -132,6 +134,7 @@ def decision_mask(player, hand_tensor: np.ndarray, tile_idx: int):
         return _jihai_mask(player, hand_tensor, tile_idx)
     elif tile_idx % 9 in [0, 8]:
         return _one_and_nine_mask(player, hand_tensor, tile_idx)
-    else:
-        assert tile_idx % 9 in [1, 7]
+    elif tile_idx % 9 in [1, 7]:
         return _two_and_eight_mask(player, hand_tensor, tile_idx)
+    else:
+        raise ValueError("Invalid tile index")

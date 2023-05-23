@@ -7,7 +7,7 @@ class ShantenSolver:
         self.hand_tensor = hand_tensor
         self.n_melds = (14 - self.hand_tensor.sum()) // 3
         self.n_mentsu = self.n_melds + sum(self.hand_tensor[27:] >= 3.0)
-        self.n_tatsu = 0
+        self.n_taatsu = 0
         self.n_toitsu = sum(self.hand_tensor[27:] == 2.0)
         self.n_kuttsuki = 0
         self.best_shanten = 14
@@ -40,12 +40,12 @@ class ShantenSolver:
     def add_taatsu(self, idx: int, which: int):
         self.hand_tensor[idx : idx + 3] -= 1
         self.hand_tensor[idx + which] += 1
-        self.n_tatsu += 1
+        self.n_taatsu += 1
 
     def remove_taatsu(self, idx: int, which: int):
         self.hand_tensor[idx : idx + 3] += 1
         self.hand_tensor[idx + which] -= 1
-        self.n_tatsu -= 1
+        self.n_taatsu -= 1
 
     def add_kuttsuki(self, idx: int, tune: int):
         self.hand_tensor[idx] -= 1
@@ -67,9 +67,9 @@ class ShantenSolver:
 
         if idx == 27:
             shanten = min(
-                self.best_shanten, 8 - self.n_mentsu * 2 - self.n_tatsu - self.n_toitsu
+                self.best_shanten, 8 - self.n_mentsu * 2 - self.n_taatsu - self.n_toitsu
             )
-            potential_mentsu = max(0, self.n_toitsu - 1) + self.n_tatsu
+            potential_mentsu = max(0, self.n_toitsu - 1) + self.n_taatsu
             if potential_mentsu + self.n_mentsu > 4:
                 shanten += potential_mentsu + self.n_mentsu - 4
             if self.tune and not self.n_toitsu:

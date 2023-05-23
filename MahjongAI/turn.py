@@ -1,7 +1,7 @@
+from abc import abstractmethod
 from MahjongAI.draw import Draw, Naki, Tsumo
 from MahjongAI.discard import Discard
 from MahjongAI.state import StateObject
-from abc import abstractmethod
 
 
 class Turn:
