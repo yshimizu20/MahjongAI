@@ -244,7 +244,7 @@ def evaluate_tsumo(
 
     result: HandResponse = hand_calculator.estimate_hand_value(
         tiles=tiles,
-        win_tile=discarded_tile,
+        win_tile=tsumo_tile,
         melds=melds,
         dora_indicators=doras,
         config=config,
@@ -265,14 +265,14 @@ def hand_tensor2strs(hand_tensor):
     for i in range(0, 27, 9):
         lst = []
         for j in range(9):
-            lst += [j + 1] * hand_tensor[i + j]
+            lst += [j + 1] * int(hand_tensor[i + j])
         if hand_tensor[34 + i // 9]:
             lst.insert(0, 0)
         tile_strs.append("".join(list(map(str, lst))))
 
     lst = []
     for j in range(27, 34):
-        lst += [j + 1] * hand_tensor[j]
+        lst += [j - 26] * int(hand_tensor[j])
     tile_strs.append("".join(list(map(str, lst))))
 
     man, pin, sou, honors = tile_strs

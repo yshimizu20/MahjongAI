@@ -108,7 +108,7 @@ def process(file_path: str, verbose: bool = False):
         assert np.max(hands) == 1.0
 
         # needed to check furiten
-        sutehai_list = [np.zeros((4, 34), dtype=np.float32) for _ in range(4)]
+        sutehai_list = [np.zeros((34), dtype=np.float32) for _ in range(4)]
 
         curr_round, honba, kyotaku, _, _, dora = list(
             map(int, kyoku_info[0]["attr"]["seed"].split(","))
@@ -206,7 +206,7 @@ def process(file_path: str, verbose: bool = False):
                     ippatsu = [0] * 4
 
                 if naki.is_kakan():
-                    curr_turn.post_decisions = evaluate_ron(
+                    curr_turn.post_decisions += evaluate_ron(
                         player=player,
                         hand_tensors=hand_tensors,
                         naki_list=melds,
@@ -240,8 +240,7 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     hand_tensors=hand_tensors,
                     naki_list=melds,
-                    sutehai_list=sutehai_list,
-                    discarded_tile=tile,
+                    tsumo_tile=tile,
                     doras=doras,
                     reaches=reaches,
                     ippatsu=ippatsu,
@@ -249,12 +248,12 @@ def process(file_path: str, verbose: bool = False):
                     is_rinshan=False,
                     double_reaches=double_reaches,
                     is_tenhou=(
-                        remaining_tiles == 70
+                        remaining_tsumo == 70
                         and parent == player
                         and sum(list(map(len, melds))) == 0
                     ),
-                    is_chihou=(
-                        remaining_tiles == 70
+                    is_chiihou=(
+                        remaining_tsumo >= 66
                         and parent != player
                         and sum(list(map(len, melds))) == 0
                     ),
@@ -316,19 +315,16 @@ def process(file_path: str, verbose: bool = False):
 
                 remaining_tiles_pov[player][tile_idx] += 1
                 curr_turn.discard = Discard(tile)
-                curr_turn.post_decisions = decision_mask(
+                curr_turn.post_decisions += decision_mask(
                     curr_turn, hand_tensors, tile_idx
                 )
-                turns.append(curr_turn)
-                curr_turn = None
-
                 num_naki = sum(len(m) for m in melds)
                 curr_turn.post_decisions += evaluate_ron(
                     player=player,
                     hand_tensors=hand_tensors,
                     naki_list=melds,
                     sutehai_list=sutehai_list,
-                    discarded_tile=obtained,
+                    discarded_tile=tile,
                     doras=doras,
                     reaches=reaches,
                     ippatsu=ippatsu,
@@ -344,6 +340,9 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku=kyotaku,
                     honba=honba,
                 )
+
+                turns.append(curr_turn)
+                curr_turn = None
 
             else:
                 raise ValueError(f"Invalid event type: {eventtype}")
