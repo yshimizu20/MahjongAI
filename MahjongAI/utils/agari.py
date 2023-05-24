@@ -49,7 +49,7 @@ def evaluate_ron(
     is_chankan: bool,
     is_haitei: bool,
     double_reaches: List[int],
-    is_renhou: bool,
+    is_renhou: List[bool],
     player_wind: int,
     round_wind: int,
     kyotaku: int,
@@ -126,7 +126,7 @@ def evaluate_ron(
             is_haitei=is_haitei,
             is_houtei=False,
             is_daburu_riichi=double_reaches[p],
-            is_renhou=is_renhou,
+            is_renhou=is_renhou[p],
             player_wind=player_wind,
             round_wind=round_wind,
             kyoutaku_number=kyotaku,
@@ -147,6 +147,114 @@ def evaluate_ron(
 
         if result.error is None:
             decisions.append(AgariDecision(p, False))
+
+    return decisions
+
+
+def evaluate_tsumo(
+    player,
+    hand_tensors: List[np.ndarray],
+    naki_list: List[List[Naki]],
+    tsumo_tile: int,
+    doras: List[int],
+    reaches: List[int],
+    ippatsu: List[int],
+    is_haitei: bool,
+    is_rinshan: bool,
+    double_reaches: List[int],
+    is_tenhou: bool,
+    is_chiihou: bool,
+    player_wind: int,
+    round_wind: int,
+    kyotaku: int,
+    honba: int,
+    verbose: bool = False,
+):
+    decisions = []
+    tsumo_tile_idx = TILE2IDX[tsumo_tile]
+    hand_tensor = hand_tensors[player]
+
+    hand_tensor[tsumo_tile_idx] += 1
+    man, pin, sou, honors = hand_tensor2strs(hand_tensor)
+
+    tiles = TilesConverter.string_to_136_array(
+        man=man, pin=pin, sou=sou, honors=honors, has_aka_dora=True
+    )
+    nakis = naki_list[player]
+
+    melds = []
+    for naki in nakis:
+        if naki.is_chi():
+            color, number, _, has_red, *_ = naki.pattern_chi()
+            if has_red:
+                tile_lst = [(color * 9 + number + i) * 4 for i in range(3)]
+            else:
+                tile_lst = [(color * 9 + number + i) * 4 + 1 for i in range(3)]
+            meld = Meld(Meld.CHI, tiles=tile_lst)
+            melds.append(meld)
+
+        elif naki.is_pon():
+            color, number, _, has_red, *_ = naki.pattern_pon()
+            if has_red:
+                tile_lst = [(color * 9 + number) * 4 + i for i in range(3)]
+            else:
+                tile_lst = [(color * 9 + number) * 4 + i + 1 for i in range(3)]
+            meld = Meld(Meld.PON, tiles=tile_lst)
+            melds.append(meld)
+
+        elif naki.is_kakan():
+            color, number, _, has_red, *_ = naki.pattern_kakan()
+            tile_lst = [(color * 9 + number) * 4 + i for i in range(4)]
+            meld = Meld(Meld.SHOUMINKAN, tiles=tile_lst)
+            melds.append(meld)
+
+        elif naki.is_minkan():
+            color, number, _, has_red, *_ = naki.pattern_minkan()
+            tile_lst = [(color * 9 + number) * 4 + i for i in range(4)]
+            meld = Meld(Meld.KAN, tiles=tile_lst)
+            melds.append(meld)
+
+        elif naki.is_ankan():
+            color, number, _, has_red, *_ = naki.pattern_ankan()
+            tile_lst = [(color * 9 + number) * 4 + i for i in range(4)]
+            meld = Meld(Meld.KAN, tiles=tile_lst, opened=False)
+            melds.append(meld)
+
+        else:
+            raise ValueError("Unknown naki type")
+
+    config = HandConfig(
+        is_tsumo=True,
+        is_riichi=reaches[player],
+        is_ippatsu=ippatsu[player],
+        is_rinshan=is_rinshan,
+        is_chankan=False,
+        is_haitei=is_haitei,
+        is_houtei=False,
+        is_daburu_riichi=double_reaches[player],
+        is_tenhou=is_tenhou,
+        is_chiihou=is_chiihou,
+        is_renhou=False,
+        player_wind=player_wind,
+        round_wind=round_wind,
+        kyoutaku_number=kyotaku,
+        tsumi_number=honba,
+        options=OPTIONS,
+    )
+
+    result: HandResponse = hand_calculator.estimate_hand_value(
+        tiles=tiles,
+        win_tile=discarded_tile,
+        melds=melds,
+        dora_indicators=doras,
+        config=config,
+    )
+
+    if verbose:
+        print(result)
+
+    if result.error is None:
+        decisions.append(AgariDecision(player, False))
 
     return decisions
 
@@ -353,7 +461,7 @@ if __name__ == "__main__":
     is_chankan = False
     is_haitei = False
     double_reaches = [0, 0, 0, 0]
-    is_renhou = False
+    is_renhou = [False] * 4
     player_wind = 2
     round_wind = 0
     kyotaku = 1

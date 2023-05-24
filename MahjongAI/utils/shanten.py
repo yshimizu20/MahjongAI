@@ -1,4 +1,8 @@
 import numpy as np
+import sys
+
+sys.path.append("../../")
+
 from MahjongAI.utils.constants import YAOCHU_TENSOR
 
 
@@ -142,3 +146,54 @@ class ShantenSolver:
         self.solve_kokushi()
 
         return self.best_shanten
+
+
+if __name__ == "__main__":
+    hand_tensor = np.array(
+        [
+            0,
+            2,
+            2,
+            0,
+            2,
+            2,
+            2,
+            2,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+    )
+
+    shanten_solver = ShantenSolver()
+    shanten_solver._init(hand_tensor)
+    shanten = shanten_solver.solve()
+    print(f"Shanten: {shanten}")
+
+    print(hand_tensor)

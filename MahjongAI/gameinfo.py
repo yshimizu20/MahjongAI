@@ -38,6 +38,8 @@ class RoundInfo:
         self.parent_rounds_remaining = [
             (self.remaining_rounds + i) // 4 for i in range(4)
         ]
+        self.player_wind = curr_round % 4
+        self.round_wind = curr_round // 4
 
     def __repr__(self):
         return f"RoundInfo: gameinfo={self.gameinfo}, remaining_rounds={self.remaining_rounds}, parent_rounds_remaining={self.parent_rounds_remaining}"

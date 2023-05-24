@@ -19,11 +19,17 @@ class NakiDecision(Decision):
         self.naki = naki
         self.executed = executed
 
+    def __repr__(self) -> str:
+        return f"NakiDecision: player={self.player}, naki={self.naki}, executed={self.executed}"
+
 
 class ReachDecision(Decision):
     def __init__(self, player: int, executed: bool):
         super().__init__(player, Decision.REACH)
         self.executed = executed
+
+    def __repr__(self) -> str:
+        return f"ReachDecision: player={self.player}, executed={self.executed}"
 
 
 class AgariDecision(Decision):
@@ -31,11 +37,17 @@ class AgariDecision(Decision):
         super().__init__(player, Decision.AGARI)
         self.executed = executed
 
+    def __repr__(self) -> str:
+        return f"AgariDecision: player={self.player}, executed={self.executed}"
+
 
 class PassDecision(Decision):
     def __init__(self, player: int, executed: bool):
         super().__init__(player, Decision.PASS)
         self.executed = executed
+
+    def __repr__(self) -> str:
+        return f"PassDecision: player={self.player}, executed={self.executed}"
 
 
 def _one_and_nine_mask(

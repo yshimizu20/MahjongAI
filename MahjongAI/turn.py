@@ -21,6 +21,8 @@ class Turn:
         self.draw = draw
         self.stateObj = stateObj
         self.discard = discard
+        self.pre_decisions = []
+        self.post_decisions = []
 
     @abstractmethod
     def is_tsumogiri(self):
@@ -37,8 +39,6 @@ class TsumoTurn(Turn):
         discard: Discard = None,
     ):
         super().__init__(player, Turn.TSUMO, draw, stateObj, discard)
-        self.pre_decisions = []
-        self.post_decisions = []
 
     def is_tsumogiri(self):
         super().is_tsumogiri()
@@ -54,7 +54,6 @@ class NakiTurn(Turn):
         discard: Discard = None,
     ):
         super().__init__(player, Turn.NAKI, naki, stateObj, discard)
-        self.post_decisions = []
 
     def is_tsumogiri(self):
         super().is_tsumogiri()

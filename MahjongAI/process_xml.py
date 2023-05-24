@@ -6,6 +6,7 @@ sys.path.append("..")
 
 from MahjongAI.gameinfo import GameInfo, RoundInfo
 from MahjongAI.utils.constants import REMAINING_TILES, REMAINING_TSUMO, TILE2IDX
+from MahjongAI.utils.agari import evaluate_ron, evaluate_tsumo
 from MahjongAI.utils.shanten import ShantenSolver
 from MahjongAI.draw import Naki, Tsumo
 from MahjongAI.discard import Discard
@@ -77,6 +78,7 @@ def process(file_path: str, verbose: bool = False):
         remaining_tiles = REMAINING_TILES.copy()
         remaining_tiles_pov = [REMAINING_TILES.copy() for _ in range(4)]
         remaining_tsumo = REMAINING_TSUMO
+
         scores = kyoku_info[0]["attr"]["ten"].split(",")
         scores = [int(score) for score in scores]
         parent = kyoku_info[0]["attr"]["oya"]
@@ -105,6 +107,9 @@ def process(file_path: str, verbose: bool = False):
         assert np.allclose(hands.sum(axis=1), [13.0, 13.0, 13.0, 13.0])
         assert np.max(hands) == 1.0
 
+        # needed to check furiten
+        sutehai_list = [np.zeros((4, 34), dtype=np.float32) for _ in range(4)]
+
         curr_round, honba, kyotaku, _, _, dora = list(
             map(int, kyoku_info[0]["attr"]["seed"].split(","))
         )
@@ -130,7 +135,9 @@ def process(file_path: str, verbose: bool = False):
 
         assert sum(remaining_tiles) == 83
 
+        double_reaches = [0] * 4  # TODO: check double reach
         reaches = [0] * 4
+        ippatsu = [0] * 4
         melds = [[] for _ in range(4)]
         turns = []
         is_menzen = [True] * 4
@@ -159,6 +166,9 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku += 1
                     scores = scores.copy()
                     scores[player] -= 1000
+
+                ippatsu = ippatsu[:]
+                ippatsu[player] = 1
 
             elif eventtype == "N":
                 naki = Naki(int(event["attr"]["m"]))
@@ -192,6 +202,28 @@ def process(file_path: str, verbose: bool = False):
                 curr_turn = NakiTurn(player=player, naki=naki, stateObj=stateObj)
                 if naki.from_who() != 0:
                     is_menzen[player] = False
+                if sum(ippatsu):
+                    ippatsu = [0] * 4
+
+                if naki.is_kakan():
+                    curr_turn.post_decisions = evaluate_ron(
+                        player=player,
+                        hand_tensors=hand_tensors,
+                        naki_list=melds,
+                        sutehai_list=sutehai_list,
+                        discarded_tile=obtained,
+                        doras=doras,
+                        reaches=reaches,
+                        ippatsu=ippatsu,
+                        is_chankan=True,
+                        is_haitei=False,
+                        double_reaches=double_reaches,
+                        is_renhou=False,
+                        player_wind=roundinfo.player_wind,
+                        round_wind=roundinfo.round_wind,
+                        kyotaku=kyotaku,
+                        honba=honba,
+                    )
 
             elif eventtype[0] in ["T", "U", "V", "W"]:
                 player = ["T", "U", "V", "W"].index(eventtype[0])
@@ -204,6 +236,33 @@ def process(file_path: str, verbose: bool = False):
                 hands[player, tile] = 1.0
 
                 pre_decisions = [PassDecision(player, executed=False)]
+                pre_decisions += evaluate_tsumo(
+                    player=player,
+                    hand_tensors=hand_tensors,
+                    naki_list=melds,
+                    sutehai_list=sutehai_list,
+                    discarded_tile=tile,
+                    doras=doras,
+                    reaches=reaches,
+                    ippatsu=ippatsu,
+                    is_haitei=(remaining_tsumo == 0),
+                    is_rinshan=False,
+                    double_reaches=double_reaches,
+                    is_tenhou=(
+                        remaining_tiles == 70
+                        and parent == player
+                        and sum(list(map(len, melds))) == 0
+                    ),
+                    is_chihou=(
+                        remaining_tiles == 70
+                        and parent != player
+                        and sum(list(map(len, melds))) == 0
+                    ),
+                    player_wind=roundinfo.player_wind,
+                    round_wind=roundinfo.round_wind,
+                    kyotaku=kyotaku,
+                    honba=honba,
+                )
                 # check if ankan or kakan is possible
                 if np.any(hands[player] == 4.0):
                     pre_decisions.append(
@@ -238,6 +297,8 @@ def process(file_path: str, verbose: bool = False):
                     player=player, draw=Tsumo(tile), stateObj=stateObj
                 )
                 curr_turn.pre_decisions = pre_decisions
+                if sum(ippatsu):
+                    ippatsu = [0] * 4
 
             elif eventtype[0] in ["D", "E", "F", "G"]:
                 player = ["D", "E", "F", "G"].index(eventtype[0])
@@ -248,6 +309,7 @@ def process(file_path: str, verbose: bool = False):
                 assert hands[player, tile] == 1.0
 
                 hands[player, tile] = 0.0
+                sutehai_list[player][tile // 4] += 1.0
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1
@@ -259,6 +321,29 @@ def process(file_path: str, verbose: bool = False):
                 )
                 turns.append(curr_turn)
                 curr_turn = None
+
+                num_naki = sum(len(m) for m in melds)
+                curr_turn.post_decisions += evaluate_ron(
+                    player=player,
+                    hand_tensors=hand_tensors,
+                    naki_list=melds,
+                    sutehai_list=sutehai_list,
+                    discarded_tile=obtained,
+                    doras=doras,
+                    reaches=reaches,
+                    ippatsu=ippatsu,
+                    is_chankan=False,
+                    is_haitei=(remaining_tsumo == 0),
+                    double_reaches=double_reaches,
+                    is_renhou=[
+                        remaining_tsumo + i - 68 >= 0 and num_naki == 0
+                        for i in range(4)
+                    ],
+                    player_wind=roundinfo.player_wind,
+                    round_wind=roundinfo.round_wind,
+                    kyotaku=kyotaku,
+                    honba=honba,
+                )
 
             else:
                 raise ValueError(f"Invalid event type: {eventtype}")
