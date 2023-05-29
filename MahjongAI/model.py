@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-ENCODER_EMBD_DIM = 1024
-DECODER_STATE_OBJ_DIM = [(37, 3), (4, 6), (1, 4)]
+ENCODER_EMBD_DIM = 5000  # leave some margin for now
+DECODER_STATE_OBJ_DIM = [(37, 3), (4, 7), (1, 4)]
 DECODER_EMBD_DIM = 1024
 DISCARD_ACTION_DIM = 37
 REACH_ACTION_DIM = 2
@@ -133,13 +133,16 @@ class StateNet(nn.Module):
         self.norm1_1 = nn.BatchNorm2d(8)
         self.conv1_2 = nn.Conv2d(8, 8, 3, padding=1)
         self.norm1_2 = nn.BatchNorm2d(8)
-        self.fc1 = nn.Linear(DECODER_STATE_OBJ_DIM[0] * 8, 64)
+        self.fc1 = nn.Linear(DECODER_STATE_OBJ_DIM[0][0] * 8, 64)
 
         self.conv2_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[1][1], 8, 3, padding=1)
         self.norm2_1 = nn.BatchNorm2d(8)
         self.fc2 = nn.Linear(DECODER_STATE_OBJ_DIM[1][0] * 8, 16)
 
-        self.fc = nn.Linear(64 + 16 + DECODER_STATE_OBJ_DIM[2][0], EMBD_SIZE)
+        self.fc = nn.Linear(
+            64 + 16 + DECODER_STATE_OBJ_DIM[2][0] * DECODER_STATE_OBJ_DIM[2][1],
+            EMBD_SIZE,
+        )
 
     def forward(self, state_obj):
         x1, x2, x3 = state_obj
@@ -200,6 +203,7 @@ class Decoder(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, n_layers=N_LAYERS):
         super().__init__()
+        # TODO: replace embedding with neural network (keep position embedding table)
         self.token_embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
         self.position_embedding_table = nn.Embedding(MAX_ACTION_LEN, EMBD_SIZE)
         self.blocks = nn.Sequential(

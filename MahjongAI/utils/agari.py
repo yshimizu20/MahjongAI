@@ -39,7 +39,7 @@ hand_calculator = HandCalculator()
 
 def evaluate_ron(
     player,
-    hand_tensors: List[np.ndarray],
+    hand_tensors_full: List[np.ndarray],
     naki_list: List[List[Naki]],
     sutehai_tensor: np.ndarray,
     discarded_tile: int,
@@ -59,18 +59,30 @@ def evaluate_ron(
     decisions = []
     discarded_tile_idx = TILE2IDX[discarded_tile]
 
-    for p, (hand_tensor, nakis) in enumerate(zip(hand_tensors, naki_list)):
+    for p, (hand_tensor, nakis) in enumerate(zip(hand_tensors_full, naki_list)):
         if p == player:
             continue
 
         # check for furiten
-        if sutehai_tensor[p, discarded_tile_idx]:
+        if (
+            sutehai_tensor[p, discarded_tile_idx]
+            or (
+                discarded_tile_idx < 27
+                and discarded_tile_idx % 9 == 4
+                and sutehai_tensor[p, 34 + discarded_tile_idx // 9]
+            )
+            or (
+                discarded_tile_idx >= 34
+                and sutehai_tensor[p, (discarded_tile_idx - 34) * 9 + 4]
+            )
+        ):
             if verbose:
                 print(f"Player {p} is furiten")
             continue
 
         hand_tensor[discarded_tile_idx] += 1
         man, pin, sou, honors = hand_tensor2strs(hand_tensor)
+        hand_tensor[discarded_tile_idx] -= 1
 
         tiles = TilesConverter.string_to_136_array(
             man=man, pin=pin, sou=sou, honors=honors, has_aka_dora=True
@@ -134,6 +146,7 @@ def evaluate_ron(
             options=OPTIONS,
         )
 
+        # TODO: use Agari.is_ageri instead for better performance
         result: HandResponse = hand_calculator.estimate_hand_value(
             tiles=tiles,
             win_tile=discarded_tile,
@@ -153,7 +166,7 @@ def evaluate_ron(
 
 def evaluate_tsumo(
     player,
-    hand_tensors: List[np.ndarray],
+    hand_tensors_full: List[np.ndarray],
     naki_list: List[List[Naki]],
     tsumo_tile: int,
     doras: List[int],
@@ -171,10 +184,8 @@ def evaluate_tsumo(
     verbose: bool = False,
 ):
     decisions = []
-    tsumo_tile_idx = TILE2IDX[tsumo_tile]
-    hand_tensor = hand_tensors[player]
+    hand_tensor = hand_tensors_full[player]
 
-    hand_tensor[tsumo_tile_idx] += 1
     man, pin, sou, honors = hand_tensor2strs(hand_tensor)
 
     tiles = TilesConverter.string_to_136_array(
@@ -280,7 +291,7 @@ def hand_tensor2strs(hand_tensor):
 
 
 if __name__ == "__main__":
-    hand_tensors = [
+    hand_tensors_full = [
         np.array(
             [
                 1,
@@ -447,7 +458,7 @@ if __name__ == "__main__":
         ),
     ]
     naki_list = [[], [], [], []]
-    sutehai_tensor = np.zeros((4, 34))
+    sutehai_tensor = np.zeros((4, 37))
     sutehai_tensor[3, 7] = 1  # furiten
     discarded_tile = 28
     doras = [50]
@@ -464,7 +475,7 @@ if __name__ == "__main__":
 
     decisions = evaluate_ron(
         2,
-        hand_tensors,
+        hand_tensors_full,
         naki_list,
         sutehai_tensor,
         discarded_tile,

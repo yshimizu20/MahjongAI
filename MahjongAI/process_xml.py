@@ -1,13 +1,14 @@
 import sys
 import xml.etree.ElementTree as ET
 import numpy as np
+import copy
+from mahjong.shanten import Shanten
 
 sys.path.append("..")
 
 from MahjongAI.gameinfo import GameInfo, RoundInfo
-from MahjongAI.utils.constants import REMAINING_TILES, REMAINING_TSUMO, TILE2IDX
+from MahjongAI.utils.constants import *
 from MahjongAI.utils.agari import evaluate_ron, evaluate_tsumo
-from MahjongAI.utils.shanten import ShantenSolver
 from MahjongAI.draw import Naki, Tsumo
 from MahjongAI.discard import Discard
 from MahjongAI.state import StateObject
@@ -75,6 +76,8 @@ def process(file_path: str, verbose: bool = False):
     for kyoku_info in rounds:
         assert kyoku_info[0]["event"] == "INIT"
 
+        enc_indices = []
+
         remaining_tiles = REMAINING_TILES.copy()
         remaining_tiles_pov = [REMAINING_TILES.copy() for _ in range(4)]
         remaining_tsumo = REMAINING_TSUMO
@@ -100,6 +103,7 @@ def process(file_path: str, verbose: bool = False):
             pov[idx] -= count
             remaining_tiles[idx] -= count
         assert list(map(np.sum, hand_tensors)) == [13.0, 13.0, 13.0, 13.0]
+        hand_tensors_full = copy.deepcopy(hand_tensors)
 
         hands = np.zeros((4, 136), dtype=np.float32)
         player_indices = np.arange(4)[:, np.newaxis]
@@ -108,7 +112,7 @@ def process(file_path: str, verbose: bool = False):
         assert np.max(hands) == 1.0
 
         # needed to check furiten
-        sutehai_tensor = np.zeros((4, 34), dtype=np.float32)
+        sutehai_tensor = np.zeros((4, 37), dtype=np.float32)
 
         curr_round, honba, kyotaku, _, _, dora = list(
             map(int, kyoku_info[0]["attr"]["seed"].split(","))
@@ -135,24 +139,34 @@ def process(file_path: str, verbose: bool = False):
 
         assert sum(remaining_tiles) == 83
 
-        double_reaches = [0] * 4  # TODO: check double reach
+        double_reaches = [0] * 4
         reaches = [0] * 4
         ippatsu = [0] * 4
         melds = [[] for _ in range(4)]
         turns = []
         is_menzen = [True] * 4
         curr_turn = None
-        shanten_solver = ShantenSolver()
+        # shanten_solver = ShantenSolver()
+        shanten_solver = Shanten()
+
+        jjj = 0
 
         for event in kyoku_info[1:-1]:
+            jjj += 1
             eventtype = event["event"]
+            print(jjj, eventtype)
 
             if eventtype == "DORA":
-                doras = doras[:] + [int(event["attr"]["hai"])]
-                remaining_tiles[TILE2IDX[int(event["attr"]["hai"])]] -= 1
+                tile = int(event["attr"]["hai"])
+                tile_idx = TILE2IDX[tile]
+                doras = doras[:] + [tile]
+                remaining_tiles[tile_idx] -= 1
                 for pov in remaining_tiles_pov:
-                    pov[TILE2IDX[int(dora)]] -= 1
+                    pov[tile_idx] -= 1
                 remaining_tsumo -= 1
+
+                enc_idx = new_dora2idx(tile_idx)
+                enc_indices.append(enc_idx)
 
             elif eventtype == "REACH":
                 player = int(event["attr"]["who"])
@@ -166,11 +180,22 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku += 1
                     scores = scores.copy()
                     scores[player] -= 1000
+                    if (
+                        remaining_tsumo >= 66
+                        and parent != player
+                        and sum(list(map(len, melds))) == 0
+                    ):
+                        double_reaches = double_reaches[:]
+                        double_reaches[player] = 1
 
                 ippatsu = ippatsu[:]
                 ippatsu[player] = 1
 
+                enc_idx = reach2idx(player)
+                enc_indices.append(enc_idx)
+
             elif eventtype == "N":
+                # TODO: change executed to True
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
                 melds[player] = melds[player][:] + [naki]
@@ -187,6 +212,8 @@ def process(file_path: str, verbose: bool = False):
                 for e in exposed:
                     assert hands[player, e] == 1.0
                     hands[player, e] -= 1.0
+                    hand_tensors[player][TILE2IDX[e]] -= 1.0
+                hand_tensors_full[player][TILE2IDX[obtained]] += 1.0
                 stateObj = StateObject(
                     remaining_turns=remaining_tsumo,
                     hand_tensor=hand_tensors[player],
@@ -226,6 +253,9 @@ def process(file_path: str, verbose: bool = False):
                         honba=honba,
                     )
 
+                enc_idx = naki2idx(player, naki)
+                enc_indices.append(enc_idx)
+
             elif eventtype[0] in ["T", "U", "V", "W"]:
                 player = ["T", "U", "V", "W"].index(eventtype[0])
                 tile = int(eventtype[1:])
@@ -235,11 +265,16 @@ def process(file_path: str, verbose: bool = False):
                 remaining_tsumo -= 1
                 assert hands[player, tile] == 0.0
                 hands[player, tile] = 1.0
+                hand_tensors[player][tile_idx] += 1.0
+                hand_tensors_full[player][tile_idx] += 1.0
+                assert int(hand_tensors[player].sum()) % 3 == 2, hand_tensors[
+                    player
+                ].sum()
 
                 pre_decisions = [PassDecision(player, executed=False)]
                 pre_decisions += evaluate_tsumo(
                     player=player,
-                    hand_tensors=hand_tensors,
+                    hand_tensors_full=hand_tensors_full,
                     naki_list=melds,
                     tsumo_tile=tile,
                     doras=doras,
@@ -276,8 +311,9 @@ def process(file_path: str, verbose: bool = False):
                                 NakiDecision(player, Naki(0), executed=False)
                             )  # TODO: calculate naki code
                 if not reaches[player] and is_menzen[player]:
-                    shanten_solver._init(hand_tensors[player])
-                    shanten = shanten_solver.solve()
+                    shanten = shanten_solver.calculate_shanten(
+                        hand_tensors[player]
+                    )
                     if shanten <= 0:
                         pre_decisions.append(ReachDecision(player, executed=False))
 
@@ -310,7 +346,12 @@ def process(file_path: str, verbose: bool = False):
                 assert hands[player, tile] == 1.0
 
                 hands[player, tile] = 0.0
-                sutehai_tensor[player, tile // 4] += 1.0
+                hand_tensors[player][tile_idx] -= 1.0
+                hand_tensors_full[player][tile_idx] -= 1.0
+                assert int(hand_tensors[player].sum()) % 3 == 1, hand_tensors[
+                    player
+                ].sum()
+                sutehai_tensor[player, tile_idx] += 1.0
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1
@@ -323,7 +364,7 @@ def process(file_path: str, verbose: bool = False):
                 num_naki = sum(len(m) for m in melds)
                 curr_turn.post_decisions += evaluate_ron(
                     player=player,
-                    hand_tensors=hand_tensors,
+                    hand_tensors_full=hand_tensors_full,
                     naki_list=melds,
                     sutehai_tensor=sutehai_tensor,
                     discarded_tile=tile,
@@ -342,6 +383,9 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku=kyotaku,
                     honba=honba,
                 )
+
+                enc_idx = discard2idx(player, tile_idx, curr_turn.is_tsumogiri())
+                enc_indices.append(enc_idx)
 
                 turns.append(curr_turn)
                 curr_turn = None
@@ -368,6 +412,59 @@ def process(file_path: str, verbose: bool = False):
         assert sum([1 for rem in remaining_tiles_pov for r in rem if r < 0]) == 0
 
 
+NAKI_IDX_START = 37 * 4 * 2
+CHI_IDX_START = NAKI_IDX_START
+PON_IDX_START = CHI_IDX_START + 4 * 3 * 3 * 7 * 3 * 2
+KAKAN_IDX_START = PON_IDX_START + 4 * 3 * 4 * 9 * 2
+MINKAN_IDX_START = KAKAN_IDX_START + 4 * 4 * 9 * 2
+ANKAN_IDX_START = MINKAN_IDX_START + 4 * 3 * 4 * 9 * 2
+REACH_IDX_START = ANKAN_IDX_START + 4 * 4 * 9 * 2
+NEW_DORA_IDX_START = REACH_IDX_START + 4  # 4116
+
+
+def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
+    return (who * 37 + tile_idx) * 2 + int(is_tsumogiri)
+
+
+def naki2idx(who: int, naki: Naki):
+    from_who = naki.from_who()
+    if naki.is_chi():
+        color, number, which, has_red, *_ = naki.pattern_chi()
+        return NAKI_IDX_START + (
+            ((((who * 3 + from_who) * 3 + color) * 7 + number) * 3 + which) * 2
+            + int(has_red)
+        )
+    elif naki.is_pon():
+        color, number, _, has_red, *_ = naki.pattern_pon()
+        return PON_IDX_START + (
+            (((who * 3 + from_who) * 4 + color) * 9 + number) * 2 + int(has_red)
+        )
+    elif naki.is_kakan():
+        color, number, _, has_red, *_ = naki.pattern_kakan()
+        return KAKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
+    elif naki.is_minkan():
+        color, number, _, has_red, *_ = naki.pattern_minkan()
+        return MINKAN_IDX_START + (
+            (((who * 3 + from_who) * 4 + color) * 9 + number) * 2 + int(has_red)
+        )
+    elif naki.is_ankan():
+        color, number, _, has_red, *_ = naki.pattern_ankan()
+        return ANKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
+    else:
+        raise ValueError("Invalid naki code")
+
+
+def reach2idx(who: int):
+    return REACH_IDX_START + who
+
+
+def new_dora2idx(tile_idx: int):
+    return NEW_DORA_IDX_START + tile_idx
+
+
 if __name__ == "__main__":
-    file_path = "data/sample_haifu.xml"
+    import cProfile
+
+    file_path = "data/sample/sample_haifu.xml"
+    # cProfile.run("process(file_path, verbose=True)", sort="tottime")
     process(file_path, verbose=True)
