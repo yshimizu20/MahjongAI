@@ -108,7 +108,7 @@ def process(file_path: str, verbose: bool = False):
         assert np.max(hands) == 1.0
 
         # needed to check furiten
-        sutehai_list = [np.zeros((34), dtype=np.float32) for _ in range(4)]
+        sutehai_tensor = np.zeros((4, 34), dtype=np.float32)
 
         curr_round, honba, kyotaku, _, _, dora = list(
             map(int, kyoku_info[0]["attr"]["seed"].split(","))
@@ -192,6 +192,7 @@ def process(file_path: str, verbose: bool = False):
                     hand_tensor=hand_tensors[player],
                     remaining_tiles=remaining_tiles,
                     remaining_tiles_pov=remaining_tiles_pov[player],
+                    sutehai_tensor=sutehai_tensor[player],
                     reaches=reaches,  # share same reach list
                     melds=melds,
                     scores=scores,
@@ -210,7 +211,7 @@ def process(file_path: str, verbose: bool = False):
                         player=player,
                         hand_tensors=hand_tensors,
                         naki_list=melds,
-                        sutehai_list=sutehai_list,
+                        sutehai_tensor=sutehai_tensor,
                         discarded_tile=obtained,
                         doras=doras,
                         reaches=reaches,
@@ -285,6 +286,7 @@ def process(file_path: str, verbose: bool = False):
                     hand_tensor=hand_tensors[player],
                     remaining_tiles=remaining_tiles,
                     remaining_tiles_pov=remaining_tiles_pov[player],
+                    sutehai_tensor=sutehai_tensor[player],
                     reaches=reaches,  # share same reach list
                     melds=melds,
                     scores=scores,
@@ -308,7 +310,7 @@ def process(file_path: str, verbose: bool = False):
                 assert hands[player, tile] == 1.0
 
                 hands[player, tile] = 0.0
-                sutehai_list[player][tile // 4] += 1.0
+                sutehai_tensor[player, tile // 4] += 1.0
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1
@@ -323,7 +325,7 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     hand_tensors=hand_tensors,
                     naki_list=melds,
-                    sutehai_list=sutehai_list,
+                    sutehai_tensor=sutehai_tensor,
                     discarded_tile=tile,
                     doras=doras,
                     reaches=reaches,

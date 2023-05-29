@@ -41,7 +41,7 @@ def evaluate_ron(
     player,
     hand_tensors: List[np.ndarray],
     naki_list: List[List[Naki]],
-    sutehai_list: List[np.ndarray],
+    sutehai_tensor: np.ndarray,
     discarded_tile: int,
     doras: List[int],
     reaches: List[int],
@@ -64,7 +64,7 @@ def evaluate_ron(
             continue
 
         # check for furiten
-        if sutehai_list[p][discarded_tile_idx]:
+        if sutehai_tensor[p, discarded_tile_idx]:
             if verbose:
                 print(f"Player {p} is furiten")
             continue
@@ -447,13 +447,8 @@ if __name__ == "__main__":
         ),
     ]
     naki_list = [[], [], [], []]
-    sutehai_list = [
-        np.zeros(34),
-        np.zeros(34),
-        np.zeros(34),
-        np.zeros(34),
-    ]
-    sutehai_list[3][7] = 1  # furiten
+    sutehai_tensor = np.zeros((4, 34))
+    sutehai_tensor[3, 7] = 1  # furiten
     discarded_tile = 28
     doras = [50]
     reaches = [0, 0, 1, 1]
@@ -471,7 +466,7 @@ if __name__ == "__main__":
         2,
         hand_tensors,
         naki_list,
-        sutehai_list,
+        sutehai_tensor,
         discarded_tile,
         doras,
         reaches,

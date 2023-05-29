@@ -10,6 +10,7 @@ class StateObject:
         hand_tensor: List[int],
         remaining_tiles: np.ndarray,
         remaining_tiles_pov: np.ndarray,
+        sutehai_tensor: np.ndarray,
         reaches: List[int],
         melds: List[List[Naki]],
         scores: List[int],
@@ -21,6 +22,7 @@ class StateObject:
         self.hand_tensor = hand_tensor
         self.remaining_tiles = remaining_tiles
         self.remaining_tiles_pov = remaining_tiles_pov
+        self.sutehai_tensor = sutehai_tensor
         self.reaches = reaches
         self.melds = melds
         self.scores = scores
