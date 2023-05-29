@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 
 ENCODER_EMBD_DIM = 1024
-DECODER_STATE_OBJ_DIM = (37, 28)
+DECODER_STATE_OBJ_DIM = [(37, 3), (4, 6), (1, 4)]
 DECODER_EMBD_DIM = 1024
 DISCARD_ACTION_DIM = 37
 REACH_ACTION_DIM = 2
@@ -57,7 +57,6 @@ class Head(nn.Module):
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
 
-        # perform the weighted aggregation of the values
         v = self.value(v)
         out = wei @ v
         return out
@@ -130,17 +129,32 @@ class EncoderBlock(nn.Module):
 class StateNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[1], 16, 3, padding=1)
-        self.norm1 = nn.BatchNorm2d(16)
-        self.conv2 = nn.Conv2d(16, 16, 3, padding=1)
-        self.norm2 = nn.BatchNorm2d(16)
-        self.lm = nn.Linear(DECODER_STATE_OBJ_DIM[0] * 16, EMBD_SIZE)
+        self.conv1_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[0][1], 8, 3, padding=1)
+        self.norm1_1 = nn.BatchNorm2d(8)
+        self.conv1_2 = nn.Conv2d(8, 8, 3, padding=1)
+        self.norm1_2 = nn.BatchNorm2d(8)
+        self.fc1 = nn.Linear(DECODER_STATE_OBJ_DIM[0] * 8, 64)
 
-    def forward(self, x):
-        x = F.relu(self.norm1(self.conv1(x)))
-        x = F.relu(self.norm2(self.conv2(x)))
-        x = x.view(x.shape[0], -1)
-        x = self.lm(x)
+        self.conv2_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[1][1], 8, 3, padding=1)
+        self.norm2_1 = nn.BatchNorm2d(8)
+        self.fc2 = nn.Linear(DECODER_STATE_OBJ_DIM[1][0] * 8, 16)
+
+        self.fc = nn.Linear(64 + 16 + DECODER_STATE_OBJ_DIM[2][0], EMBD_SIZE)
+
+    def forward(self, state_obj):
+        x1, x2, x3 = state_obj
+
+        x1 = F.relu(self.norm1_1(self.conv1_1(x1)))
+        x1 = F.relu(self.norm1_2(self.conv1_2(x1)))
+        x1 = x1.view(x1.shape[0], -1)
+        x1 = F.relu(self.fc1(x1))
+
+        x2 = F.relu(self.norm2_1(self.conv2_1(x2)))
+        x2 = x2.view(x2.shape[0], -1)
+        x2 = F.relu(self.fc2(x2))
+
+        x = torch.cat([x1, x2, x3], dim=-1)
+        x = F.relu(self.fc(x))
         return x
 
 
