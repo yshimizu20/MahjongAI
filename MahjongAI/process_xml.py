@@ -146,15 +146,10 @@ def process(file_path: str, verbose: bool = False):
         turns = []
         is_menzen = [True] * 4
         curr_turn = None
-        # shanten_solver = ShantenSolver()
         shanten_solver = Shanten()
 
-        jjj = 0
-
         for event in kyoku_info[1:-1]:
-            jjj += 1
             eventtype = event["event"]
-            print(jjj, eventtype)
 
             if eventtype == "DORA":
                 tile = int(event["attr"]["hai"])
@@ -299,10 +294,10 @@ def process(file_path: str, verbose: bool = False):
                     honba=honba,
                 )
                 # check if ankan or kakan is possible
-                if np.any(hands[player] == 4.0):
+                for i in np.where(hand_tensors[player] == 4.0)[0]:
                     pre_decisions.append(
                         NakiDecision(player, Naki(0), executed=False)
-                    )  # TODO: calculate naki code # TODO: multiple ankan chances?
+                    )  # TODO: calculate naki code
                 for meld in melds[player]:
                     if meld.is_pon():
                         color, number, which, *_ = meld.pattern_pon()
@@ -326,7 +321,7 @@ def process(file_path: str, verbose: bool = False):
                     scores=scores,
                     kyotaku=kyotaku,
                     honba=honba,
-                    dora=doras,  # share same reach list
+                    dora=doras,  # share same dora list
                 )
                 curr_turn = TsumoTurn(
                     player=player, draw=Tsumo(tile), stateObj=stateObj
@@ -461,7 +456,7 @@ def new_dora2idx(tile_idx: int):
 
 
 if __name__ == "__main__":
-    import cProfile
+    # import cProfile
 
     file_path = "data/sample/sample_haifu.xml"
     # cProfile.run("process(file_path, verbose=True)", sort="tottime")

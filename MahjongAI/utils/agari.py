@@ -146,7 +146,7 @@ def evaluate_ron(
             options=OPTIONS,
         )
 
-        # TODO: use Agari.is_ageri instead for better performance
+        # TODO: use Agari.is_agari instead for better performance
         result: HandResponse = hand_calculator.estimate_hand_value(
             tiles=tiles,
             win_tile=discarded_tile,
