@@ -311,9 +311,7 @@ def process(file_path: str, verbose: bool = False):
                                 NakiDecision(player, Naki(0), executed=False)
                             )  # TODO: calculate naki code
                 if not reaches[player] and is_menzen[player]:
-                    shanten = shanten_solver.calculate_shanten(
-                        hand_tensors[player]
-                    )
+                    shanten = shanten_solver.calculate_shanten(hand_tensors[player])
                     if shanten <= 0:
                         pre_decisions.append(ReachDecision(player, executed=False))
 
@@ -431,13 +429,13 @@ def naki2idx(who: int, naki: Naki):
     if naki.is_chi():
         color, number, which, has_red, *_ = naki.pattern_chi()
         return NAKI_IDX_START + (
-            ((((who * 3 + from_who) * 3 + color) * 7 + number) * 3 + which) * 2
+            ((((who * 3 + from_who - 1) * 3 + color) * 7 + number) * 3 + which) * 2
             + int(has_red)
         )
     elif naki.is_pon():
         color, number, _, has_red, *_ = naki.pattern_pon()
         return PON_IDX_START + (
-            (((who * 3 + from_who) * 4 + color) * 9 + number) * 2 + int(has_red)
+            (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
         )
     elif naki.is_kakan():
         color, number, _, has_red, *_ = naki.pattern_kakan()
@@ -445,7 +443,7 @@ def naki2idx(who: int, naki: Naki):
     elif naki.is_minkan():
         color, number, _, has_red, *_ = naki.pattern_minkan()
         return MINKAN_IDX_START + (
-            (((who * 3 + from_who) * 4 + color) * 9 + number) * 2 + int(has_red)
+            (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
         )
     elif naki.is_ankan():
         color, number, _, has_red, *_ = naki.pattern_ankan()
