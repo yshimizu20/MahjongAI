@@ -23,6 +23,9 @@ from MahjongAI.turn import TsumoTurn, NakiTurn
 from MahjongAI.result import AgariResult, RyukyokuResult
 
 
+shanten_solver = Shanten()
+
+
 def get_rounds(file_path: str):
     with open(file_path, "rb") as file:
         tree = ET.parse(file)
@@ -90,19 +93,15 @@ def process(file_path: str, verbose: bool = False):
             list(map(int, kyoku_info[0]["attr"][f"hai{player}"].split(",")))
             for player in range(4)
         ]
-        hand_indices_grouped = TILE2IDX[hand_indices]
 
         hand_tensors = [np.zeros(37, dtype=np.float32) for _ in range(4)]
-        unique_indices_counts = [
-            np.unique(row, return_counts=True) for row in hand_indices_grouped
-        ]
-        for (idx, count), ht, pov in zip(
-            unique_indices_counts, hand_tensors, remaining_tiles_pov
-        ):
-            ht[idx] += count
-            pov[idx] -= count
-            remaining_tiles[idx] -= count
-        assert list(map(np.sum, hand_tensors)) == [13.0, 13.0, 13.0, 13.0]
+        for hi, ht, pov in zip(hand_indices, hand_tensors, remaining_tiles_pov):
+            for tile in hi:
+                tile_idx = TILE2IDX[tile]
+                ht[tile_idx] += 1.0
+                pov[tile_idx] -= 1.0
+                remaining_tiles[tile_idx] -= 1.0
+
         hand_tensors_full = copy.deepcopy(hand_tensors)
 
         hands = np.zeros((4, 136), dtype=np.float32)
@@ -137,7 +136,7 @@ def process(file_path: str, verbose: bool = False):
             print(f"Parent rounds remaining: {parent_rounds_remaining}")
             print("\n" + "=" * 20 + "\n")
 
-        assert sum(remaining_tiles) == 83
+        assert sum(remaining_tiles[:34]) == 83
 
         double_reaches = [0] * 4
         reaches = [0] * 4
@@ -146,7 +145,6 @@ def process(file_path: str, verbose: bool = False):
         turns = []
         is_menzen = [True] * 4
         curr_turn = None
-        shanten_solver = Shanten()
 
         for event in kyoku_info[1:-1]:
             eventtype = event["event"]
@@ -203,7 +201,8 @@ def process(file_path: str, verbose: bool = False):
                     if i == player:
                         continue
                     for e in exposed_idx:
-                        pov[e] -= 1
+                        for ee in e:
+                            pov[ee] -= 1.0
                 for e in exposed:
                     assert hands[player, e] == 1.0
                     hands[player, e] -= 1.0
@@ -262,7 +261,7 @@ def process(file_path: str, verbose: bool = False):
                 hands[player, tile] = 1.0
                 hand_tensors[player][tile_idx] += 1.0
                 hand_tensors_full[player][tile_idx] += 1.0
-                assert int(hand_tensors[player].sum()) % 3 == 2, hand_tensors[
+                assert int(hand_tensors[player][:34].sum()) % 3 == 2, hand_tensors[
                     player
                 ].sum()
 
@@ -308,7 +307,9 @@ def process(file_path: str, verbose: bool = False):
                                 )
                             )
                 if not reaches[player] and is_menzen[player]:
-                    shanten = shanten_solver.calculate_shanten(hand_tensors[player])
+                    shanten = shanten_solver.calculate_shanten(
+                        hand_tensors[player][:34]
+                    )
                     if shanten <= 0:
                         pre_decisions.append(ReachDecision(player, executed=False))
 
@@ -343,18 +344,18 @@ def process(file_path: str, verbose: bool = False):
                 hands[player, tile] = 0.0
                 hand_tensors[player][tile_idx] -= 1.0
                 hand_tensors_full[player][tile_idx] -= 1.0
-                assert int(hand_tensors[player].sum()) % 3 == 1, hand_tensors[
+                assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[
                     player
                 ].sum()
                 sutehai_tensor[player, tile_idx] += 1.0
 
                 for pov in remaining_tiles_pov:
-                    pov[tile_idx] -= 1
+                    pov[tile_idx] -= 1.0
 
-                remaining_tiles_pov[player][tile_idx] += 1
+                remaining_tiles_pov[player][tile_idx] += 1.0
                 curr_turn.discard = Discard(tile)
                 curr_turn.post_decisions += decision_mask(
-                    curr_turn, hand_tensors, tile_idx
+                    curr_turn, hand_tensors, tile_idx[0]
                 )
                 num_naki = sum(len(m) for m in melds)
                 curr_turn.post_decisions += evaluate_ron(
@@ -379,7 +380,7 @@ def process(file_path: str, verbose: bool = False):
                     honba=honba,
                 )
 
-                enc_idx = discard2idx(player, tile_idx, curr_turn.is_tsumogiri())
+                enc_idx = discard2idx(player, tile_idx[-1], curr_turn.is_tsumogiri())
                 enc_indices.append(enc_idx)
 
                 turns.append(curr_turn)

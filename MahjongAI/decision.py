@@ -95,8 +95,6 @@ def _two_and_eight_mask(
 
 def _three_to_seven_mask(player: int, hand_tensors: np.ndarray, tile_idx: int):
     decisions = []
-    num = tile_idx % 9
-    red_idx = 34 + tile_idx // 9
 
     for p, hand_tensor in enumerate(hand_tensors):
         if p == player:
@@ -112,27 +110,6 @@ def _three_to_seven_mask(player: int, hand_tensors: np.ndarray, tile_idx: int):
             decisions.append(NakiDecision(p, Naki(0), False))
         if hand_tensor[tile_idx] == 3.0:
             decisions.append(NakiDecision(p, Naki(0), False))
-
-        if hand_tensor[red_idx]:
-            if num == 5:
-                if hand_tensor[tile_idx] == 1:
-                    decisions.append(NakiDecision(p, Naki(0), False))
-                elif hand_tensor[tile_idx] == 2:
-                    decisions.append(NakiDecision(p, Naki(0), False))
-            if num == 3 and hand_tensor[tile_idx + 1]:
-                decisions.append(NakiDecision(p, Naki(0), False))
-            if num == 4:
-                if hand_tensor[tile_idx - 1]:
-                    decisions.append(NakiDecision(p, Naki(0), False))
-                if hand_tensor[tile_idx + 2]:
-                    decisions.append(NakiDecision(p, Naki(0), False))
-            if num == 6:
-                if hand_tensor[tile_idx - 2]:
-                    decisions.append(NakiDecision(p, Naki(0), False))
-                if hand_tensor[tile_idx + 1]:
-                    decisions.append(NakiDecision(p, Naki(0), False))
-            if num == 7 and hand_tensor[tile_idx - 1]:
-                decisions.append(NakiDecision(p, Naki(0), False))
 
     return decisions
 
@@ -153,9 +130,7 @@ def _jihai_mask(player: int, hand_tensors: np.ndarray, tile_idx: int):
 
 
 def decision_mask(player, hand_tensors: np.ndarray, tile_idx: int):
-    if tile_idx > 33:
-        return _three_to_seven_mask(player, hand_tensors, 4 + 9 * (tile_idx - 34))
-    elif tile_idx > 26:
+    if tile_idx > 26:
         return _jihai_mask(player, hand_tensors, tile_idx)
     elif tile_idx % 9 in [0, 8]:
         return _one_and_nine_mask(player, hand_tensors, tile_idx)

@@ -57,25 +57,14 @@ def evaluate_ron(
     verbose: bool = False,
 ):
     decisions = []
-    discarded_tile_idx = TILE2IDX[discarded_tile]
+    discarded_tile_idx = TILE2IDX[discarded_tile][0]
 
     for p, (hand_tensor, nakis) in enumerate(zip(hand_tensors_full, naki_list)):
         if p == player:
             continue
 
         # check for furiten
-        if (
-            sutehai_tensor[p, discarded_tile_idx]
-            or (
-                discarded_tile_idx < 27
-                and discarded_tile_idx % 9 == 4
-                and sutehai_tensor[p, 34 + discarded_tile_idx // 9]
-            )
-            or (
-                discarded_tile_idx >= 34
-                and sutehai_tensor[p, (discarded_tile_idx - 34) * 9 + 4]
-            )
-        ):
+        if sutehai_tensor[p, discarded_tile_idx]:
             if verbose:
                 print(f"Player {p} is furiten")
             continue
@@ -277,8 +266,6 @@ def hand_tensor2strs(hand_tensor):
         lst = []
         for j in range(9):
             lst += [j + 1] * int(hand_tensor[i + j])
-        if hand_tensor[34 + i // 9]:
-            lst.insert(0, 0)
         tile_strs.append("".join(list(map(str, lst))))
 
     lst = []
