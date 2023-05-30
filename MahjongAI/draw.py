@@ -3,6 +3,48 @@ class Draw:
 
 
 class Naki(Draw):
+    @staticmethod
+    def from_chi_info(
+        color: int, number: int, which: int, has_red: bool, from_who: int
+    ):
+        pattern = (color * 7 + number) * 3 + which
+        naki_code = (from_who & 3) | 0x4 | 0x8 | 0x20 | 0x80 | (pattern << 10)
+        if has_red:
+            bit = 4 + (number - 4) * 2
+            naki_code ^= 1 << bit
+
+        return Naki(naki_code)
+
+    @staticmethod
+    def from_pon_info(tile: int, which: int, has_red: bool, from_who: int):
+        pattern = tile * 3 + which
+        naki_code = (from_who & 3) | 0x8 | (pattern << 9)
+        if has_red:
+            naki_code |= 1 << 5
+
+        return Naki(naki_code)
+
+    @staticmethod
+    def from_kakan_info(tile: int):
+        pattern = tile * 3
+        naki_code = 0x10 | (pattern << 9)
+
+        return Naki(naki_code)
+
+    @staticmethod
+    def from_minkan_info(tile: int, from_who: int):
+        pattern = tile * 4
+        naki_code = (from_who & 3) | (pattern << 8)
+
+        return Naki(naki_code)
+
+    @staticmethod
+    def from_ankan_info(tile: int):
+        pattern = tile * 4
+        naki_code = pattern << 8
+
+        return Naki(naki_code)
+
     def __init__(self, naki_code: int):
         self.naki_code = naki_code
 

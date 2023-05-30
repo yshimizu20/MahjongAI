@@ -296,15 +296,17 @@ def process(file_path: str, verbose: bool = False):
                 # check if ankan or kakan is possible
                 for i in np.where(hand_tensors[player] == 4.0)[0]:
                     pre_decisions.append(
-                        NakiDecision(player, Naki(0), executed=False)
-                    )  # TODO: calculate naki code
+                        NakiDecision(player, Naki.from_ankan_info(i), executed=False)
+                    )
                 for meld in melds[player]:
                     if meld.is_pon():
-                        color, number, which, *_ = meld.pattern_pon()
+                        color, number, *_ = meld.pattern_pon()
                         if hands[player, 9 * color + number] == 1.0:
                             pre_decisions.append(
-                                NakiDecision(player, Naki(0), executed=False)
-                            )  # TODO: calculate naki code
+                                NakiDecision(
+                                    player, Naki(9 * color + number), executed=False
+                                )
+                            )
                 if not reaches[player] and is_menzen[player]:
                     shanten = shanten_solver.calculate_shanten(hand_tensors[player])
                     if shanten <= 0:
