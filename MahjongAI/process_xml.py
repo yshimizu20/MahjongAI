@@ -355,7 +355,7 @@ def process(file_path: str, verbose: bool = False):
                 remaining_tiles_pov[player][tile_idx] += 1.0
                 curr_turn.discard = Discard(tile)
                 curr_turn.post_decisions += decision_mask(
-                    curr_turn, hand_tensors, tile_idx[0]
+                    player, hand_tensors, tile_idx[0], len(tile_idx) == 2
                 )
                 num_naki = sum(len(m) for m in melds)
                 curr_turn.post_decisions += evaluate_ron(
