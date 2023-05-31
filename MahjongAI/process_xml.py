@@ -166,7 +166,10 @@ def process(file_path: str, verbose: bool = False):
 
                 if event["attr"]["step"] == "1":
                     assert curr_turn is not None
-                    # TODO: change decision executed to True
+                    for decision in curr_turn.pre_decisions:
+                        if isinstance(decision, ReachDecision):
+                            decision.executed = True
+                            break
                 else:  # step == 2
                     reaches = reaches[:]
                     reaches[player] = 1
@@ -188,10 +191,29 @@ def process(file_path: str, verbose: bool = False):
                 enc_indices.append(enc_idx)
 
             elif eventtype == "N":
-                # TODO: change executed to True
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
                 melds[player] = melds[player][:] + [naki]
+
+                # change executed to True
+                assert len(turns) > 0
+                turn = turns[-1]
+                if naki.is_ankan():
+                    for decision in turn.pre_decisions:
+                        if (
+                            decision.naki.convenient_naki_code
+                            == naki.convenient_naki_code
+                        ):
+                            decision.executed = True
+                            break
+                else:
+                    for decision in turn.post_decisions:
+                        if (
+                            decision.naki.convenient_naki_code
+                            == naki.convenient_naki_code
+                        ):
+                            decision.executed = True
+                            break
 
                 if not naki.is_chi() and not naki.is_pon():
                     remaining_tsumo -= 1
