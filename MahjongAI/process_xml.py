@@ -217,7 +217,7 @@ def process(file_path: str, verbose: bool = False):
 
                 if not naki.is_chi() and not naki.is_pon():
                     remaining_tsumo -= 1
-                exposed, obtained = naki.get_exposed()
+                exposed, acquired = naki.get_exposed()
                 exposed_idx = TILE2IDX[exposed]
                 for i, pov in enumerate(remaining_tiles_pov):
                     if i == player:
@@ -229,7 +229,7 @@ def process(file_path: str, verbose: bool = False):
                     assert hands[player, e] == 1.0
                     hands[player, e] -= 1.0
                     hand_tensors[player][TILE2IDX[e]] -= 1.0
-                hand_tensors_full[player][TILE2IDX[obtained]] += 1.0
+                hand_tensors_full[player][TILE2IDX[acquired]] += 1.0
                 stateObj = StateObject(
                     remaining_turns=remaining_tsumo,
                     hand_tensor=hand_tensors[player],
@@ -255,7 +255,7 @@ def process(file_path: str, verbose: bool = False):
                         hand_tensors=hand_tensors,
                         naki_list=melds,
                         sutehai_tensor=sutehai_tensor,
-                        discarded_tile=obtained,
+                        discarded_tile=acquired,
                         doras=doras,
                         reaches=reaches,
                         ippatsu=ippatsu,

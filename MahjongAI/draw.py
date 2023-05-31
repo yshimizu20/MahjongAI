@@ -4,11 +4,9 @@ class Draw:
 
 class Naki(Draw):
     @staticmethod
-    def from_chi_info(
-        color: int, number: int, which: int, has_red: bool, from_who: int
-    ):
+    def from_chi_info(color: int, number: int, which: int, has_red: bool):
         pattern = (color * 7 + number) * 3 + which
-        naki_code = (from_who & 3) | 0x4 | 0x8 | 0x20 | 0x80 | (pattern << 10)
+        naki_code = 0x3 | 0x4 | 0x8 | 0x20 | 0x80 | (pattern << 10)
         if has_red:
             bit = 3 + (4 - number) * 2
             naki_code ^= 1 << bit
@@ -17,23 +15,34 @@ class Naki(Draw):
 
     @staticmethod
     def from_pon_info(tile: int, which: int, has_red: bool, from_who: int):
+        # which = 1 if red was in the hand else 0
+        assert which in [0, 1]
         pattern = tile * 3 + which
         naki_code = (from_who & 3) | 0x8 | (pattern << 9)
         if has_red:
+            naki_code |= 3 << 5
+        # if which:
+        #     naki_code += 1 << 9
+
+        return Naki(naki_code, clean=False)
+
+    @staticmethod
+    def from_kakan_info(tile: int, which: int):
+        # which = 1 if red was in the exposed pon else 0
+        assert which in [0, 1]
+        has_red = tile < 27 and tile % 9 == 4
+        pattern = tile * 3 + which
+        naki_code = 0x10 | (pattern << 9)
+        if not has_red or which:
             naki_code |= 1 << 5
 
         return Naki(naki_code, clean=False)
 
     @staticmethod
-    def from_kakan_info(tile: int):
-        pattern = tile * 3
-        naki_code = 0x10 | (pattern << 9)
-
-        return Naki(naki_code, clean=False)
-
-    @staticmethod
-    def from_minkan_info(tile: int, from_who: int):
-        pattern = tile * 4
+    def from_minkan_info(tile: int, from_who: int, which: int):
+        # which = 0 if red was acquired else 1
+        assert which in [0, 1]
+        pattern = tile * 4 + which
         naki_code = (from_who & 3) | (pattern << 8)
 
         return Naki(naki_code, clean=False)
@@ -75,38 +84,39 @@ class Naki(Draw):
         return code
 
     def _clean_pon(self):
-        _, _, _, red, *_ = self.pattern_pon()
+        _, _, which, red, *_ = self.pattern_pon()
         code = self.naki_code & ~(0x60)
-        if not red:
-            code |= 0x20
+        if red:
+            code += 0x60
+            if which:
+                code -= (which - 1) << 9
         return code
 
     def _clean_kakan(self):
-        _, _, _, red, *_ = self.pattern_kakan()
+        _, _, which, red, *_ = self.pattern_kakan()
         code = self.naki_code & ~(0x60)
-        if not red:
+        print(red, which)
+        if not red or which:
             code |= 0x20
         return code
 
     def _clean_minkan(self):
         _, _, which, red, *_ = self.pattern_minkan()
-        code = self.naki_code & ~(3 << 8)
-        if not red or which != 0:
-            code |= 1 << 8
+        code = self.naki_code
+        if not red or which:
+            code -= (which - 1) << 8
         return code
 
     def _clean_ankan(self):
         _, _, which, red, *_ = self.pattern_ankan()
         code = self.naki_code & ~(3 << 8)
-        if not red or which != 0:
-            code |= 1 << 8
         return code
 
     def from_who(self):
         return self.naki_code & 3
 
     def is_chi(self):
-        return (self.naki_code & 0x4) >> 2
+        return bool(self.naki_code & 0x4)
 
     def is_pon(self):
         return not self.is_chi() and (self.naki_code & 0x8)
@@ -133,8 +143,8 @@ class Naki(Draw):
         ]
         exposed = [(9 * color + number + i) * 4 + code for i, code in enumerate(codes)]
         has_red = color * 36 + 16 in exposed
-        obtained = exposed.pop(which)
-        return (color, number, which, has_red, exposed, obtained)
+        acquired = exposed.pop(which)
+        return (color, number, which, has_red, exposed, acquired)
 
     def pattern_pon(self):
         pattern = (self.naki_code & 0xFE00) >> 9
@@ -145,8 +155,8 @@ class Naki(Draw):
         code = (self.naki_code & 0x0060) >> 5
         exposed = [(9 * color + number) * 4 + c for c in range(4) if c != code]
         has_red = color < 3 and color * 36 + 16 in exposed
-        obtained = exposed.pop(which)
-        return (color, number, which, has_red, exposed, obtained)
+        acquired = exposed.pop(which)
+        return (color, number, which, has_red, exposed, acquired)
 
     def pattern_kakan(self):
         pattern = (self.naki_code & 0xFE00) >> 9
@@ -154,10 +164,10 @@ class Naki(Draw):
         pattern //= 3
         color = pattern // 9
         number = pattern % 9
-        has_red = number == 5 and color != 3
+        has_red = number == 4 and color != 3
         exposed = [(9 * color + number) * 4 + c for c in range(4)]
-        obtained = exposed.pop(which)
-        return (color, number, which, has_red, exposed, obtained)
+        acquired = exposed.pop(which)
+        return (color, number, which, has_red, exposed, acquired)
 
     def pattern_minkan(self):
         pattern = (self.naki_code & 0xFF00) >> 8
@@ -165,10 +175,10 @@ class Naki(Draw):
         pattern //= 4
         color = pattern // 9
         number = pattern % 9
-        has_red = number == 5 and color != 3
+        has_red = number == 4 and color != 3
         exposed = [(9 * color + number) * 4 + c for c in range(4)]
-        obtained = exposed.pop(which)
-        return (color, number, which, has_red, exposed, obtained)
+        acquired = exposed.pop(which)
+        return (color, number, which, has_red, exposed, acquired)
 
     def pattern_ankan(self):
         pattern = (self.naki_code & 0xFF00) >> 8
@@ -176,33 +186,33 @@ class Naki(Draw):
         pattern //= 4
         color = pattern // 9
         number = pattern % 9
-        has_red = number == 5 and color != 3
+        has_red = number == 4 and color != 3
         exposed = [(9 * color + number) * 4 + c for c in range(4)]
-        obtained = None
-        return (color, number, which, has_red, exposed, obtained)
+        acquired = None
+        return (color, number, which, has_red, exposed, acquired)
 
     def get_exposed(self):
-        exposed, obtained = None, None
+        exposed, acquired = None, None
 
         if self.is_chi():
-            _, _, _, _, exposed, obtained = self.pattern_chi()
+            _, _, _, _, exposed, acquired = self.pattern_chi()
 
         elif self.is_pon():
-            _, _, _, _, exposed, obtained = self.pattern_pon()
+            _, _, _, _, exposed, acquired = self.pattern_pon()
 
         elif self.is_kakan():
-            _, _, _, _, exposed, obtained = self.pattern_kakan()
+            _, _, _, _, exposed, acquired = self.pattern_kakan()
 
         elif self.is_minkan():
-            _, _, _, _, exposed, obtained = self.pattern_minkan()
+            _, _, _, _, exposed, acquired = self.pattern_minkan()
 
         elif self.is_ankan():
-            _, _, _, _, exposed, obtained = self.pattern_ankan()
+            _, _, _, _, exposed, acquired = self.pattern_ankan()
 
         else:
             raise ValueError("Invalid naki code")
 
-        return exposed, obtained
+        return exposed, acquired
 
 
 class Tsumo(Draw):
