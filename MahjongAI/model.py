@@ -22,23 +22,6 @@ learning_rate = 3e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def encode(idx):
-    raise NotImplementedError
-
-
-def decode(idx):
-    raise NotImplementedError
-
-
-def get_batch():
-    raise NotImplementedError
-
-
-@torch.no_grad()
-def estimate_loss():
-    raise NotImplementedError
-
-
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
@@ -173,6 +156,11 @@ class Decoder(nn.Module):
         self.reach_head = nn.Linear(EMBD_SIZE, REACH_ACTION_DIM)
         self.agari_head = nn.Linear(EMBD_SIZE, AGARI_ACTION_DIM)
         self.meld_head = nn.Linear(EMBD_SIZE, MELD_ACTION_DIM)
+        self.heads = {
+            "discard": self.discard_head,
+            "reach": self.reach_head,
+            "agari": self.agari_head,
+        }
 
         self.apply(self._init_weights)
 
@@ -185,12 +173,16 @@ class Decoder(nn.Module):
             torch.nn.init.normal_(module.weight, std=0.02)
 
     def forward(
-        self, enc_out: torch.tensor, state_obj: torch.tensor, target: int = None
+        self,
+        enc_out: torch.tensor,
+        state_obj: torch.tensor,
+        head: str,
+        target: int = None,
     ):
         q = self.state_net(state_obj)
         x = self.blocks(enc_out, enc_out, q)
         x = self.ln_f(x)
-        logits = self.lm_head(x)
+        logits = self.heads[head](x)
 
         if target is None:
             loss = None
@@ -245,30 +237,14 @@ class TransformerModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, enc_indices: np.array, state_obj: torch.tensor, targets=None):
+    def forward(
+        self, enc_indices: np.array, state_obj: torch.tensor, head: str, target=None
+    ):
         enc_out = self.encoder(enc_indices)
-        logits, loss = self.decoder(enc_out, state_obj, targets)
+        logits, loss = self.decoder(enc_out, state_obj, target, head)
         return logits, loss
 
 
 if __name__ == "__main__":
     model = TransformerModel().to(device)
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M params")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
-    raise NotImplementedError
-
-    for iter in range(max_iters):
-        if iter % eval_interval == eval_interval - 1:
-            losses = estimate_loss()
-            print(
-                f"iter {iter} | train loss {losses['train']} | val loss {losses['val']}"
-            )
-
-        xb, yb = get_batch()
-
-        logits, loss = model(xb, yb)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()

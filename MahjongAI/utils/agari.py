@@ -56,7 +56,7 @@ def evaluate_ron(
     honba: int,
     verbose: bool = False,
 ):
-    decisions = []
+    decisions = [None] * 4
     discarded_tile_idx = TILE2IDX[discarded_tile][0]
 
     for p, (hand_tensor, nakis) in enumerate(zip(hand_tensors_full, naki_list)):
@@ -148,8 +148,7 @@ def evaluate_ron(
             print(result)
 
         if result.error is None:
-            decisions.append(AgariDecision(p, False))
-
+            decisions[p] = AgariDecision(p, False)
     return decisions
 
 
