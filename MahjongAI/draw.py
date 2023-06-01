@@ -108,7 +108,6 @@ class Naki(Draw):
         return code
 
     def _clean_ankan(self):
-        _, _, which, red, *_ = self.pattern_ankan()
         code = self.naki_code & ~(3 << 8)
         return code
 

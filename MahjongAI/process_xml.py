@@ -19,7 +19,7 @@ from MahjongAI.decision import (
     PassDecision,
     decision_mask,
 )
-from MahjongAI.turn import TsumoTurn, NakiTurn
+from MahjongAI.turn import TsumoTurn, NakiTurn, DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.result import AgariResult, RyukyokuResult
 
 
@@ -143,6 +143,7 @@ def process(file_path: str, verbose: bool = False):
         ippatsu = [0] * 4
         melds = [[] for _ in range(4)]
         turns = []
+        half_turns = []
         is_menzen = [True] * 4
         curr_turn = None
 
@@ -199,21 +200,23 @@ def process(file_path: str, verbose: bool = False):
                 assert len(turns) > 0
                 turn = turns[-1]
                 if naki.is_ankan():
-                    for decision in turn.pre_decisions:
-                        if (
-                            decision.naki.convenient_naki_code
-                            == naki.convenient_naki_code
-                        ):
-                            decision.executed = True
-                            break
+                    for lst in turn.pre_decisions:
+                        for decision in lst:
+                            if (
+                                decision.naki.convenient_naki_code
+                                == naki.convenient_naki_code
+                            ):
+                                decision.executed = True
+                                break
                 else:
-                    for decision in turn.post_decisions:
-                        if (
-                            decision.naki.convenient_naki_code
-                            == naki.convenient_naki_code
-                        ):
-                            decision.executed = True
-                            break
+                    for lst in turn.post_decisions:
+                        for decision in lst:
+                            if (
+                                decision.naki.convenient_naki_code
+                                == naki.convenient_naki_code
+                            ):
+                                decision.executed = True
+                                break
 
                 if not naki.is_chi() and not naki.is_pon():
                     remaining_tsumo -= 1
@@ -314,11 +317,12 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku=kyotaku,
                     honba=honba,
                 )
-                # check if ankan or kakan is possible
+                # check if ankan is possible
                 for i in np.where(hand_tensors[player] == 4.0)[0]:
                     pre_decisions.append(
                         NakiDecision(player, Naki.from_ankan_info(i), executed=False)
                     )
+                # check if kakan is possible
                 for meld in melds[player]:
                     if meld.is_pon():
                         color, number, *_ = meld.pattern_pon()
@@ -328,6 +332,7 @@ def process(file_path: str, verbose: bool = False):
                                     player, Naki(9 * color + number), executed=False
                                 )
                             )
+                # check if reach is possible
                 if not reaches[player] and is_menzen[player]:
                     shanten = shanten_solver.calculate_shanten(
                         hand_tensors[player][:34]
@@ -352,6 +357,13 @@ def process(file_path: str, verbose: bool = False):
                     player=player, draw=Tsumo(tile), stateObj=stateObj
                 )
                 curr_turn.pre_decisions = pre_decisions
+                half_turn = DuringTurn(
+                    player=player,
+                    enc_indices=enc_indices,
+                    stateObj=stateObj,
+                    decisions=pre_decisions,
+                )
+                half_turns.append(half_turn)
                 if sum(ippatsu):
                     ippatsu = [0] * 4
 
@@ -362,6 +374,14 @@ def process(file_path: str, verbose: bool = False):
                 tile = int(eventtype[1:])
                 tile_idx = TILE2IDX[tile]
                 assert hands[player, tile] == 1.0
+
+                half_turn = DiscardTurn(
+                    player=player,
+                    enc_indices=enc_indices,
+                    stateObj=curr_turn.stateObj,
+                    discarded_tile=tile,
+                )
+                half_turns.append(half_turn)
 
                 hands[player, tile] = 0.0
                 hand_tensors[player][tile_idx] -= 1.0
@@ -376,11 +396,11 @@ def process(file_path: str, verbose: bool = False):
 
                 remaining_tiles_pov[player][tile_idx] += 1.0
                 curr_turn.discard = Discard(tile)
-                curr_turn.post_decisions += decision_mask(
+                post_decisions = decision_mask(
                     player, hand_tensors, tile_idx[0], len(tile_idx) == 2
                 )
                 num_naki = sum(len(m) for m in melds)
-                curr_turn.post_decisions += evaluate_ron(
+                rons = evaluate_ron(
                     player=player,
                     hand_tensors_full=hand_tensors_full,
                     naki_list=melds,
@@ -401,6 +421,18 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku=kyotaku,
                     honba=honba,
                 )
+                for ron, lst in zip(rons, post_decisions):
+                    if ron is not None:
+                        lst.append(ron)
+                curr_turn.post_decisions = post_decisions
+
+                half_turn = PostTurn(
+                    player=player,
+                    enc_indices=enc_indices,
+                    stateObj=stateObj,
+                    decisions=post_decisions,
+                )
+                half_turns.append(half_turn)
 
                 enc_idx = discard2idx(player, tile_idx[-1], curr_turn.is_tsumogiri())
                 enc_indices.append(enc_idx)
