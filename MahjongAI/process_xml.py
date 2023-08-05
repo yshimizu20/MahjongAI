@@ -9,17 +9,15 @@ sys.path.append("..")
 from MahjongAI.gameinfo import GameInfo, RoundInfo
 from MahjongAI.utils.constants import *
 from MahjongAI.utils.agari import evaluate_ron, evaluate_tsumo
-from MahjongAI.draw import Naki, Tsumo
-from MahjongAI.discard import Discard
+from MahjongAI.draw import Naki
 from MahjongAI.state import StateObject
 from MahjongAI.decision import (
     NakiDecision,
     ReachDecision,
-    AgariDecision,
     PassDecision,
     decision_mask,
 )
-from MahjongAI.turn import TsumoTurn, NakiTurn, DuringTurn, DiscardTurn, PostTurn
+from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.result import AgariResult, RyukyokuResult
 
 
@@ -74,6 +72,8 @@ def process(file_path: str, verbose: bool = False):
     assert gameinfo.no_red() == 0
     assert gameinfo.kansaki() == 0
     assert gameinfo.three_players() == 0
+
+    all_halfturns = []
 
     for kyoku_events in rounds:
         # get imitial state
@@ -130,10 +130,9 @@ def process(file_path: str, verbose: bool = False):
         ippatsu = [0] * 4
         melds = [[] for _ in range(4)]
         turns = []
-        half_turns = []
+        halfturns = []
         is_menzen = [True] * 4
-        curr_turn = None
-        enc_indices = []
+        curr_halfturn = None
         cycles = 0
 
         if verbose:
@@ -158,19 +157,18 @@ def process(file_path: str, verbose: bool = False):
                     pov[tile_idx] -= 1
                 remaining_tsumo -= 1
 
-                enc_idx = new_dora2idx(tile_idx)
-                enc_indices.append(enc_idx)
-
             elif eventtype == "REACH":
+                assert curr_halfturn is not None
                 player = int(event["attr"]["who"])
 
                 if event["attr"]["step"] == "1":
-                    assert curr_turn is not None
-                    for decision in curr_turn.pre_decisions:
+                    assert isinstance(curr_halfturn, DuringTurn)
+                    for decision in curr_halfturn.decisions:
                         if isinstance(decision, ReachDecision):
                             decision.executed = True
                             break
                 else:  # step == 2
+                    assert isinstance(curr_halfturn, PostTurn)
                     reaches = reaches[:]
                     reaches[player] = 1
                     kyotaku += 1
@@ -183,10 +181,9 @@ def process(file_path: str, verbose: bool = False):
                 ippatsu = ippatsu[:]
                 ippatsu[player] = 1
 
-                enc_idx = reach2idx(player)
-                enc_indices.append(enc_idx)
-
             elif eventtype == "N":
+                assert curr_halfturn is not None
+
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
                 from_who = naki.from_who()
@@ -194,10 +191,9 @@ def process(file_path: str, verbose: bool = False):
                 melds[player] = melds[player][:] + [naki]
 
                 # change executed to True
-                assert len(turns) > 0
-                turn = turns[-1]
                 if naki.is_ankan():
-                    for lst in turn.pre_decisions:
+                    assert isinstance(curr_halfturn, DuringTurn)
+                    for lst in curr_halfturn.decisions:
                         for decision in lst:
                             if (
                                 decision.naki.convenient_naki_code
@@ -206,7 +202,9 @@ def process(file_path: str, verbose: bool = False):
                                 decision.executed = True
                                 break
                 else:
-                    for lst in turn.post_decisions:
+                    assert isinstance(curr_halfturn, PostTurn)
+                    # TODO: exclude decision that would not have been picked up anyways
+                    for lst in curr_halfturn.decisions:
                         for decision in lst:
                             if (
                                 decision.naki.convenient_naki_code
@@ -241,16 +239,15 @@ def process(file_path: str, verbose: bool = False):
                     scores=scores,
                     kyotaku=kyotaku,
                     honba=honba,
-                    dora=doras,  # share same reach list
+                    dora=doras,  # share same dora list
                 )
-                curr_turn = NakiTurn(player=player, naki=naki, stateObj=stateObj)
                 if naki.from_who() != 0:
                     is_menzen[player] = False
                 if sum(ippatsu):
                     ippatsu = [0] * 4
 
                 if naki.is_kakan():
-                    curr_turn.post_decisions += evaluate_ron(
+                    curr_halfturn.decisions += evaluate_ron(
                         player=player,
                         hand_tensors=hand_tensors,
                         naki_list=melds,
@@ -269,10 +266,11 @@ def process(file_path: str, verbose: bool = False):
                         honba=honba,
                     )
 
-                enc_idx = naki2idx(player, naki)
-                enc_indices.append(enc_idx)
+                # TODO: add logic for ankan kokushi ron
 
             elif eventtype[0] in ["T", "U", "V", "W"]:
+                curr_halfturn = None
+
                 player = ["T", "U", "V", "W"].index(eventtype[0])
                 cycles += 1
                 tile = int(eventtype[1:])
@@ -286,9 +284,9 @@ def process(file_path: str, verbose: bool = False):
                 hand_tensors_full[player][tile_idx] += 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 2
 
-                pre_decisions = [PassDecision(player, executed=False)]
+                during_decisions = [PassDecision(player, executed=False)]
                 # check if tsumo is possible
-                pre_decisions += evaluate_tsumo(
+                during_decisions += evaluate_tsumo(
                     player=player,
                     hand_tensors_full=hand_tensors_full,
                     naki_list=melds,
@@ -308,7 +306,7 @@ def process(file_path: str, verbose: bool = False):
                 )
                 # check if ankan is possible
                 for i in np.where(hand_tensors[player] == 4.0)[0]:
-                    pre_decisions.append(
+                    during_decisions.append(
                         NakiDecision(player, Naki.from_ankan_info(i), executed=False)
                     )
                 # TODO: make it cleaner
@@ -317,7 +315,7 @@ def process(file_path: str, verbose: bool = False):
                     if meld.is_pon():
                         color, number, *_ = meld.pattern_pon()
                         if hands[player, 9 * color + number] == 1.0:
-                            pre_decisions.append(
+                            during_decisions.append(
                                 NakiDecision(
                                     player, Naki(9 * color + number), executed=False
                                 )
@@ -328,7 +326,7 @@ def process(file_path: str, verbose: bool = False):
                         hand_tensors[player][:34]
                     )
                     if shanten <= 0:
-                        pre_decisions.append(ReachDecision(player, executed=False))
+                        during_decisions.append(ReachDecision(player, executed=False))
 
                 stateObj = StateObject(
                     remaining_turns=remaining_tsumo,
@@ -343,23 +341,19 @@ def process(file_path: str, verbose: bool = False):
                     honba=honba,
                     dora=doras,  # share same dora list
                 )
-                curr_turn = TsumoTurn(
-                    player=player, draw=Tsumo(tile), stateObj=stateObj
-                )
-                curr_turn.pre_decisions = pre_decisions
-                half_turn = DuringTurn(
+                halfturn = DuringTurn(
                     player=player,
-                    enc_indices=enc_indices,
                     stateObj=stateObj,
-                    decisions=pre_decisions,
+                    decisions=during_decisions,
                 )
-                half_turns.append(half_turn)
+                halfturns.append(halfturn)
+                curr_halfturn = halfturn  # carry over
                 if sum(ippatsu):
                     ippatsu = [0] * 4
 
             elif eventtype[0] in ["D", "E", "F", "G"]:
                 player = ["D", "E", "F", "G"].index(eventtype[0])
-                assert curr_turn.player == player
+                curr_halfturn = None
 
                 tile = int(eventtype[1:])
                 tile_idx = TILE2IDX[tile]
@@ -367,11 +361,10 @@ def process(file_path: str, verbose: bool = False):
 
                 half_turn = DiscardTurn(
                     player=player,
-                    enc_indices=enc_indices,
-                    stateObj=curr_turn.stateObj,
+                    stateObj=stateObj,
                     discarded_tile=tile,
                 )
-                half_turns.append(half_turn)
+                halfturns.append(half_turn)
 
                 hands[player, tile] = 0.0
                 hand_tensors[player][tile_idx] -= 1.0
@@ -385,7 +378,6 @@ def process(file_path: str, verbose: bool = False):
                     pov[tile_idx] -= 1.0
 
                 remaining_tiles_pov[player][tile_idx] += 1.0
-                curr_turn.discard = Discard(tile)
                 post_decisions = decision_mask(
                     player, hand_tensors, tile_idx[0], len(tile_idx) == 2
                 )
@@ -414,21 +406,14 @@ def process(file_path: str, verbose: bool = False):
                 for ron, lst in zip(rons, post_decisions):
                     if ron is not None:
                         lst.append(ron)
-                curr_turn.post_decisions = post_decisions
 
                 half_turn = PostTurn(
                     player=player,
-                    enc_indices=enc_indices,
                     stateObj=stateObj,
                     decisions=post_decisions,
                 )
-                half_turns.append(half_turn)
-
-                enc_idx = discard2idx(player, tile_idx[-1], curr_turn.is_tsumogiri())
-                enc_indices.append(enc_idx)
-
-                turns.append(curr_turn)
-                curr_turn = None
+                halfturns.append(half_turn)
+                curr_halfturn = half_turn  # carry over
 
             else:
                 raise ValueError(f"Invalid event type: {eventtype}")
@@ -451,55 +436,59 @@ def process(file_path: str, verbose: bool = False):
         assert sum([1 for r in remaining_tiles if r < 0]) == 0
         assert sum([1 for rem in remaining_tiles_pov for r in rem if r < 0]) == 0
 
+        all_halfturns.append(halfturns)
 
-NAKI_IDX_START = 37 * 4 * 2
-CHI_IDX_START = NAKI_IDX_START
-PON_IDX_START = CHI_IDX_START + 4 * 3 * 3 * 7 * 3 * 2
-KAKAN_IDX_START = PON_IDX_START + 4 * 3 * 4 * 9 * 2
-MINKAN_IDX_START = KAKAN_IDX_START + 4 * 4 * 9 * 2
-ANKAN_IDX_START = MINKAN_IDX_START + 4 * 3 * 4 * 9 * 2
-REACH_IDX_START = ANKAN_IDX_START + 4 * 4 * 9 * 2
-NEW_DORA_IDX_START = REACH_IDX_START + 4  # 4116
+    return all_halfturns
 
 
-def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
-    return (who * 37 + tile_idx) * 2 + int(is_tsumogiri)
+# NAKI_IDX_START = 37 * 4 * 2
+# CHI_IDX_START = NAKI_IDX_START
+# PON_IDX_START = CHI_IDX_START + 4 * 3 * 3 * 7 * 3 * 2
+# KAKAN_IDX_START = PON_IDX_START + 4 * 3 * 4 * 9 * 2
+# MINKAN_IDX_START = KAKAN_IDX_START + 4 * 4 * 9 * 2
+# ANKAN_IDX_START = MINKAN_IDX_START + 4 * 3 * 4 * 9 * 2
+# REACH_IDX_START = ANKAN_IDX_START + 4 * 4 * 9 * 2
+# NEW_DORA_IDX_START = REACH_IDX_START + 4  # 4116
 
 
-def naki2idx(who: int, naki: Naki):
-    from_who = naki.from_who()
-    if naki.is_chi():
-        color, number, which, has_red, *_ = naki.pattern_chi()
-        return NAKI_IDX_START + (
-            ((((who * 3 + from_who - 1) * 3 + color) * 7 + number) * 3 + which) * 2
-            + int(has_red)
-        )
-    elif naki.is_pon():
-        color, number, _, has_red, *_ = naki.pattern_pon()
-        return PON_IDX_START + (
-            (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
-        )
-    elif naki.is_kakan():
-        color, number, _, has_red, *_ = naki.pattern_kakan()
-        return KAKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
-    elif naki.is_minkan():
-        color, number, _, has_red, *_ = naki.pattern_minkan()
-        return MINKAN_IDX_START + (
-            (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
-        )
-    elif naki.is_ankan():
-        color, number, _, has_red, *_ = naki.pattern_ankan()
-        return ANKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
-    else:
-        raise ValueError("Invalid naki code")
+# def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
+#     return (who * 37 + tile_idx) * 2 + int(is_tsumogiri)
 
 
-def reach2idx(who: int):
-    return REACH_IDX_START + who
+# def naki2idx(who: int, naki: Naki):
+#     from_who = naki.from_who()
+#     if naki.is_chi():
+#         color, number, which, has_red, *_ = naki.pattern_chi()
+#         return NAKI_IDX_START + (
+#             ((((who * 3 + from_who - 1) * 3 + color) * 7 + number) * 3 + which) * 2
+#             + int(has_red)
+#         )
+#     elif naki.is_pon():
+#         color, number, _, has_red, *_ = naki.pattern_pon()
+#         return PON_IDX_START + (
+#             (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
+#         )
+#     elif naki.is_kakan():
+#         color, number, _, has_red, *_ = naki.pattern_kakan()
+#         return KAKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
+#     elif naki.is_minkan():
+#         color, number, _, has_red, *_ = naki.pattern_minkan()
+#         return MINKAN_IDX_START + (
+#             (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
+#         )
+#     elif naki.is_ankan():
+#         color, number, _, has_red, *_ = naki.pattern_ankan()
+#         return ANKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
+#     else:
+#         raise ValueError("Invalid naki code")
 
 
-def new_dora2idx(tile_idx: int):
-    return NEW_DORA_IDX_START + tile_idx
+# def reach2idx(who: int):
+#     return REACH_IDX_START + who
+
+
+# def new_dora2idx(tile_idx: int):
+#     return NEW_DORA_IDX_START + tile_idx
 
 
 if __name__ == "__main__":
@@ -507,4 +496,6 @@ if __name__ == "__main__":
 
     file_path = "data/sample/sample_haifu.xml"
     # cProfile.run("process(file_path, verbose=True)", sort="tottime")
-    process(file_path, verbose=True)
+    all_halfturns = process(file_path, verbose=True)
+
+    print(list(map(len, all_halfturns)))
