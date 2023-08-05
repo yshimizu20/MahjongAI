@@ -57,6 +57,7 @@ class Naki(Draw):
     def __init__(self, naki_code: int, clean: bool = True):
         self.naki_code = naki_code
         self.convenient_naki_code = naki_code
+
         if clean:
             self.convenient_naki_code = self._clean()
 

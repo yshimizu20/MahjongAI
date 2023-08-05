@@ -41,6 +41,7 @@ def get_rounds(file_path: str):
 
     traverse(root)
 
+    # get game config
     gametype = root.findall("GO")
     if len(gametype) != 1:
         raise ValueError("Invalid number of game type elements")
@@ -63,8 +64,6 @@ def get_rounds(file_path: str):
             rounds.append(curr_round_events)
             curr_round_events = []
 
-    assert len(rounds) >= gameinfo.n_rounds()
-
     return gameinfo, rounds
 
 
@@ -76,25 +75,32 @@ def process(file_path: str, verbose: bool = False):
     assert gameinfo.kansaki() == 0
     assert gameinfo.three_players() == 0
 
-    for kyoku_info in rounds:
-        assert kyoku_info[0]["event"] == "INIT"
+    for kyoku_events in rounds:
+        # get imitial state
+        kyoku_init_state = kyoku_events[0]
+        assert kyoku_init_state["event"] == "INIT"
 
-        enc_indices = []
+        scores = [int(score) for score in kyoku_init_state["attr"]["ten"].split(",")]
+        parent = kyoku_init_state["attr"]["oya"]
+        curr_round, honba, kyotaku, _, _, dora = list(
+            map(int, kyoku_init_state["attr"]["seed"].split(","))
+        )
+        doras = [dora]
+        remaining_rounds = gameinfo.n_rounds() - int(curr_round)
+        parent_rounds_remaining = [(remaining_rounds + i) // 4 for i in range(4)]
+        roundinfo = RoundInfo(gameinfo, curr_round)
 
+        # create state object tensors
+        hand_indices = [
+            list(map(int, kyoku_init_state["attr"][f"hai{player}"].split(",")))
+            for player in range(4)
+        ]  # 0 - 135
         remaining_tiles = REMAINING_TILES.copy()
         remaining_tiles_pov = [REMAINING_TILES.copy() for _ in range(4)]
         remaining_tsumo = REMAINING_TSUMO
+        hand_tensors = [np.zeros(37, dtype=np.float32) for _ in range(4)]  # 0 - 36
+        sutehai_tensor = np.zeros((4, 37), dtype=np.float32)  # to check furiten
 
-        scores = kyoku_info[0]["attr"]["ten"].split(",")
-        scores = [int(score) for score in scores]
-        parent = kyoku_info[0]["attr"]["oya"]
-
-        hand_indices = [
-            list(map(int, kyoku_info[0]["attr"][f"hai{player}"].split(",")))
-            for player in range(4)
-        ]
-
-        hand_tensors = [np.zeros(37, dtype=np.float32) for _ in range(4)]
         for hi, ht, pov in zip(hand_indices, hand_tensors, remaining_tiles_pov):
             for tile in hi:
                 tile_idx = TILE2IDX[tile]
@@ -102,29 +108,33 @@ def process(file_path: str, verbose: bool = False):
                 pov[tile_idx] -= 1.0
                 remaining_tiles[tile_idx] -= 1.0
 
-        hand_tensors_full = copy.deepcopy(hand_tensors)
-
-        hands = np.zeros((4, 136), dtype=np.float32)
-        player_indices = np.arange(4)[:, np.newaxis]
-        hands[player_indices, hand_indices] = 1.0
-        assert np.allclose(hands.sum(axis=1), [13.0, 13.0, 13.0, 13.0])
-        assert np.max(hands) == 1.0
-
-        # needed to check furiten
-        sutehai_tensor = np.zeros((4, 37), dtype=np.float32)
-
-        curr_round, honba, kyotaku, _, _, dora = list(
-            map(int, kyoku_info[0]["attr"]["seed"].split(","))
-        )
-        doras = [dora]
         remaining_tiles[TILE2IDX[int(dora)]] -= 1
         for pov in remaining_tiles_pov:
             pov[TILE2IDX[int(dora)]] -= 1
 
-        remaining_rounds = gameinfo.n_rounds() - int(curr_round)
-        parent_rounds_remaining = [(remaining_rounds + i) // 4 for i in range(4)]
+        hand_tensors_full = copy.deepcopy(
+            hand_tensors
+        )  # hand info including all melded tiles
 
-        roundinfo = RoundInfo(gameinfo, curr_round)
+        hands = np.zeros((4, 136), dtype=np.float32)
+        player_indices = np.arange(4)[:, np.newaxis]
+        hands[player_indices, hand_indices] = 1.0
+
+        assert np.allclose(hands.sum(axis=1), [13.0, 13.0, 13.0, 13.0])
+        assert np.max(hands) == 1.0
+        assert sum(remaining_tiles[:34]) == 83
+
+        # more non-tensor state objects
+        double_reaches = [0] * 4
+        reaches = [0] * 4
+        ippatsu = [0] * 4
+        melds = [[] for _ in range(4)]
+        turns = []
+        half_turns = []
+        is_menzen = [True] * 4
+        curr_turn = None
+        enc_indices = []
+        cycles = 0
 
         if verbose:
             print(f"Scores: {scores}")
@@ -136,18 +146,7 @@ def process(file_path: str, verbose: bool = False):
             print(f"Parent rounds remaining: {parent_rounds_remaining}")
             print("\n" + "=" * 20 + "\n")
 
-        assert sum(remaining_tiles[:34]) == 83
-
-        double_reaches = [0] * 4
-        reaches = [0] * 4
-        ippatsu = [0] * 4
-        melds = [[] for _ in range(4)]
-        turns = []
-        half_turns = []
-        is_menzen = [True] * 4
-        curr_turn = None
-
-        for event in kyoku_info[1:-1]:
+        for event in kyoku_events[1:-1]:
             eventtype = event["event"]
 
             if eventtype == "DORA":
@@ -177,11 +176,7 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku += 1
                     scores = scores.copy()
                     scores[player] -= 1000
-                    if (
-                        remaining_tsumo >= 66
-                        and parent != player
-                        and sum(list(map(len, melds))) == 0
-                    ):
+                    if cycles <= 4 and min(is_menzen):
                         double_reaches = double_reaches[:]
                         double_reaches[player] = 1
 
@@ -194,6 +189,8 @@ def process(file_path: str, verbose: bool = False):
             elif eventtype == "N":
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
+                from_who = naki.from_who()
+                cycles += (player - from_who) % 4
                 melds[player] = melds[player][:] + [naki]
 
                 # change executed to True
@@ -277,6 +274,7 @@ def process(file_path: str, verbose: bool = False):
 
             elif eventtype[0] in ["T", "U", "V", "W"]:
                 player = ["T", "U", "V", "W"].index(eventtype[0])
+                cycles += 1
                 tile = int(eventtype[1:])
                 tile_idx = TILE2IDX[tile]
                 remaining_tiles[tile_idx] -= 1
@@ -286,11 +284,10 @@ def process(file_path: str, verbose: bool = False):
                 hands[player, tile] = 1.0
                 hand_tensors[player][tile_idx] += 1.0
                 hand_tensors_full[player][tile_idx] += 1.0
-                assert int(hand_tensors[player][:34].sum()) % 3 == 2, hand_tensors[
-                    player
-                ].sum()
+                assert int(hand_tensors[player][:34].sum()) % 3 == 2
 
                 pre_decisions = [PassDecision(player, executed=False)]
+                # check if tsumo is possible
                 pre_decisions += evaluate_tsumo(
                     player=player,
                     hand_tensors_full=hand_tensors_full,
@@ -302,16 +299,8 @@ def process(file_path: str, verbose: bool = False):
                     is_haitei=(remaining_tsumo == 0),
                     is_rinshan=False,
                     double_reaches=double_reaches,
-                    is_tenhou=(
-                        remaining_tsumo == 70
-                        and parent == player
-                        and sum(list(map(len, melds))) == 0
-                    ),
-                    is_chiihou=(
-                        remaining_tsumo >= 66
-                        and parent != player
-                        and sum(list(map(len, melds))) == 0
-                    ),
+                    is_tenhou=(cycles == 1),
+                    is_chiihou=(2 <= cycles <= 4 and min(is_menzen)),
                     player_wind=roundinfo.player_wind,
                     round_wind=roundinfo.round_wind,
                     kyotaku=kyotaku,
@@ -322,6 +311,7 @@ def process(file_path: str, verbose: bool = False):
                     pre_decisions.append(
                         NakiDecision(player, Naki.from_ankan_info(i), executed=False)
                     )
+                # TODO: make it cleaner
                 # check if kakan is possible
                 for meld in melds[player]:
                     if meld.is_pon():
@@ -389,7 +379,7 @@ def process(file_path: str, verbose: bool = False):
                 assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[
                     player
                 ].sum()
-                sutehai_tensor[player, tile_idx] += 1.0
+                sutehai_tensor[player, tile_idx] = 1.0
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1.0
@@ -443,7 +433,7 @@ def process(file_path: str, verbose: bool = False):
             else:
                 raise ValueError(f"Invalid event type: {eventtype}")
 
-        event = kyoku_info[-1]
+        event = kyoku_events[-1]
         assert event["event"] in ["AGARI", "RYUUKYOKU"]
 
         if event["event"] == "AGARI":
@@ -456,7 +446,7 @@ def process(file_path: str, verbose: bool = False):
             print(f"len(turns): {len(turns)}")
             print(result)
             print(f"remaining_tiles: {remaining_tiles}")
-            print(f"remaining_tiles_pov: {remaining_tiles_pov}")
+            print(f"player hands: {hand_tensors}")
 
         assert sum([1 for r in remaining_tiles if r < 0]) == 0
         assert sum([1 for rem in remaining_tiles_pov for r in rem if r < 0]) == 0

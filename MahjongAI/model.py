@@ -160,6 +160,7 @@ class Decoder(nn.Module):
             "discard": self.discard_head,
             "reach": self.reach_head,
             "agari": self.agari_head,
+            "meld": self.meld_head,
         }
 
         self.apply(self._init_weights)
