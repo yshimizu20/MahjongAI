@@ -51,54 +51,59 @@ class PassDecision(Decision):
 def _one_and_nine_mask(
     player: int, hand_tensors: np.ndarray, tile_idx: int, is_one: bool = True
 ):
-    decisions = [[] for _ in range(4)]
+    pons, chis = [], []
     coef = 1 if is_one else -1
 
-    for p, (hand_tensor, d) in enumerate(zip(hand_tensors, decisions)):
+    for p, hand_tensor in enumerate(hand_tensors):
         if p == player:
             continue
 
-        if hand_tensor[tile_idx + coef] * hand_tensor[tile_idx + coef * 2]:
+        if (p - player) % 4 == 1 and hand_tensor[tile_idx + coef] * hand_tensor[
+            tile_idx + coef * 2
+        ]:
             naki = Naki.from_chi_info(
                 tile_idx // 9, 0 if is_one else 6, 0 if is_one else 2, False
             )
-            d.append(NakiDecision(p, naki, False))
+            chis.append(NakiDecision(p, naki, False))
         if hand_tensor[tile_idx] == 2.0:
             naki = Naki.from_pon_info(tile_idx, 0, False, (player - p) % 4)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
         if hand_tensor[tile_idx] == 3.0:
             naki = Naki.from_minkan_info(tile_idx, (player - p) % 4, 0)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
 
-    return decisions
+    return [pons, chis]
 
 
 def _two_and_eight_mask(
     player: int, hand_tensors: np.ndarray, tile_idx: int, is_two: bool = True
 ):
-    decisions = [[] for _ in range(4)]
+    pons, chis = [], []
     coef = 1 if is_two else -1
 
-    for p, (hand_tensor, d) in enumerate(zip(hand_tensors, decisions)):
+    for p, hand_tensor in enumerate(hand_tensors):
         if p == player:
             continue
 
-        if hand_tensor[tile_idx - 1] * hand_tensor[tile_idx + 1]:
-            naki = Naki.from_chi_info(tile_idx // 9, 0 if is_two else 6, 1, False)
-            d.append(NakiDecision(p, naki, False))
-        if hand_tensor[tile_idx + coef] * hand_tensor[tile_idx + coef * 2]:
-            naki = Naki.from_chi_info(
-                tile_idx // 9, 1 if is_two else 5, 0 if is_two else 2, False
-            )
-            d.append(NakiDecision(p, naki, False))
+        if (p - player) % 4 == 1:
+            if hand_tensor[tile_idx - 1] * hand_tensor[tile_idx + 1]:
+                naki = Naki.from_chi_info(tile_idx // 9, 0 if is_two else 6, 1, False)
+                chis.append(NakiDecision(p, naki, False))
+            if hand_tensor[tile_idx + coef] * hand_tensor[tile_idx + coef * 2]:
+                naki = Naki.from_chi_info(
+                    tile_idx // 9, 1 if is_two else 5, 0 if is_two else 2, False
+                )
+                chis.append(NakiDecision(p, naki, False))
+
         if hand_tensor[tile_idx] == 2.0:
             naki = Naki.from_pon_info(tile_idx, 0, False, (player - p) % 4)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
+
         if hand_tensor[tile_idx] == 3.0:
             naki = Naki.from_minkan_info(tile_idx, (player - p) % 4, 0)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
 
-    return decisions
+    return [pons, chis]
 
 
 def _three_and_seven_mask(
@@ -107,52 +112,54 @@ def _three_and_seven_mask(
     tile_idx: int,
     is_three: bool = True,
 ):
-    decisions = [[] for _ in range(4)]
+    pons, chis = [], []
     coef = 1 if is_three else -1
 
-    for p, (hand_tensor, d) in enumerate(zip(hand_tensors, decisions)):
+    for p, hand_tensor in enumerate(hand_tensors):
         if p == player:
             continue
 
         player_has_red = hand_tensors[p][34 + tile_idx // 9] > 0.0
         black_fives = hand_tensor[tile_idx] - float(player_has_red)
 
-        if hand_tensor[tile_idx - 2 * coef] * hand_tensor[tile_idx - coef]:
-            naki = Naki.from_chi_info(
-                tile_idx // 9, 0 if is_three else 6, 2 if is_three else 0, False
-            )
-            d.append(NakiDecision(p, naki, False))
-        if hand_tensor[tile_idx - 1] * hand_tensor[tile_idx + 1]:
-            naki = Naki.from_chi_info(tile_idx // 9, 1 if is_three else 5, 1, False)
-            d.append(NakiDecision(p, naki, False))
-        if hand_tensor[tile_idx + coef] * hand_tensor[tile_idx + 2 * coef]:
-            if player_has_red:
+        if (p - player) % 4 == 1:
+            if hand_tensor[tile_idx - 2 * coef] * hand_tensor[tile_idx - coef]:
                 naki = Naki.from_chi_info(
-                    tile_idx // 9, 2 if is_three else 4, 0 if is_three else 2, True
+                    tile_idx // 9, 0 if is_three else 6, 2 if is_three else 0, False
                 )
-                d.append(NakiDecision(p, naki, False))
-                if black_fives > 0:
+                chis.append(NakiDecision(p, naki, False))
+            if hand_tensor[tile_idx - 1] * hand_tensor[tile_idx + 1]:
+                naki = Naki.from_chi_info(tile_idx // 9, 1 if is_three else 5, 1, False)
+                chis.append(NakiDecision(p, naki, False))
+            if hand_tensor[tile_idx + coef] * hand_tensor[tile_idx + 2 * coef]:
+                if player_has_red:
                     naki = Naki.from_chi_info(
-                        tile_idx // 9,
-                        2 if is_three else 4,
-                        0 if is_three else 2,
-                        False,
+                        tile_idx // 9, 2 if is_three else 4, 0 if is_three else 2, True
                     )
-                    d.append(NakiDecision(p, naki, False))
-            else:
-                naki = Naki.from_chi_info(
-                    tile_idx // 9, 2 if is_three else 4, 0 if is_three else 2, False
-                )
-                d.append(NakiDecision(p, naki, False))
+                    chis.append(NakiDecision(p, naki, False))
+                    if black_fives > 0:
+                        naki = Naki.from_chi_info(
+                            tile_idx // 9,
+                            2 if is_three else 4,
+                            0 if is_three else 2,
+                            False,
+                        )
+                        chis.append(NakiDecision(p, naki, False))
+                else:
+                    naki = Naki.from_chi_info(
+                        tile_idx // 9, 2 if is_three else 4, 0 if is_three else 2, False
+                    )
+                    chis.append(NakiDecision(p, naki, False))
+
         if hand_tensor[tile_idx] == 2.0:
             naki = Naki.from_pon_info(tile_idx, 0, False, (player - p) % 4)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
 
         if hand_tensor[tile_idx] == 3.0:
             naki = Naki.from_minkan_info(tile_idx, (player - p) % 4, 0)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
 
-    return decisions
+    return [pons, chis]
 
 
 def _four_and_six_mask(
@@ -161,59 +168,67 @@ def _four_and_six_mask(
     tile_idx: int,
     is_four: bool = True,
 ):
-    decisions = [[] for _ in range(4)]
+    pons, chis = [], []
     coef = 1 if is_four else -1
 
-    for p, (hand_tensor, d) in enumerate(zip(hand_tensors, decisions)):
+    for p, hand_tensor in enumerate(hand_tensors):
         if p == player:
             continue
 
         player_has_red = hand_tensors[p][34 + tile_idx // 9] > 0.0
         black_fives = hand_tensor[tile_idx] - float(player_has_red)
 
-        if hand_tensor[tile_idx - 2 * coef] * hand_tensor[tile_idx - coef]:
-            naki = Naki.from_chi_info(
-                tile_idx // 9, 1 if is_four else 5, 2 if is_four else 0, False
-            )
-            d.append(NakiDecision(p, naki, False))
-        if hand_tensor[tile_idx - 1] * hand_tensor[tile_idx + 1]:
-            if player_has_red:
+        if (p - player) % 4 == 1:
+            if hand_tensor[tile_idx - 2 * coef] * hand_tensor[tile_idx - coef]:
                 naki = Naki.from_chi_info(
-                    tile_idx // 9, 2 if is_four else 4, 0 if is_four else 2, True
+                    tile_idx // 9, 1 if is_four else 5, 2 if is_four else 0, False
                 )
-                d.append(NakiDecision(p, naki, False))
-                if black_fives > 0:
+                chis.append(NakiDecision(p, naki, False))
+            if hand_tensor[tile_idx - 1] * hand_tensor[tile_idx + 1]:
+                if player_has_red:
                     naki = Naki.from_chi_info(
-                        tile_idx // 9,
-                        2 if is_four else 4,
-                        0 if is_four else 2,
-                        False,
+                        tile_idx // 9, 2 if is_four else 4, 0 if is_four else 2, True
                     )
-                    d.append(NakiDecision(p, naki, False))
-            else:
-                naki = Naki.from_chi_info(tile_idx // 9, 2 if is_four else 4, 1, False)
-                d.append(NakiDecision(p, naki, False))
-        if hand_tensor[tile_idx + coef] * hand_tensor[tile_idx + 2 * coef]:
-            if player_has_red:
-                naki = Naki.from_chi_info(tile_idx // 9, 3, 0 if is_four else 2, True)
-                d.append(NakiDecision(p, naki, False))
-                if black_fives > 0:
+                    chis.append(NakiDecision(p, naki, False))
+                    if black_fives > 0:
+                        naki = Naki.from_chi_info(
+                            tile_idx // 9,
+                            2 if is_four else 4,
+                            0 if is_four else 2,
+                            False,
+                        )
+                        chis.append(NakiDecision(p, naki, False))
+                else:
+                    naki = Naki.from_chi_info(
+                        tile_idx // 9, 2 if is_four else 4, 1, False
+                    )
+                    chis.append(NakiDecision(p, naki, False))
+            if hand_tensor[tile_idx + coef] * hand_tensor[tile_idx + 2 * coef]:
+                if player_has_red:
+                    naki = Naki.from_chi_info(
+                        tile_idx // 9, 3, 0 if is_four else 2, True
+                    )
+                    chis.append(NakiDecision(p, naki, False))
+                    if black_fives > 0:
+                        naki = Naki.from_chi_info(
+                            tile_idx // 9, 3, 0 if is_four else 2, False
+                        )
+                        chis.append(NakiDecision(p, naki, False))
+                else:
                     naki = Naki.from_chi_info(
                         tile_idx // 9, 3, 0 if is_four else 2, False
                     )
-                    d.append(NakiDecision(p, naki, False))
-            else:
-                naki = Naki.from_chi_info(tile_idx // 9, 3, 0 if is_four else 2, False)
-                d.append(NakiDecision(p, naki, False))
+                    chis.append(NakiDecision(p, naki, False))
+
         if hand_tensor[tile_idx] == 2.0:
             naki = Naki.from_pon_info(tile_idx, 0, False, (player - p) % 4)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
 
         if hand_tensor[tile_idx] == 3.0:
             naki = Naki.from_minkan_info(tile_idx, (player - p) % 4, 0)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
 
-    return decisions
+    return [pons, chis]
 
 
 def _five_mask(
@@ -222,59 +237,60 @@ def _five_mask(
     tile_idx: int,
     is_red: bool = False,
 ):
-    decisions = [[] for _ in range(4)]
+    pons, chis = [], []
 
-    for p, (hand_tensor, d) in enumerate(zip(hand_tensors, decisions)):
+    for p, hand_tensor in enumerate(hand_tensors):
         if p == player:
             continue
 
         player_has_red = hand_tensors[p][34 + tile_idx // 9] > 0.0
         black_fives = hand_tensor[tile_idx] - float(player_has_red)
 
-        if hand_tensor[tile_idx - 2] * hand_tensor[tile_idx - 1]:
-            naki = Naki.from_chi_info(tile_idx // 9, 2, 2, is_red)
-            d.append(NakiDecision(p, naki, False))
-        if hand_tensor[tile_idx - 1] * hand_tensor[tile_idx + 1]:
-            naki = Naki.from_chi_info(tile_idx // 9, 3, 1, is_red)
-            d.append(NakiDecision(p, naki, False))
-        if hand_tensor[tile_idx + 1] * hand_tensor[tile_idx + 2]:
-            naki = Naki.from_chi_info(tile_idx // 9, 4, 0, is_red)
-            d.append(NakiDecision(p, naki, False))
+        if (p - player) % 4 == 1:
+            if hand_tensor[tile_idx - 2] * hand_tensor[tile_idx - 1]:
+                naki = Naki.from_chi_info(tile_idx // 9, 2, 2, is_red)
+                chis.append(NakiDecision(p, naki, False))
+            if hand_tensor[tile_idx - 1] * hand_tensor[tile_idx + 1]:
+                naki = Naki.from_chi_info(tile_idx // 9, 3, 1, is_red)
+                chis.append(NakiDecision(p, naki, False))
+            if hand_tensor[tile_idx + 1] * hand_tensor[tile_idx + 2]:
+                naki = Naki.from_chi_info(tile_idx // 9, 4, 0, is_red)
+                chis.append(NakiDecision(p, naki, False))
 
         if player_has_red:
             if hand_tensor[tile_idx] == 2.0:
                 naki = Naki.from_pon_info(tile_idx, 1, True, (player - p) % 4)
-                d.append(NakiDecision(p, naki, False))
+                pons.append(NakiDecision(p, naki, False))
             if black_fives == 2.0:
                 naki = Naki.from_pon_info(tile_idx, 0, False, (player - p) % 4)
-                d.append(NakiDecision(p, naki, False))
+                pons.append(NakiDecision(p, naki, False))
         else:
             if hand_tensor[tile_idx] == 2.0:
                 naki = Naki.from_pon_info(
                     tile_idx, 1 if is_red else 0, is_red, (player - p) % 4
                 )
-                d.append(NakiDecision(p, naki, False))
+                pons.append(NakiDecision(p, naki, False))
 
         if hand_tensor[tile_idx] == 3.0:
             naki = Naki.from_minkan_info(tile_idx, (player - p) % 4, 1 if is_red else 0)
-            d.append(NakiDecision(p, naki, False))
+            pons.append(NakiDecision(p, naki, False))
 
-    return decisions
+    return [pons, chis]
 
 
 def _jihai_mask(player: int, hand_tensors: np.ndarray, tile_idx: int):
-    decisions = [[] for _ in range(4)]
+    pons = []
 
-    for p, (hand_tensor, d) in enumerate(zip(hand_tensors, decisions)):
+    for p, hand_tensor in enumerate(hand_tensors):
         if p == player:
             continue
 
         if hand_tensor[tile_idx] == 2.0:
-            d.append(NakiDecision(p, Naki(0), False))
+            pons.append(NakiDecision(p, Naki(0), False))
         if hand_tensor[tile_idx] == 3.0:
-            d.append(NakiDecision(p, Naki(0), False))
+            pons.append(NakiDecision(p, Naki(0), False))
 
-    return decisions
+    return [pons, []]
 
 
 def decision_mask(

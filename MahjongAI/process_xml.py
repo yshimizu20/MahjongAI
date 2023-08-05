@@ -14,7 +14,6 @@ from MahjongAI.state import StateObject
 from MahjongAI.decision import (
     NakiDecision,
     ReachDecision,
-    PassDecision,
     decision_mask,
 )
 from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
@@ -167,13 +166,13 @@ def process(file_path: str, verbose: bool = False):
                         if isinstance(decision, ReachDecision):
                             decision.executed = True
                             break
-                else:  # step == 2
+                else:  # event["attr"]["step"] == 2
                     assert isinstance(curr_halfturn, PostTurn)
                     reaches = reaches[:]
                     reaches[player] = 1
                     kyotaku += 1
                     scores = scores.copy()
-                    scores[player] -= 1000
+                    scores[player] -= 10
                     if cycles <= 4 and min(is_menzen):
                         double_reaches = double_reaches[:]
                         double_reaches[player] = 1
@@ -284,7 +283,7 @@ def process(file_path: str, verbose: bool = False):
                 hand_tensors_full[player][tile_idx] += 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 2
 
-                during_decisions = [PassDecision(player, executed=False)]
+                during_decisions = []
                 # check if tsumo is possible
                 during_decisions += evaluate_tsumo(
                     player=player,
@@ -376,12 +375,11 @@ def process(file_path: str, verbose: bool = False):
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1.0
-
                 remaining_tiles_pov[player][tile_idx] += 1.0
-                post_decisions = decision_mask(
-                    player, hand_tensors, tile_idx[0], len(tile_idx) == 2
-                )
-                num_naki = sum(len(m) for m in melds)
+
+                # post_decisions will contain three lists of different decisions: ron, pon/kan, chi
+                post_decisions = []
+
                 rons = evaluate_ron(
                     player=player,
                     hand_tensors_full=hand_tensors_full,
@@ -395,17 +393,20 @@ def process(file_path: str, verbose: bool = False):
                     is_haitei=(remaining_tsumo == 0),
                     double_reaches=double_reaches,
                     is_renhou=[
-                        remaining_tsumo + i - 68 >= 0 and num_naki == 0
-                        for i in range(4)
+                        (cycles <= 3 and player >= cycles and min(is_menzen))
+                        for _ in range(4)
                     ],
                     player_wind=roundinfo.player_wind,
                     round_wind=roundinfo.round_wind,
                     kyotaku=kyotaku,
                     honba=honba,
                 )
-                for ron, lst in zip(rons, post_decisions):
-                    if ron is not None:
-                        lst.append(ron)
+                post_decisions.append(rons)
+
+                pon_chi_decisions = decision_mask(
+                    player, hand_tensors, tile_idx[0], len(tile_idx) == 2
+                )
+                post_decisions += pon_chi_decisions
 
                 half_turn = PostTurn(
                     player=player,
@@ -423,6 +424,7 @@ def process(file_path: str, verbose: bool = False):
 
         if event["event"] == "AGARI":
             result = AgariResult(list(map(int, event["attr"]["sc"].split(","))))
+            # TODO: make decision executed = True
 
         elif event["event"] == "RYUUKYOKU":
             result = RyukyokuResult(list(map(int, event["attr"]["sc"].split(","))))
