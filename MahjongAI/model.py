@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+# Hyperparameters
 ENCODER_EMBD_DIM = 5000  # leave some margin for now
 DECODER_STATE_OBJ_DIM = [(37, 3), (4, 7), (1, 4)]
 DECODER_EMBD_DIM = 1024
@@ -22,125 +23,56 @@ learning_rate = 3e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class Head(nn.Module):
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(EMBD_SIZE, head_size, bias=False)
-        self.query = nn.Linear(EMBD_SIZE, head_size, bias=False)
-        self.value = nn.Linear(EMBD_SIZE, head_size, bias=False)
-
-        self.dropout = nn.Dropout(DROPOUT_RATIO)
-
-    def forward(self, k, v, q):
-        k = self.key(k)
-        q = self.query(q)
-
-        # compute attention scores
-        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** 0.5
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-
-        v = self.value(v)
-        out = wei @ v
-        return out
-
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, EMBD_SIZE)
-        self.dropout = nn.Dropout(DROPOUT_RATIO)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
-
-
-class FeedForward(nn.Module):
-    def __init__(self, EMBD_SIZE):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(EMBD_SIZE, 4 * EMBD_SIZE),
-            nn.GELU(),
-            nn.Linear(4 * EMBD_SIZE, EMBD_SIZE),
-            nn.Dropout(DROPOUT_RATIO),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class DecoderBlock(nn.Module):
-    def __init__(self, EMBD_SIZE, num_heads):
-        super().__init__()
-        head_size = EMBD_SIZE // num_heads
-        self.attention = MultiHeadAttention(num_heads, head_size)
-        self.ffwd = FeedForward(EMBD_SIZE)
-        self.ln1 = nn.LayerNorm(EMBD_SIZE)
-        self.ln2 = nn.LayerNorm(EMBD_SIZE)
-        self.ln3 = nn.LayerNorm(EMBD_SIZE)
-        self.ln4 = nn.LayerNorm(EMBD_SIZE)
-
-    def forward(self, k, v, q):
-        k = self.ln1(k)
-        v = self.ln2(v)
-        q = self.ln3(q)
-
-        q = q + self.attention(k, v, q)
-        q = q + self.ffwd(self.ln4(q))
-        return q
-
-
-class EncoderBlock(nn.Module):
-    def __init__(self, EMBD_SIZE, num_heads):
-        super().__init__()
-        head_size = EMBD_SIZE // num_heads
-        self.attention = MultiHeadAttention(num_heads, head_size)
-        self.ffwd = FeedForward(EMBD_SIZE)
-        self.ln1 = nn.LayerNorm(EMBD_SIZE)
-        self.ln2 = nn.LayerNorm(EMBD_SIZE)
-
-    def forward(self, x):
-        x = self.ln1(x)
-        x = x + self.attention(x, x, x)
-        x = x + self.ffwd(self.ln2(x))
-        return x
-
-
-class StateNet(nn.Module):
+class TransformerModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[0][1], 8, 3, padding=1)
-        self.norm1_1 = nn.BatchNorm2d(8)
-        self.conv1_2 = nn.Conv2d(8, 8, 3, padding=1)
-        self.norm1_2 = nn.BatchNorm2d(8)
-        self.fc1 = nn.Linear(DECODER_STATE_OBJ_DIM[0][0] * 8, 64)
+        self.encoder = Encoder()
+        self.decoder = Decoder()
 
-        self.conv2_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[1][1], 8, 3, padding=1)
-        self.norm2_1 = nn.BatchNorm2d(8)
-        self.fc2 = nn.Linear(DECODER_STATE_OBJ_DIM[1][0] * 8, 16)
+        self.apply(self._init_weights)
 
-        self.fc = nn.Linear(
-            64 + 16 + DECODER_STATE_OBJ_DIM[2][0] * DECODER_STATE_OBJ_DIM[2][1],
-            EMBD_SIZE,
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, std=0.02)
+
+    def forward(
+        self, enc_indices: np.array, state_obj: torch.tensor, head: str, target=None
+    ):
+        enc_out = self.encoder(enc_indices)
+        logits, loss = self.decoder(enc_out, state_obj, target, head)
+        return logits, loss
+
+
+class Encoder(nn.Module):
+    def __init__(self, n_layers=N_LAYERS):
+        super().__init__()
+        # TODO: replace token_embedding with neural network (keep position_embedding_table)
+        self.token_embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
+        self.position_embedding_table = nn.Embedding(MAX_ACTION_LEN, EMBD_SIZE)
+        self.blocks = nn.Sequential(
+            *[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)]
         )
 
-    def forward(self, state_obj):
-        x1, x2, x3 = state_obj
+        self.apply(self._init_weights)
 
-        x1 = F.relu(self.norm1_1(self.conv1_1(x1)))
-        x1 = F.relu(self.norm1_2(self.conv1_2(x1)))
-        x1 = x1.view(x1.shape[0], -1)
-        x1 = F.relu(self.fc1(x1))
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, std=0.02)
 
-        x2 = F.relu(self.norm2_1(self.conv2_1(x2)))
-        x2 = x2.view(x2.shape[0], -1)
-        x2 = F.relu(self.fc2(x2))
-
-        x = torch.cat([x1, x2, x3], dim=-1)
-        x = F.relu(self.fc(x))
+    def forward(self, enc_indices: torch.Tensor):
+        B, T = enc_indices.shape
+        tok = self.token_embedding_table(enc_indices)
+        pos = self.position_embedding_table(torch.arange(T, device=device))
+        x = tok + pos
+        x = self.blocks(x)
         return x
 
 
@@ -193,57 +125,130 @@ class Decoder(nn.Module):
         return logits, loss
 
 
-class Encoder(nn.Module):
-    def __init__(self, n_layers=N_LAYERS):
+class EncoderBlock(nn.Module):
+    def __init__(self, EMBD_SIZE, num_heads):
         super().__init__()
-        # TODO: replace embedding with neural network (keep position embedding table)
-        self.token_embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
-        self.position_embedding_table = nn.Embedding(MAX_ACTION_LEN, EMBD_SIZE)
-        self.blocks = nn.Sequential(
-            *[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)]
-        )
+        head_size = EMBD_SIZE // num_heads
+        self.attention = MultiHeadAttention(num_heads, head_size)
+        self.ffwd = FeedForward(EMBD_SIZE)
+        self.ln1 = nn.LayerNorm(EMBD_SIZE)
+        self.ln2 = nn.LayerNorm(EMBD_SIZE)
 
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, std=0.02)
-
-    def forward(self, enc_indices: torch.Tensor):
-        B, T = enc_indices.shape
-        tok = self.token_embedding_table(enc_indices)
-        pos = self.position_embedding_table(torch.arange(T, device=device))
-        x = tok + pos
-        x = self.blocks(x)
+    def forward(self, x):
+        x = self.ln1(x)
+        x = x + self.attention(x, x, x)
+        x = x + self.ffwd(self.ln2(x))
         return x
 
 
-class TransformerModel(nn.Module):
+class DecoderBlock(nn.Module):
+    def __init__(self, EMBD_SIZE, num_heads):
+        super().__init__()
+        head_size = EMBD_SIZE // num_heads
+        self.attention = MultiHeadAttention(num_heads, head_size)
+        self.ffwd = FeedForward(EMBD_SIZE)
+        self.ln1 = nn.LayerNorm(EMBD_SIZE)
+        self.ln2 = nn.LayerNorm(EMBD_SIZE)
+        self.ln3 = nn.LayerNorm(EMBD_SIZE)
+        self.ln4 = nn.LayerNorm(EMBD_SIZE)
+
+    def forward(self, k, v, q):
+        k = self.ln1(k)
+        v = self.ln2(v)
+        q = self.ln3(q)
+
+        q = q + self.attention(k, v, q)
+        q = q + self.ffwd(self.ln4(q))
+        return q
+
+
+class StateNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = Encoder()
-        self.decoder = Decoder()
 
-        self.apply(self._init_weights)
+        # subnetwork 1
+        self.conv1_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[0][1], 8, 3, padding=1)
+        self.norm1_1 = nn.BatchNorm2d(8)
+        self.conv1_2 = nn.Conv2d(8, 8, 3, padding=1)
+        self.norm1_2 = nn.BatchNorm2d(8)
+        self.fc1 = nn.Linear(DECODER_STATE_OBJ_DIM[0][0] * 8, 64)
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, std=0.02)
+        # subnetwork 2
+        self.conv2_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[1][1], 8, 3, padding=1)
+        self.norm2_1 = nn.BatchNorm2d(8)
+        self.fc2 = nn.Linear(DECODER_STATE_OBJ_DIM[1][0] * 8, 16)
 
-    def forward(
-        self, enc_indices: np.array, state_obj: torch.tensor, head: str, target=None
-    ):
-        enc_out = self.encoder(enc_indices)
-        logits, loss = self.decoder(enc_out, state_obj, target, head)
-        return logits, loss
+        # main network
+        self.fc = nn.Linear(
+            64 + 16 + DECODER_STATE_OBJ_DIM[2][0] * DECODER_STATE_OBJ_DIM[2][1],
+            EMBD_SIZE,
+        )
+
+    def forward(self, state_obj):
+        x1, x2, x3 = state_obj
+
+        x1 = F.relu(self.norm1_1(self.conv1_1(x1)))
+        x1 = F.relu(self.norm1_2(self.conv1_2(x1)))
+        x1 = x1.view(x1.shape[0], -1)
+        x1 = F.relu(self.fc1(x1))
+
+        x2 = F.relu(self.norm2_1(self.conv2_1(x2)))
+        x2 = x2.view(x2.shape[0], -1)
+        x2 = F.relu(self.fc2(x2))
+
+        x = torch.cat([x1, x2, x3], dim=-1)
+        x = F.relu(self.fc(x))
+        return x
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, EMBD_SIZE)
+        self.dropout = nn.Dropout(DROPOUT_RATIO)
+
+    def forward(self, k, v, q):
+        out = torch.cat([h(k, v, q) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(EMBD_SIZE, head_size, bias=False)
+        self.query = nn.Linear(EMBD_SIZE, head_size, bias=False)
+        self.value = nn.Linear(EMBD_SIZE, head_size, bias=False)
+
+        self.dropout = nn.Dropout(DROPOUT_RATIO)
+
+    def forward(self, k, v, q):
+        k = self.key(k)
+        q = self.query(q)
+
+        # compute attention scores
+        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** 0.5
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+
+        v = self.value(v)
+        out = wei @ v
+        return out
+
+
+class FeedForward(nn.Module):
+    def __init__(self, EMBD_SIZE):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(EMBD_SIZE, 4 * EMBD_SIZE),
+            nn.GELU(),
+            nn.Linear(4 * EMBD_SIZE, EMBD_SIZE),
+            nn.Dropout(DROPOUT_RATIO),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 if __name__ == "__main__":
