@@ -133,6 +133,8 @@ def process(file_path: str, verbose: bool = False):
         is_menzen = [True] * 4
         curr_halfturn = None
         cycles = 0
+        encoding_tokens = []
+        acquired = None
 
         if verbose:
             print(f"Scores: {scores}")
@@ -148,6 +150,8 @@ def process(file_path: str, verbose: bool = False):
             eventtype = event["event"]
 
             if eventtype == "DORA":
+                acquired = None
+
                 tile = int(event["attr"]["hai"])
                 tile_idx = TILE2IDX[tile]
                 doras = doras[:] + [tile]
@@ -155,6 +159,7 @@ def process(file_path: str, verbose: bool = False):
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1
                 remaining_tsumo -= 1
+                encoding_tokens.append(new_dora2idx(tile_idx))
 
             elif eventtype == "REACH":
                 assert curr_halfturn is not None
@@ -162,10 +167,13 @@ def process(file_path: str, verbose: bool = False):
 
                 if event["attr"]["step"] == "1":
                     assert isinstance(curr_halfturn, DuringTurn)
+                    assert acquired is not None
+
                     for decision in curr_halfturn.decisions:
                         if isinstance(decision, ReachDecision):
                             decision.executed = True
                             break
+
                 else:  # event["attr"]["step"] == 2
                     assert isinstance(curr_halfturn, PostTurn)
                     reaches = reaches[:]
@@ -176,12 +184,14 @@ def process(file_path: str, verbose: bool = False):
                     if cycles <= 4 and min(is_menzen):
                         double_reaches = double_reaches[:]
                         double_reaches[player] = 1
+                    encoding_tokens.append(reach2idx(player))
 
                 ippatsu = ippatsu[:]
                 ippatsu[player] = 1
 
             elif eventtype == "N":
                 assert curr_halfturn is not None
+                acquired = None
 
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
@@ -200,6 +210,7 @@ def process(file_path: str, verbose: bool = False):
                             ):
                                 decision.executed = True
                                 break
+
                 else:
                     assert isinstance(curr_halfturn, PostTurn)
                     # TODO: exclude decision that would not have been picked up anyways
@@ -267,29 +278,35 @@ def process(file_path: str, verbose: bool = False):
 
                 # TODO: add logic for ankan kokushi ron
 
+                curr_halfturn = None
+                encoding_tokens.append(naki2idx(player, naki))
+
             elif eventtype[0] in ["T", "U", "V", "W"]:
+                assert acquired is None
                 curr_halfturn = None
 
                 player = ["T", "U", "V", "W"].index(eventtype[0])
                 cycles += 1
-                tile = int(eventtype[1:])
-                tile_idx = TILE2IDX[tile]
+                acquired = int(eventtype[1:])
+                tile_idx = TILE2IDX[acquired]
                 remaining_tiles[tile_idx] -= 1
                 remaining_tiles_pov[player][tile_idx] -= 1
                 remaining_tsumo -= 1
-                assert hands[player, tile] == 0.0
-                hands[player, tile] = 1.0
+                assert hands[player, acquired] == 0.0
+
+                hands[player, acquired] = 1.0
                 hand_tensors[player][tile_idx] += 1.0
                 hand_tensors_full[player][tile_idx] += 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 2
 
                 during_decisions = []
+
                 # check if tsumo is possible
                 during_decisions += evaluate_tsumo(
                     player=player,
                     hand_tensors_full=hand_tensors_full,
                     naki_list=melds,
-                    tsumo_tile=tile,
+                    tsumo_tile=acquired,
                     doras=doras,
                     reaches=reaches,
                     ippatsu=ippatsu,
@@ -303,11 +320,13 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku=kyotaku,
                     honba=honba,
                 )
+
                 # check if ankan is possible
                 for i in np.where(hand_tensors[player] == 4.0)[0]:
                     during_decisions.append(
                         NakiDecision(player, Naki.from_ankan_info(i), executed=False)
                     )
+
                 # TODO: make it cleaner
                 # check if kakan is possible
                 for meld in melds[player]:
@@ -319,6 +338,7 @@ def process(file_path: str, verbose: bool = False):
                                     player, Naki(9 * color + number), executed=False
                                 )
                             )
+
                 # check if reach is possible
                 if not reaches[player] and is_menzen[player]:
                     shanten = shanten_solver.calculate_shanten(
@@ -340,19 +360,28 @@ def process(file_path: str, verbose: bool = False):
                     honba=honba,
                     dora=doras,  # share same dora list
                 )
+
                 halfturn = DuringTurn(
                     player=player,
                     stateObj=stateObj,
                     decisions=during_decisions,
+                    encoding_tokens=encoding_tokens[:],
                 )
+
                 halfturns.append(halfturn)
                 curr_halfturn = halfturn  # carry over
                 if sum(ippatsu):
                     ippatsu = [0] * 4
 
             elif eventtype[0] in ["D", "E", "F", "G"]:
-                player = ["D", "E", "F", "G"].index(eventtype[0])
+                assert acquired is not None
+
+                # the tile was obtained through tsumo
+                if curr_halfturn is not None:
+                    assert isinstance(curr_halfturn, DuringTurn)
                 curr_halfturn = None
+
+                player = ["D", "E", "F", "G"].index(eventtype[0])
 
                 tile = int(eventtype[1:])
                 tile_idx = TILE2IDX[tile]
@@ -362,6 +391,7 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     stateObj=stateObj,
                     discarded_tile=tile,
+                    encoding_tokens=encoding_tokens[:],
                 )
                 halfturns.append(half_turn)
 
@@ -412,9 +442,15 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     stateObj=stateObj,
                     decisions=post_decisions,
+                    encoding_tokens=encoding_tokens[:],
                 )
                 halfturns.append(half_turn)
                 curr_halfturn = half_turn  # carry over
+
+                encoding_tokens.append(
+                    discard2idx(player, tile_idx[0], tile == acquired)
+                )
+                acquired = None
 
             else:
                 raise ValueError(f"Invalid event type: {eventtype}")
@@ -443,54 +479,54 @@ def process(file_path: str, verbose: bool = False):
     return all_halfturns
 
 
-# NAKI_IDX_START = 37 * 4 * 2
-# CHI_IDX_START = NAKI_IDX_START
-# PON_IDX_START = CHI_IDX_START + 4 * 3 * 3 * 7 * 3 * 2
-# KAKAN_IDX_START = PON_IDX_START + 4 * 3 * 4 * 9 * 2
-# MINKAN_IDX_START = KAKAN_IDX_START + 4 * 4 * 9 * 2
-# ANKAN_IDX_START = MINKAN_IDX_START + 4 * 3 * 4 * 9 * 2
-# REACH_IDX_START = ANKAN_IDX_START + 4 * 4 * 9 * 2
-# NEW_DORA_IDX_START = REACH_IDX_START + 4  # 4116
+NAKI_IDX_START = 37 * 4 * 2
+CHI_IDX_START = NAKI_IDX_START
+PON_IDX_START = CHI_IDX_START + 4 * 3 * 3 * 7 * 3 * 2
+KAKAN_IDX_START = PON_IDX_START + 4 * 3 * 4 * 9 * 2
+MINKAN_IDX_START = KAKAN_IDX_START + 4 * 4 * 9 * 2
+ANKAN_IDX_START = MINKAN_IDX_START + 4 * 3 * 4 * 9 * 2
+REACH_IDX_START = ANKAN_IDX_START + 4 * 4 * 9 * 2
+NEW_DORA_IDX_START = REACH_IDX_START + 4  # 4116
 
 
-# def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
-#     return (who * 37 + tile_idx) * 2 + int(is_tsumogiri)
+def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
+    return (who * 37 + tile_idx) * 2 + int(is_tsumogiri)
 
 
-# def naki2idx(who: int, naki: Naki):
-#     from_who = naki.from_who()
-#     if naki.is_chi():
-#         color, number, which, has_red, *_ = naki.pattern_chi()
-#         return NAKI_IDX_START + (
-#             ((((who * 3 + from_who - 1) * 3 + color) * 7 + number) * 3 + which) * 2
-#             + int(has_red)
-#         )
-#     elif naki.is_pon():
-#         color, number, _, has_red, *_ = naki.pattern_pon()
-#         return PON_IDX_START + (
-#             (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
-#         )
-#     elif naki.is_kakan():
-#         color, number, _, has_red, *_ = naki.pattern_kakan()
-#         return KAKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
-#     elif naki.is_minkan():
-#         color, number, _, has_red, *_ = naki.pattern_minkan()
-#         return MINKAN_IDX_START + (
-#             (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
-#         )
-#     elif naki.is_ankan():
-#         color, number, _, has_red, *_ = naki.pattern_ankan()
-#         return ANKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
-#     else:
-#         raise ValueError("Invalid naki code")
+def naki2idx(who: int, naki: Naki):
+    from_who = naki.from_who()
+    if naki.is_chi():
+        color, number, which, has_red, *_ = naki.pattern_chi()
+        return NAKI_IDX_START + (
+            ((((who * 3 + from_who - 1) * 3 + color) * 7 + number) * 3 + which) * 2
+            + int(has_red)
+        )
+    elif naki.is_pon():
+        color, number, _, has_red, *_ = naki.pattern_pon()
+        return PON_IDX_START + (
+            (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
+        )
+    elif naki.is_kakan():
+        color, number, _, has_red, *_ = naki.pattern_kakan()
+        return KAKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
+    elif naki.is_minkan():
+        color, number, _, has_red, *_ = naki.pattern_minkan()
+        return MINKAN_IDX_START + (
+            (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
+        )
+    elif naki.is_ankan():
+        color, number, _, has_red, *_ = naki.pattern_ankan()
+        return ANKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
+    else:
+        raise ValueError("Invalid naki code")
 
 
-# def reach2idx(who: int):
-#     return REACH_IDX_START + who
+def reach2idx(who: int):
+    return REACH_IDX_START + who
 
 
-# def new_dora2idx(tile_idx: int):
-#     return NEW_DORA_IDX_START + tile_idx
+def new_dora2idx(tile_idx: int):
+    return NEW_DORA_IDX_START + tile_idx
 
 
 if __name__ == "__main__":

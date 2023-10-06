@@ -1,65 +1,7 @@
 from typing import List
 
-# from MahjongAI.draw import Draw, Naki, Tsumo
-# from MahjongAI.discard import Discard
 from MahjongAI.state import StateObject
 from MahjongAI.decision import Decision
-
-
-# class Turn:
-#     TSUMO = 0
-#     NAKI = 1
-
-#     def __init__(
-#         self,
-#         player: int,
-#         type_: int,
-#         draw: Draw,
-#         stateObj: StateObject = None,
-#         discard: Discard = None,
-#     ):
-#         self.player = player
-#         self.type = type_
-#         self.draw = draw
-#         self.stateObj = stateObj
-#         self.discard = discard
-#         self.pre_decisions = []
-#         self.post_decisions = []
-
-#     @abstractmethod
-#     def is_tsumogiri(self):
-#         if self.draw is None or self.discard is None:
-#             raise ValueError("draw and discard must be set")
-
-
-# class TsumoTurn(Turn):
-#     def __init__(
-#         self,
-#         player: int,
-#         draw: Tsumo = None,
-#         stateObj: StateObject = None,
-#         discard: Discard = None,
-#     ):
-#         super().__init__(player, Turn.TSUMO, draw, stateObj, discard)
-
-#     def is_tsumogiri(self):
-#         super().is_tsumogiri()
-#         return self.draw.tile == self.discard.tile
-
-
-# class NakiTurn(Turn):
-#     def __init__(
-#         self,
-#         player: int,
-#         naki: Naki,
-#         stateObj: StateObject = None,
-#         discard: Discard = None,
-#     ):
-#         super().__init__(player, Turn.NAKI, naki, stateObj, discard)
-
-#     def is_tsumogiri(self):
-#         super().is_tsumogiri()
-#         return False
 
 
 class HalfTurn:
@@ -72,10 +14,12 @@ class HalfTurn:
         player: int,
         type_: int,
         stateObj: StateObject,
+        encoding_tokens: List[int],
     ):
         self.player = player
         self.type_ = type_
         self.stateObj = stateObj
+        self.encoding_tokens = encoding_tokens
 
 
 class DuringTurn(HalfTurn):
@@ -84,8 +28,9 @@ class DuringTurn(HalfTurn):
         player: int,
         stateObj: StateObject,
         decisions: List[Decision],
+        encoding_tokens: List[int],
     ):
-        super().__init__(player, HalfTurn.DURING, stateObj)
+        super().__init__(player, HalfTurn.DURING, stateObj, encoding_tokens)
         self.decisions = decisions
 
 
@@ -94,9 +39,10 @@ class DiscardTurn(HalfTurn):
         self,
         player: int,
         stateObj: StateObject,
-        discarded_tile: int,  # 0-136
+        discarded_tile: int,  # 0-135
+        encoding_tokens: List[int],
     ):
-        super().__init__(player, HalfTurn.DISCARD, stateObj)
+        super().__init__(player, HalfTurn.DISCARD, stateObj, encoding_tokens)
         self.discarded_tile = discarded_tile
 
 
@@ -106,6 +52,7 @@ class PostTurn(HalfTurn):
         player: int,
         stateObj: StateObject,
         decisions: List[List[Decision]],
+        encoding_tokens: List[int],
     ):
-        super().__init__(player, HalfTurn.POST, stateObj)
+        super().__init__(player, HalfTurn.POST, stateObj, encoding_tokens)
         self.decisions = decisions

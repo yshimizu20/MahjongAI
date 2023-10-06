@@ -48,6 +48,23 @@ class PassDecision(Decision):
         return f"PassDecision: player={self.player}, executed={self.executed}"
 
 
+def decision_mask(
+    player: int, hand_tensors: np.ndarray, tile_idx: int, is_red: bool = False
+):
+    if tile_idx > 26:
+        return _jihai_mask(player, hand_tensors, tile_idx)
+    elif tile_idx % 9 in [0, 8]:
+        return _one_and_nine_mask(player, hand_tensors, tile_idx, tile_idx % 9 == 0)
+    elif tile_idx % 9 in [1, 7]:
+        return _two_and_eight_mask(player, hand_tensors, tile_idx, tile_idx % 9 == 1)
+    elif tile_idx % 9 in [2, 6]:
+        return _three_and_seven_mask(player, hand_tensors, tile_idx, tile_idx % 9 == 2)
+    elif tile_idx % 9 in [3, 5]:
+        return _four_and_six_mask(player, hand_tensors, tile_idx, tile_idx % 9 == 3)
+    elif tile_idx % 9 == 4:
+        return _five_mask(player, hand_tensors, tile_idx, is_red)
+
+
 def _one_and_nine_mask(
     player: int, hand_tensors: np.ndarray, tile_idx: int, is_one: bool = True
 ):
@@ -291,20 +308,3 @@ def _jihai_mask(player: int, hand_tensors: np.ndarray, tile_idx: int):
             pons.append(NakiDecision(p, Naki(0), False))
 
     return [pons, []]
-
-
-def decision_mask(
-    player: int, hand_tensors: np.ndarray, tile_idx: int, is_red: bool = False
-):
-    if tile_idx > 26:
-        return _jihai_mask(player, hand_tensors, tile_idx)
-    elif tile_idx % 9 in [0, 8]:
-        return _one_and_nine_mask(player, hand_tensors, tile_idx, tile_idx % 9 == 0)
-    elif tile_idx % 9 in [1, 7]:
-        return _two_and_eight_mask(player, hand_tensors, tile_idx, tile_idx % 9 == 1)
-    elif tile_idx % 9 in [2, 6]:
-        return _three_and_seven_mask(player, hand_tensors, tile_idx, tile_idx % 9 == 2)
-    elif tile_idx % 9 in [3, 5]:
-        return _four_and_six_mask(player, hand_tensors, tile_idx, tile_idx % 9 == 3)
-    elif tile_idx % 9 == 4:
-        return _five_mask(player, hand_tensors, tile_idx, is_red)

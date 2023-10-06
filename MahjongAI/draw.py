@@ -212,9 +212,9 @@ class Naki(Draw):
         else:
             raise ValueError("Invalid naki code")
 
-        return exposed, acquired
+        return exposed, acquired  # 0 - 135
 
 
 class Tsumo(Draw):
     def __init__(self, tile: int):
-        self.tile = tile  # 0-136
+        self.tile = tile  # 0-135
