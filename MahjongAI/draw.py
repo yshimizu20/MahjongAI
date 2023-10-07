@@ -96,7 +96,6 @@ class Naki(Draw):
     def _clean_kakan(self):
         _, _, which, red, *_ = self.pattern_kakan()
         code = self.naki_code & ~(0x60)
-        print(red, which)
         if not red or which:
             code |= 0x20
         return code
@@ -119,10 +118,10 @@ class Naki(Draw):
         return bool(self.naki_code & 0x4)
 
     def is_pon(self):
-        return not self.is_chi() and (self.naki_code & 0x8)
+        return not self.is_chi() and (self.naki_code & 0x8) != 0
 
     def is_kakan(self):
-        return not self.is_chi() and (self.naki_code & 0x10)
+        return not self.is_chi() and (self.naki_code & 0x10) != 0
 
     def is_minkan(self):
         return self.naki_code & 0b111100 == 0 and self.from_who()
@@ -165,8 +164,9 @@ class Naki(Draw):
         color = pattern // 9
         number = pattern % 9
         has_red = number == 4 and color != 3
-        exposed = [(9 * color + number) * 4 + c for c in range(4)]
-        acquired = exposed.pop(which)
+        code = (self.naki_code & 0x0060) >> 5
+        exposed = [(9 * color + number) * 4 + code]
+        acquired = None
         return (color, number, which, has_red, exposed, acquired)
 
     def pattern_minkan(self):
@@ -212,9 +212,14 @@ class Naki(Draw):
         else:
             raise ValueError("Invalid naki code")
 
-        return exposed, acquired  # 0 - 135
+        return exposed, acquired  # 0-135
 
 
 class Tsumo(Draw):
     def __init__(self, tile: int):
         self.tile = tile  # 0-135
+
+
+n = Naki(28673)
+print(n.is_chi(), n.is_pon(), n.is_kakan(), n.is_minkan(), n.is_ankan())
+print(n.pattern_minkan())

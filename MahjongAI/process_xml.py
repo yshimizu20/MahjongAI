@@ -23,54 +23,22 @@ from MahjongAI.result import AgariResult, RyukyokuResult
 shanten_solver = Shanten()
 
 
-def get_rounds(file_path: str):
-    with open(file_path, "rb") as file:
-        tree = ET.parse(file)
-        root = tree.getroot()
-
-    events = []
-
-    def traverse(element: ET.Element):
-        item = {"event": element.tag, "attr": element.attrib}
-        events.append(item)
-        for child in element:
-            traverse(child)
-
-    traverse(root)
-
-    # get game config
-    gametype = root.findall("GO")
-    if len(gametype) != 1:
-        raise ValueError("Invalid number of game type elements")
-    try:
-        gameinfo = GameInfo(int(gametype[0].attrib["type"]))
-    except:
-        raise ValueError("Invalid game type element")
-
-    # group events into each round
-    rounds = []
-    curr_round_events = []
-
-    for event in events:
-        if event["event"] in ["mjloggm", "SHUFFLE", "UN", "GO", "TAIKYOKU"]:
-            continue
-
-        curr_round_events.append(event)
-
-        if event["event"] in ["AGARI", "RYUUKYOKU"]:
-            rounds.append(curr_round_events)
-            curr_round_events = []
-
-    return gameinfo, rounds
+class InvalidGameException(Exception):
+    def __init__(self, msg):
+        self.msg = msg
 
 
 def process(file_path: str, verbose: bool = False):
-    gameinfo, rounds = get_rounds(file_path)
+    gameinfo, rounds = _get_rounds(file_path)
 
-    assert gameinfo.against_human() == 1
-    assert gameinfo.no_red() == 0
-    assert gameinfo.kansaki() == 0
-    assert gameinfo.three_players() == 0
+    if gameinfo.against_human() != 1:
+        raise InvalidGameException("Against human")
+    if gameinfo.no_red() == 1:
+        raise InvalidGameException("Red tiles")
+    if gameinfo.kansaki() == 1:
+        raise InvalidGameException("Kansaki")
+    if gameinfo.three_players() == 1:
+        raise InvalidGameException("Three players")
 
     all_halfturns = []
 
@@ -97,7 +65,7 @@ def process(file_path: str, verbose: bool = False):
         remaining_tiles = REMAINING_TILES.copy()
         remaining_tiles_pov = [REMAINING_TILES.copy() for _ in range(4)]
         remaining_tsumo = REMAINING_TSUMO
-        hand_tensors = [np.zeros(37, dtype=np.float32) for _ in range(4)]  # 0 - 36
+        hand_tensors = [np.zeros(37, dtype=np.float32) for _ in range(4)]  # 0-36
         sutehai_tensor = np.zeros((4, 37), dtype=np.float32)  # to check furiten
 
         for hi, ht, pov in zip(hand_indices, hand_tensors, remaining_tiles_pov):
@@ -135,6 +103,7 @@ def process(file_path: str, verbose: bool = False):
         cycles = 0
         encoding_tokens = []
         acquired = None
+        result_idx = None
 
         if verbose:
             print(f"Scores: {scores}")
@@ -146,14 +115,13 @@ def process(file_path: str, verbose: bool = False):
             print(f"Parent rounds remaining: {parent_rounds_remaining}")
             print("\n" + "=" * 20 + "\n")
 
-        for event in kyoku_events[1:-1]:
+        for event_idx, event in enumerate(kyoku_events[1:]):
+            # print(event)
             eventtype = event["event"]
 
             if eventtype == "DORA":
-                acquired = None
-
                 tile = int(event["attr"]["hai"])
-                tile_idx = TILE2IDX[tile]
+                tile_idx = TILE2IDX[tile][0]
                 doras = doras[:] + [tile]
                 remaining_tiles[tile_idx] -= 1
                 for pov in remaining_tiles_pov:
@@ -200,12 +168,13 @@ def process(file_path: str, verbose: bool = False):
                 melds[player] = melds[player][:] + [naki]
 
                 # change executed to True
-                if naki.is_ankan():
+                if naki.is_ankan() or naki.is_kakan():
                     assert isinstance(curr_halfturn, DuringTurn)
                     for lst in curr_halfturn.decisions:
                         for decision in lst:
                             if (
-                                decision.naki.convenient_naki_code
+                                isinstance(decision, NakiDecision)
+                                and decision.naki.convenient_naki_code
                                 == naki.convenient_naki_code
                             ):
                                 decision.executed = True
@@ -217,7 +186,8 @@ def process(file_path: str, verbose: bool = False):
                     for lst in curr_halfturn.decisions:
                         for decision in lst:
                             if (
-                                decision.naki.convenient_naki_code
+                                isinstance(decision, NakiDecision)
+                                and decision.naki.convenient_naki_code
                                 == naki.convenient_naki_code
                             ):
                                 decision.executed = True
@@ -225,19 +195,25 @@ def process(file_path: str, verbose: bool = False):
 
                 if not naki.is_chi() and not naki.is_pon():
                     remaining_tsumo -= 1
+
                 exposed, acquired = naki.get_exposed()
                 exposed_idx = TILE2IDX[exposed]
+
                 for i, pov in enumerate(remaining_tiles_pov):
                     if i == player:
                         continue
                     for e in exposed_idx:
                         for ee in e:
                             pov[ee] -= 1.0
+
                 for e in exposed:
                     assert hands[player, e] == 1.0
                     hands[player, e] -= 1.0
                     hand_tensors[player][TILE2IDX[e]] -= 1.0
-                hand_tensors_full[player][TILE2IDX[acquired]] += 1.0
+
+                if acquired is not None:
+                    hand_tensors_full[player][TILE2IDX[acquired]] += 1.0
+
                 stateObj = StateObject(
                     remaining_turns=remaining_tsumo,
                     hand_tensor=hand_tensors[player],
@@ -251,35 +227,49 @@ def process(file_path: str, verbose: bool = False):
                     honba=honba,
                     dora=doras,  # share same dora list
                 )
+
                 if naki.from_who() != 0:
                     is_menzen[player] = False
                 if sum(ippatsu):
                     ippatsu = [0] * 4
 
                 if naki.is_kakan():
+                    # evaluate chankan ron
                     curr_halfturn.decisions += evaluate_ron(
                         player=player,
-                        hand_tensors=hand_tensors,
+                        hand_tensors_full=hand_tensors_full,
                         naki_list=melds,
                         sutehai_tensor=sutehai_tensor,
-                        discarded_tile=acquired,
+                        discarded_tile=exposed[0],
                         doras=doras,
                         reaches=reaches,
                         ippatsu=ippatsu,
                         is_chankan=True,
                         is_haitei=False,
                         double_reaches=double_reaches,
-                        is_renhou=False,
+                        is_renhou=[False] * 4,
                         player_wind=roundinfo.player_wind,
                         round_wind=roundinfo.round_wind,
                         kyotaku=kyotaku,
                         honba=honba,
                     )
 
+                    # remove corresponding pon from melds
+                    for i, meld in enumerate(melds[player]):
+                        if meld.is_pon():
+                            color, number, *_ = meld.pattern_pon()
+                            if color * 9 + number == exposed[0] // 4:
+                                melds[player].pop(i)
+                                break
+
                 # TODO: add logic for ankan kokushi ron
 
                 curr_halfturn = None
                 encoding_tokens.append(naki2idx(player, naki))
+
+                if naki.is_minkan() or naki.is_ankan() or naki.is_kakan():
+                    cycles += 1
+                    acquired = None
 
             elif eventtype[0] in ["T", "U", "V", "W"]:
                 assert acquired is None
@@ -299,7 +289,8 @@ def process(file_path: str, verbose: bool = False):
                 hand_tensors_full[player][tile_idx] += 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 2
 
-                during_decisions = []
+                decisions = [[] for _ in range(4)]
+                during_decisions = decisions[player]
 
                 # check if tsumo is possible
                 during_decisions += evaluate_tsumo(
@@ -335,7 +326,11 @@ def process(file_path: str, verbose: bool = False):
                         if hands[player, 9 * color + number] == 1.0:
                             during_decisions.append(
                                 NakiDecision(
-                                    player, Naki(9 * color + number), executed=False
+                                    player,
+                                    Naki.from_kakan_info(
+                                        9 * color + number, 0
+                                    ),  # TODO get accurate "which" value
+                                    executed=False,
                                 )
                             )
 
@@ -364,7 +359,7 @@ def process(file_path: str, verbose: bool = False):
                 halfturn = DuringTurn(
                     player=player,
                     stateObj=stateObj,
-                    decisions=during_decisions,
+                    decisions=decisions,
                     encoding_tokens=encoding_tokens[:],
                 )
 
@@ -452,18 +447,29 @@ def process(file_path: str, verbose: bool = False):
                 )
                 acquired = None
 
+            elif eventtype == "AGARI" or eventtype == "RYUUKYOKU":
+                result_idx = event_idx + 1
+                break
+
             else:
                 raise ValueError(f"Invalid event type: {eventtype}")
 
-        event = kyoku_events[-1]
-        assert event["event"] in ["AGARI", "RYUUKYOKU"]
+        result_events = kyoku_events[result_idx:]
+        result = []
 
-        if event["event"] == "AGARI":
-            result = AgariResult(list(map(int, event["attr"]["sc"].split(","))))
-            # TODO: make decision executed = True
+        for event in result_events:
+            assert event["event"] in ["AGARI", "RYUUKYOKU"]
 
-        elif event["event"] == "RYUUKYOKU":
-            result = RyukyokuResult(list(map(int, event["attr"]["sc"].split(","))))
+            if event["event"] == "AGARI":
+                result.append(
+                    AgariResult(list(map(int, event["attr"]["sc"].split(","))))
+                )
+                # TODO: make decision executed = True
+
+            elif event["event"] == "RYUUKYOKU":
+                result.append(
+                    RyukyokuResult(list(map(int, event["attr"]["sc"].split(","))))
+                )
 
         if verbose:
             print(f"len(turns): {len(turns)}")
@@ -477,6 +483,53 @@ def process(file_path: str, verbose: bool = False):
         all_halfturns.append(halfturns)
 
     return all_halfturns
+
+
+def _get_rounds(file_path: str):
+    with open(file_path, "rb") as file:
+        tree = ET.parse(file)
+        root = tree.getroot()
+
+    events = []
+
+    def traverse(element: ET.Element):
+        item = {"event": element.tag, "attr": element.attrib}
+        events.append(item)
+        for child in element:
+            traverse(child)
+
+    traverse(root)
+
+    # get game config
+    gametype = root.findall("GO")
+    if len(gametype) != 1:
+        raise ValueError("Invalid number of game type elements")
+    try:
+        gameinfo = GameInfo(int(gametype[0].attrib["type"]))
+    except:
+        raise ValueError("Invalid game type element")
+
+    # group events into each round
+    rounds = []
+    curr_round_events = None
+
+    for event in events:
+        if event["event"] in ["mjloggm", "SHUFFLE", "UN", "GO", "TAIKYOKU"]:
+            continue
+        elif event["event"] == "BYE":
+            raise InvalidGameException("BYE")
+
+        if event["event"] == "INIT":
+            if curr_round_events is not None:
+                rounds.append(curr_round_events)
+            curr_round_events = []
+
+        curr_round_events.append(event)
+
+    if curr_round_events is not None:
+        rounds.append(curr_round_events)
+
+    return gameinfo, rounds
 
 
 NAKI_IDX_START = 37 * 4 * 2
