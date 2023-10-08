@@ -6,18 +6,23 @@ from MahjongAI.process_xml import process, InvalidGameException
 class DataLoader:
     def __init__(self, path: str):
         self.path = path
+        self.file_list = os.listdir(self.path)
+        self.current_index = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        while True:
-            for filename in os.listdir(self.path):
-                print(filename)
-                try:
-                    turns = process(os.path.join(self.path, filename))
-                except InvalidGameException as e:
-                    print(e.msg)
-                    continue
+        if self.current_index == len(self.file_list):
+            self.current_index = 0
 
-                yield turns
+        filename = self.file_list[self.current_index]
+        print(filename)
+        self.current_index += 1
+
+        try:
+            turns = process(os.path.join(self.path, filename))
+            return turns
+        except InvalidGameException as e:
+            print(e.msg)
+            return self.__next__()

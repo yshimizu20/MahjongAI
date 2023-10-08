@@ -113,8 +113,8 @@ def test_naki_from_kakan_info1():
     assert number == 3
     assert which == 0
     assert has_red == False
-    assert exposed == [13, 14, 15]
-    assert acquired == 12
+    assert exposed == [13]
+    assert acquired is None
 
 
 def test_naki_from_kakan_info2():
@@ -127,8 +127,8 @@ def test_naki_from_kakan_info2():
     assert number == 4
     assert which == 0
     assert has_red == True
-    assert exposed == [53, 54, 55]
-    assert acquired == 52
+    assert exposed == [52]
+    assert acquired is None
 
 
 def test_naki_from_kakan_info3():
@@ -141,8 +141,8 @@ def test_naki_from_kakan_info3():
     assert number == 4
     assert which == 1
     assert has_red == True
-    assert exposed == [88, 90, 91]
-    assert acquired == 89
+    assert exposed == [89]
+    assert acquired == None
 
 
 def test_naki_from_kakan_info4():
@@ -155,8 +155,8 @@ def test_naki_from_kakan_info4():
     assert number == 3
     assert which == 0
     assert has_red == False
-    assert exposed == [121, 122, 123]
-    assert acquired == 120
+    assert exposed == [121]
+    assert acquired == None
 
 
 def test_naki_from_minkan_info1():

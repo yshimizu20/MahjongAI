@@ -19,31 +19,25 @@ def train(max_iters: int):
     dataloader = DataLoader("data/processed/2021/")
 
     for iter in range(max_iters):
-        # if iter % eval_interval == eval_interval - 1:
-        #     losses = estimate_loss()
-        #     print(
-        #         f"iter {iter} | train loss {losses['train']} | val loss {losses['val']}"
-        #     )
-
         halfturns = []
         for _ in range(10):
             turns = next(dataloader)
             halfturns.extend(turns)
 
-        # xb, yb = process_turns(turns)
+    # logits, loss = model(xb, yb)
+    # optimizer.zero_grad()
+    # loss.backward()
+    # optimizer.step()
 
-        # logits, loss = model(xb, yb)
-        # optimizer.zero_grad()
-        # loss.backward()
-        # optimizer.step()
+    # if iter % eval_interval == eval_interval - 1:
+    #     losses = estimate_loss()
+    #     print(
+    #         f"iter {iter} | train loss {losses['train']} | val loss {losses['val']}"
+    #     )
 
 
 @torch.no_grad()
 def estimate_loss():
-    raise NotImplementedError
-
-
-def process_turns(turns):
     raise NotImplementedError
 
 

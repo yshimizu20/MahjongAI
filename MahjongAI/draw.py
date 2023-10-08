@@ -218,8 +218,3 @@ class Naki(Draw):
 class Tsumo(Draw):
     def __init__(self, tile: int):
         self.tile = tile  # 0-135
-
-
-n = Naki(28673)
-print(n.is_chi(), n.is_pon(), n.is_kakan(), n.is_minkan(), n.is_ankan())
-print(n.pattern_minkan())
