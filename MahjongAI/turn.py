@@ -15,11 +15,13 @@ class HalfTurn:
         type_: int,
         stateObj: StateObject,
         encoding_tokens: List[int],
+        encoding_idx: int,
     ):
         self.player = player
         self.type_ = type_
         self.stateObj = stateObj
         self.encoding_tokens = encoding_tokens
+        self.encoding_idx = encoding_idx
 
 
 class DuringTurn(HalfTurn):
@@ -29,8 +31,9 @@ class DuringTurn(HalfTurn):
         stateObj: StateObject,
         decisions: List[List[Decision]],
         encoding_tokens: List[int],
+        encoding_idx: int,
     ):
-        super().__init__(player, HalfTurn.DURING, stateObj, encoding_tokens)
+        super().__init__(player, HalfTurn.DURING, stateObj, encoding_tokens, encoding_idx)
         self.decisions = decisions
 
 
@@ -41,8 +44,9 @@ class DiscardTurn(HalfTurn):
         stateObj: StateObject,
         discarded_tile: int,  # 0-135
         encoding_tokens: List[int],
+        encoding_idx: int,
     ):
-        super().__init__(player, HalfTurn.DISCARD, stateObj, encoding_tokens)
+        super().__init__(player, HalfTurn.DISCARD, stateObj, encoding_tokens, encoding_idx)
         self.discarded_tile = discarded_tile
 
 
@@ -53,6 +57,7 @@ class PostTurn(HalfTurn):
         stateObj: StateObject,
         decisions: List[List[List[Decision]]],
         encoding_tokens: List[int],
+        encoding_idx: int,
     ):
-        super().__init__(player, HalfTurn.POST, stateObj, encoding_tokens)
+        super().__init__(player, HalfTurn.POST, stateObj, encoding_tokens, encoding_idx)
         self.decisions = decisions

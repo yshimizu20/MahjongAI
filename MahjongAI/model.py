@@ -4,13 +4,15 @@ import torch.nn.functional as F
 import numpy as np
 
 # Hyperparameters
-ENCODER_EMBD_DIM = 5000  # leave some margin for now
+ENCODER_EMBD_DIM = 344
 DECODER_STATE_OBJ_DIM = [(37, 3), (4, 7), (1, 4)]
 DECODER_EMBD_DIM = 1024
 DISCARD_ACTION_DIM = 37
-REACH_ACTION_DIM = 2
-AGARI_ACTION_DIM = 2
-MELD_ACTION_DIM = 1024
+# REACH_ACTION_DIM = 2
+# AGARI_ACTION_DIM = 2
+DURING_TURN_ACTION_DIM = 34 * 2 + 1 + 1 + 1 # 71; ankan, kakan, riichi, tsumo, pass
+# MELD_ACTION_DIM = 1024
+POST_TURN_ACTION_DIM = 1024 # ron, naki
 MAX_ACTION_LEN = 128
 EMBD_SIZE = 128
 N_HEADS = 8
@@ -85,14 +87,19 @@ class Decoder(nn.Module):
         )
         self.ln_f = nn.LayerNorm(EMBD_SIZE)
         self.discard_head = nn.Linear(EMBD_SIZE, DISCARD_ACTION_DIM)
-        self.reach_head = nn.Linear(EMBD_SIZE, REACH_ACTION_DIM)
-        self.agari_head = nn.Linear(EMBD_SIZE, AGARI_ACTION_DIM)
-        self.meld_head = nn.Linear(EMBD_SIZE, MELD_ACTION_DIM)
+        # self.reach_head = nn.Linear(EMBD_SIZE, REACH_ACTION_DIM)
+        # self.agari_head = nn.Linear(EMBD_SIZE, AGARI_ACTION_DIM)
+        # self.meld_head = nn.Linear(EMBD_SIZE, MELD_ACTION_DIM)
+        self.during_head = nn.Linear(EMBD_SIZE, DURING_TURN_ACTION_DIM)
+        self.post_head = nn.Linear(EMBD_SIZE, POST_TURN_ACTION_DIM)
+
         self.heads = {
             "discard": self.discard_head,
-            "reach": self.reach_head,
-            "agari": self.agari_head,
-            "meld": self.meld_head,
+            # "reach": self.reach_head,
+            # "agari": self.agari_head,
+            # "meld": self.meld_head,
+            "during": self.during_head,
+            "post": self.post_head,
         }
 
         self.apply(self._init_weights)

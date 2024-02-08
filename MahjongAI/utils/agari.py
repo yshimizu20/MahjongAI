@@ -55,7 +55,7 @@ def evaluate_ron(
     kyotaku: int,
     honba: int,
     verbose: bool = False,
-):
+) -> List[AgariDecision]:
     rons = [None for _ in range(4)]
     discarded_tile_idx = TILE2IDX[discarded_tile][0]
 

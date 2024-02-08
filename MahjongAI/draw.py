@@ -213,6 +213,17 @@ class Naki(Draw):
             raise ValueError("Invalid naki code")
 
         return exposed, acquired  # 0-135
+    
+    def get_during_turn_filter_idx(self):
+        if self.is_ankan():
+            color, number, _, _, _, _ = self.pattern_ankan()
+            return 3 + 9 * color + number
+
+        elif self.is_kakan():
+            color, number, _, _, _, _ = self.pattern_kakan()
+            return 37 + 9 * color + number
+        
+        raise ZeroDivisionError("Invalid naki code")
 
 
 class Tsumo(Draw):

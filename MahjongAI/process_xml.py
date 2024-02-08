@@ -137,10 +137,10 @@ def process(file_path: str, verbose: bool = False):
                     assert isinstance(curr_halfturn, DuringTurn)
                     assert acquired is not None
 
-                    for decision in curr_halfturn.decisions:
-                        if isinstance(decision, ReachDecision):
-                            decision.executed = True
-                            break
+                    for decision in curr_halfturn.decisions[DECISION_REACH_IDX]:
+                        assert isinstance(decision, ReachDecision)
+                        decision.executed = True
+                        break
 
                 else:  # event["attr"]["step"] == 2
                     assert isinstance(curr_halfturn, PostTurn)
@@ -167,14 +167,16 @@ def process(file_path: str, verbose: bool = False):
                 cycles += (player - from_who) % 4
                 melds[player] = melds[player][:] + [naki]
 
+                encoding_tokens.append(naki2idx(player, naki))
+
                 # change executed to True
                 if naki.is_ankan() or naki.is_kakan():
                     assert isinstance(curr_halfturn, DuringTurn)
                     for lst in curr_halfturn.decisions:
-                        for decision in lst:
+                        for decision in lst[DECISION_NAKI_IDX]:
+                            assert isinstance(decision, NakiDecision)
                             if (
-                                isinstance(decision, NakiDecision)
-                                and decision.naki.convenient_naki_code
+                                decision.naki.convenient_naki_code
                                 == naki.convenient_naki_code
                             ):
                                 decision.executed = True
@@ -184,10 +186,10 @@ def process(file_path: str, verbose: bool = False):
                     assert isinstance(curr_halfturn, PostTurn)
                     # TODO: exclude decision that would not have been picked up anyways
                     for lst in curr_halfturn.decisions:
-                        for decision in lst:
+                        for decision in lst[DECISION_NAKI_IDX]:
+                            assert isinstance(decision, NakiDecision)
                             if (
-                                isinstance(decision, NakiDecision)
-                                and decision.naki.convenient_naki_code
+                                decision.naki.convenient_naki_code
                                 == naki.convenient_naki_code
                             ):
                                 decision.executed = True
@@ -233,9 +235,20 @@ def process(file_path: str, verbose: bool = False):
                 if sum(ippatsu):
                     ippatsu = [0] * 4
 
+                # in case of Kakan, create new post turn to train on chankan ron decision
                 if naki.is_kakan():
+                    # remove corresponding pon from melds
+                    for i, meld in enumerate(melds[player]):
+                        if meld.is_pon():
+                            color, number, *_ = meld.pattern_pon()
+                            if color * 9 + number == exposed[0] // 4:
+                                melds[player].pop(i)
+                                break
+
+                    new_post_decisions = [[[] for _ in range(3)] for _ in range(4)]
+
                     # evaluate chankan ron
-                    curr_halfturn.decisions += evaluate_ron(
+                    decisions = evaluate_ron(
                         player=player,
                         hand_tensors_full=hand_tensors_full,
                         naki_list=melds,
@@ -254,18 +267,27 @@ def process(file_path: str, verbose: bool = False):
                         honba=honba,
                     )
 
-                    # remove corresponding pon from melds
-                    for i, meld in enumerate(melds[player]):
-                        if meld.is_pon():
-                            color, number, *_ = meld.pattern_pon()
-                            if color * 9 + number == exposed[0] // 4:
-                                melds[player].pop(i)
-                                break
+                    for decision in decisions:
+                        if decision is not None:
+                            new_post_decisions[decision.player][DECISION_AGARI_IDX].append(
+                                decision
+                            )
+                    
+                    curr_halfturn = PostTurn(
+                        player=player,
+                        stateObj=stateObj,
+                        decisions=new_post_decisions,
+                        encoding_tokens=encoding_tokens,
+                        encoding_idx=len(encoding_tokens),
+                    )
+
+                    halfturns.append(curr_halfturn)
 
                 # TODO: add logic for ankan kokushi ron
+                if naki.is_ankan():
+                    pass
 
                 curr_halfturn = None
-                encoding_tokens.append(naki2idx(player, naki))
 
                 if naki.is_minkan() or naki.is_ankan() or naki.is_kakan():
                     cycles += 1
@@ -292,7 +314,7 @@ def process(file_path: str, verbose: bool = False):
                 during_decisions = [[] for _ in range(3)]
 
                 # check if tsumo is possible
-                during_decisions[DECISION_AGARI_IDX] += evaluate_tsumo(
+                decision = evaluate_tsumo(
                     player=player,
                     hand_tensors_full=hand_tensors_full,
                     naki_list=melds,
@@ -310,6 +332,9 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku=kyotaku,
                     honba=honba,
                 )
+
+                if decision is not None:
+                    during_decisions[DECISION_AGARI_IDX].append(decision)
 
                 # check if reach is possible
                 if not reaches[player] and is_menzen[player]:
@@ -361,7 +386,8 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     stateObj=stateObj,
                     decisions=during_decisions,
-                    encoding_tokens=encoding_tokens[:],
+                    encoding_tokens=encoding_tokens,
+                    encoding_idx=len(encoding_tokens),
                 )
 
                 halfturns.append(halfturn)
@@ -387,7 +413,8 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     stateObj=stateObj,
                     discarded_tile=tile,
-                    encoding_tokens=encoding_tokens[:],
+                    encoding_tokens=encoding_tokens,
+                    encoding_idx=len(encoding_tokens),
                 )
                 halfturns.append(half_turn)
 
@@ -432,16 +459,19 @@ def process(file_path: str, verbose: bool = False):
                     if ron is not None:
                         post_decisions[ron.player][DECISION_AGARI_IDX].append(ron)
 
-                pon_chi_decisions = decision_mask(
+                naki_decisions = decision_mask(
                     player, hand_tensors, tile_idx[0], len(tile_idx) == 2
                 )
-                post_decisions += pon_chi_decisions
+                
+                for decision_lst in naki_decisions:
+                    post_decisions[player][DECISION_NAKI_IDX] = decision_lst
 
                 half_turn = PostTurn(
                     player=player,
                     stateObj=stateObj,
                     decisions=post_decisions,
-                    encoding_tokens=encoding_tokens[:],
+                    encoding_tokens=encoding_tokens,
+                    encoding_idx=len(encoding_tokens),
                 )
                 halfturns.append(half_turn)
                 curr_halfturn = half_turn  # carry over
@@ -536,14 +566,18 @@ def _get_rounds(file_path: str):
     return gameinfo, rounds
 
 
-NAKI_IDX_START = 37 * 4 * 2
+DISCARD_IDX_START = 0
+NAKI_IDX_START = 74
 CHI_IDX_START = NAKI_IDX_START
-PON_IDX_START = CHI_IDX_START + 4 * 3 * 3 * 7 * 3 * 2
-KAKAN_IDX_START = PON_IDX_START + 4 * 3 * 4 * 9 * 2
-MINKAN_IDX_START = KAKAN_IDX_START + 4 * 4 * 9 * 2
-ANKAN_IDX_START = MINKAN_IDX_START + 4 * 3 * 4 * 9 * 2
-REACH_IDX_START = ANKAN_IDX_START + 4 * 4 * 9 * 2
-NEW_DORA_IDX_START = REACH_IDX_START + 4  # 4116
+PON_IDX_START = CHI_IDX_START + 90
+KAKAN_IDX_START = PON_IDX_START + 40
+MINKAN_IDX_START = KAKAN_IDX_START + 37
+ANKAN_IDX_START = MINKAN_IDX_START + 37
+
+DISCARD_TYPE = 0
+NAKI_TYPE = 1
+REACH_TYPE = 2
+NEW_DORA_TYPE = 3
 
 
 def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
@@ -551,39 +585,42 @@ def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
 
 
 def naki2idx(who: int, naki: Naki):
-    from_who = naki.from_who()
-    if naki.is_chi():
+    from_dir = naki.from_who() - who
+    embd_token = None
+
+    if naki.is_chi(): # 90 patterns
         color, number, which, has_red, *_ = naki.pattern_chi()
-        return NAKI_IDX_START + (
-            ((((who * 3 + from_who - 1) * 3 + color) * 7 + number) * 3 + which) * 2
-            + int(has_red)
+        embd_token = NAKI_IDX_START + (
+            (color * 10 + number + int(has_red) * 5) * 3 + which
         )
-    elif naki.is_pon():
-        color, number, _, has_red, *_ = naki.pattern_pon()
-        return PON_IDX_START + (
-            (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
+    elif naki.is_pon(): # 40 patterns
+        color, number, _, has_red, exposed, _ = naki.pattern_pon()
+        embd_token = PON_IDX_START + (
+            color * 11 + number + int(has_red) * 5 + int(has_red and exposed[0] % 4 == 0)
         )
-    elif naki.is_kakan():
-        color, number, _, has_red, *_ = naki.pattern_kakan()
-        return KAKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
-    elif naki.is_minkan():
-        color, number, _, has_red, *_ = naki.pattern_minkan()
-        return MINKAN_IDX_START + (
-            (((who * 3 + from_who - 1) * 4 + color) * 9 + number) * 2 + int(has_red)
+    elif naki.is_kakan(): # 37 patterns
+        color, number, _, has_red, exposed, _ = naki.pattern_kakan()
+        embd_token = KAKAN_IDX_START + color * 10 + number + int(has_red and exposed[0] % 4 == 0) * 5
+    elif naki.is_minkan(): # 37 patterns
+        color, number, _, has_red, exposed, _ = naki.pattern_minkan()
+        embd_token = MINKAN_IDX_START + (
+            color * 10 + number + int(has_red and exposed[0] % 4 == 0) * 5
         )
-    elif naki.is_ankan():
+    elif naki.is_ankan(): # 34 patterns
         color, number, _, has_red, *_ = naki.pattern_ankan()
-        return ANKAN_IDX_START + (((who * 4 + color) * 9 + number) * 2 + int(has_red))
+        embd_token = ANKAN_IDX_START + color * 9 + number
     else:
         raise ValueError("Invalid naki code")
 
+    return NAKI_TYPE << 30 + embd_token << 10 + from_dir << 2 + who
+
 
 def reach2idx(who: int):
-    return REACH_IDX_START + who
+    return REACH_TYPE << 30 + who
 
 
-def new_dora2idx(tile_idx: int):
-    return NEW_DORA_IDX_START + tile_idx
+def new_dora2idx(tile_idx: int): # tile_idx should be 0-36
+    return NEW_DORA_TYPE << 30 + tile_idx << 4
 
 
 if __name__ == "__main__":

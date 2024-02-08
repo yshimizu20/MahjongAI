@@ -4,6 +4,7 @@ import numpy as np
 
 from MahjongAI.process_xml import process, InvalidGameException
 from MahjongAI.turn import HalfTurn, DuringTurn, DiscardTurn, PostTurn
+from MahjongAI.utils.constants import DECISION_AGARI_IDX, DECISION_REACH_IDX, DECISION_NAKI_IDX
 
 
 class DataLoader:
@@ -47,12 +48,55 @@ class DataLoader:
                 raise ZeroDivisionError
 
     def _build_during_tensor(self, during_turns):
-        for turn in during_turns:
-            if len(turn.decisions) == 0:
+        L = len(during_turns)
+        X = []
+        y = torch.zeros(L, 1, dtype=torch.long)
+        filter_tensors = torch.zeros(L, 71, dtype=torch.long)
+
+        for i, turn in enumerate(during_turns):
+            n_decisions = sum(map(len, turn.decisions))
+
+            if n_decisions == 0:
                 continue
 
+            for decision_idx, decision_type in enumerate(turn.decisions):
+                if len(decision_type) == 0:
+                    continue
+
+                # populate filter tensor and y tensor
+                if decision_idx == DECISION_AGARI_IDX:
+                    filter_tensors[i, 1] = 1
+                    if decision_type[0].executed:
+                        y[i] = 1
+
+                elif decision_idx == DECISION_REACH_IDX:
+                    filter_tensors[i, 2] = 1
+                    if decision_type[0].executed:
+                        y[i] = 2
+
+                elif decision_idx == DECISION_NAKI_IDX:
+                    for meld in decision_type:
+                        idx = meld.get_during_turn_filter_idx()
+                        filter_tensors[i, idx] = 1
+                        if meld.executed:
+                            y[i] = idx
+                
+                filter_tensors[i, 0] = 1 # pass is always an option
+
+            # TODO: create state object tensor
+        
+        return torch.cat(X, dim=0), y, filter_tensors
+
     def _build_discard_tensor(self, discard_turns):
-        pass
+        tensors = []
+
+        for turn in discard_turns:
+            # TODO: create a filter tensor
+            # TODO: make a translation table
+            # TODO: create state object tensor
+            pass
+        
+        return torch.cat(tensors, dim=0)
 
     def _build_post_tensor(self, post_turns):
         pass
