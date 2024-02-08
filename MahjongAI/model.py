@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 
 # Hyperparameters
-ENCODER_EMBD_DIM = 344
+ENCODER_EMBD_DIM = 314
 DECODER_STATE_OBJ_DIM = [(37, 3), (4, 7), (1, 4)]
 DECODER_EMBD_DIM = 1024
 DISCARD_ACTION_DIM = 37
@@ -13,7 +13,7 @@ DISCARD_ACTION_DIM = 37
 DURING_TURN_ACTION_DIM = 34 * 2 + 1 + 1 + 1 # 71; ankan, kakan, riichi, tsumo, pass
 # MELD_ACTION_DIM = 1024
 POST_TURN_ACTION_DIM = 1024 # ron, naki
-MAX_ACTION_LEN = 128
+MAX_ACTION_LEN = 150
 EMBD_SIZE = 128
 N_HEADS = 8
 N_LAYERS = 3
@@ -53,8 +53,11 @@ class Encoder(nn.Module):
     def __init__(self, n_layers=N_LAYERS):
         super().__init__()
         # TODO: replace token_embedding with neural network (keep position_embedding_table)
-        self.token_embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
-        self.position_embedding_table = nn.Embedding(MAX_ACTION_LEN, EMBD_SIZE)
+        # self.token_embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
+        # self.position_embedding_table = nn.Embedding(MAX_ACTION_LEN, EMBD_SIZE)
+        self.embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
+        self.position_coding_table = self._get_position_encoding(MAX_ACTION_LEN, EMBD_SIZE)
+
         self.blocks = nn.Sequential(
             *[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)]
         )
@@ -68,6 +71,19 @@ class Encoder(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, std=0.02)
+
+
+    def _get_position_encoding():
+        position = torch.arange(MAX_ACTION_LEN).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, EMBD_SIZE, 2).float() * -(np.log(10000.0) / EMBD_SIZE))
+        pos_encoding = torch.zeros(MAX_ACTION_LEN, EMBD_SIZE)
+        pos_encoding[:, 0::2] = torch.sin(position * div_term)
+        pos_encoding[:, 1::2] = torch.cos(position * div_term)
+        return pos_encoding
+
+    def _get_player_encoding():
+        pass
+
 
     def forward(self, enc_indices: torch.Tensor):
         B, T = enc_indices.shape

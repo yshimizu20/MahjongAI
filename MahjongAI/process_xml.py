@@ -573,6 +573,8 @@ PON_IDX_START = CHI_IDX_START + 90
 KAKAN_IDX_START = PON_IDX_START + 40
 MINKAN_IDX_START = KAKAN_IDX_START + 37
 ANKAN_IDX_START = MINKAN_IDX_START + 37
+REACH_IDX_START = ANKAN_IDX_START + 34
+NEW_DORA_IDX_START = REACH_IDX_START + 1
 
 DISCARD_TYPE = 0
 NAKI_TYPE = 1
@@ -616,11 +618,11 @@ def naki2idx(who: int, naki: Naki):
 
 
 def reach2idx(who: int):
-    return REACH_TYPE << 30 + who
+    return REACH_TYPE << 30 + REACH_IDX_START + who
 
 
 def new_dora2idx(tile_idx: int): # tile_idx should be 0-36
-    return NEW_DORA_TYPE << 30 + tile_idx << 4
+    return NEW_DORA_TYPE << 30 + NEW_DORA_IDX_START << 10 + tile_idx << 4
 
 
 if __name__ == "__main__":
