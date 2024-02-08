@@ -27,7 +27,7 @@ class DuringTurn(HalfTurn):
         self,
         player: int,
         stateObj: StateObject,
-        decisions: List[Decision],
+        decisions: List[List[Decision]],
         encoding_tokens: List[int],
     ):
         super().__init__(player, HalfTurn.DURING, stateObj, encoding_tokens)
@@ -51,7 +51,7 @@ class PostTurn(HalfTurn):
         self,
         player: int,
         stateObj: StateObject,
-        decisions: List[List[Decision]],
+        decisions: List[List[List[Decision]]],
         encoding_tokens: List[int],
     ):
         super().__init__(player, HalfTurn.POST, stateObj, encoding_tokens)

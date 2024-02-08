@@ -289,11 +289,10 @@ def process(file_path: str, verbose: bool = False):
                 hand_tensors_full[player][tile_idx] += 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 2
 
-                decisions = [[] for _ in range(4)]
-                during_decisions = decisions[player]
+                during_decisions = [[] for _ in range(3)]
 
                 # check if tsumo is possible
-                during_decisions += evaluate_tsumo(
+                during_decisions[DECISION_AGARI_IDX] += evaluate_tsumo(
                     player=player,
                     hand_tensors_full=hand_tensors_full,
                     naki_list=melds,
@@ -312,9 +311,19 @@ def process(file_path: str, verbose: bool = False):
                     honba=honba,
                 )
 
+                # check if reach is possible
+                if not reaches[player] and is_menzen[player]:
+                    shanten = shanten_solver.calculate_shanten(
+                        hand_tensors[player][:34]
+                    )
+                    if shanten <= 0:
+                        during_decisions[DECISION_REACH_IDX].append(
+                            ReachDecision(player, executed=False)
+                        )
+
                 # check if ankan is possible
                 for i in np.where(hand_tensors[player] == 4.0)[0]:
-                    during_decisions.append(
+                    during_decisions[DECISION_NAKI_IDX].append(
                         NakiDecision(player, Naki.from_ankan_info(i), executed=False)
                     )
 
@@ -324,7 +333,7 @@ def process(file_path: str, verbose: bool = False):
                     if meld.is_pon():
                         color, number, *_ = meld.pattern_pon()
                         if hands[player, 9 * color + number] == 1.0:
-                            during_decisions.append(
+                            during_decisions[DECISION_NAKI_IDX].append(
                                 NakiDecision(
                                     player,
                                     Naki.from_kakan_info(
@@ -333,14 +342,6 @@ def process(file_path: str, verbose: bool = False):
                                     executed=False,
                                 )
                             )
-
-                # check if reach is possible
-                if not reaches[player] and is_menzen[player]:
-                    shanten = shanten_solver.calculate_shanten(
-                        hand_tensors[player][:34]
-                    )
-                    if shanten <= 0:
-                        during_decisions.append(ReachDecision(player, executed=False))
 
                 stateObj = StateObject(
                     remaining_turns=remaining_tsumo,
@@ -359,7 +360,7 @@ def process(file_path: str, verbose: bool = False):
                 halfturn = DuringTurn(
                     player=player,
                     stateObj=stateObj,
-                    decisions=decisions,
+                    decisions=during_decisions,
                     encoding_tokens=encoding_tokens[:],
                 )
 
@@ -403,7 +404,7 @@ def process(file_path: str, verbose: bool = False):
                 remaining_tiles_pov[player][tile_idx] += 1.0
 
                 # post_decisions will contain three lists of different decisions: ron, pon/kan, chi
-                post_decisions = []
+                post_decisions = [[[] for _ in range(3)] for _ in range(4)]
 
                 rons = evaluate_ron(
                     player=player,
@@ -426,7 +427,10 @@ def process(file_path: str, verbose: bool = False):
                     kyotaku=kyotaku,
                     honba=honba,
                 )
-                post_decisions.append(rons)
+
+                for ron in rons:
+                    if ron is not None:
+                        post_decisions[ron.player][DECISION_AGARI_IDX].append(ron)
 
                 pon_chi_decisions = decision_mask(
                     player, hand_tensors, tile_idx[0], len(tile_idx) == 2
