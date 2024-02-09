@@ -277,7 +277,6 @@ def process(file_path: str, verbose: bool = False):
                         player=player,
                         stateObj=stateObj,
                         decisions=new_post_decisions,
-                        encoding_tokens=encoding_tokens,
                         encoding_idx=len(encoding_tokens),
                     )
 
@@ -386,7 +385,6 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     stateObj=stateObj,
                     decisions=during_decisions,
-                    encoding_tokens=encoding_tokens,
                     encoding_idx=len(encoding_tokens),
                 )
 
@@ -413,7 +411,6 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     stateObj=stateObj,
                     discarded_tile=tile,
-                    encoding_tokens=encoding_tokens,
                     encoding_idx=len(encoding_tokens),
                 )
                 halfturns.append(half_turn)
@@ -470,7 +467,6 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     stateObj=stateObj,
                     decisions=post_decisions,
-                    encoding_tokens=encoding_tokens,
                     encoding_idx=len(encoding_tokens),
                 )
                 halfturns.append(half_turn)
@@ -566,8 +562,8 @@ def _get_rounds(file_path: str):
     return gameinfo, rounds
 
 
-DISCARD_IDX_START = 0
-NAKI_IDX_START = 74
+DISCARD_IDX_START = 1
+NAKI_IDX_START = DISCARD_IDX_START + 74
 CHI_IDX_START = NAKI_IDX_START
 PON_IDX_START = CHI_IDX_START + 90
 KAKAN_IDX_START = PON_IDX_START + 40
@@ -614,15 +610,15 @@ def naki2idx(who: int, naki: Naki):
     else:
         raise ValueError("Invalid naki code")
 
-    return NAKI_TYPE << 30 + embd_token << 10 + from_dir << 2 + who
+    return NAKI_TYPE << 29 + who << 27 + embd_token
 
 
 def reach2idx(who: int):
-    return REACH_TYPE << 30 + REACH_IDX_START + who
+    return REACH_TYPE << 29 + who << 27 + REACH_IDX_START
 
 
 def new_dora2idx(tile_idx: int): # tile_idx should be 0-36
-    return NEW_DORA_TYPE << 30 + NEW_DORA_IDX_START << 10 + tile_idx << 4
+    return NEW_DORA_TYPE << 29 + tile_idx << 9 + NEW_DORA_IDX_START
 
 
 if __name__ == "__main__":

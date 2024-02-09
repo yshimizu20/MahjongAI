@@ -5,13 +5,15 @@ import numpy as np
 from MahjongAI.process_xml import process, InvalidGameException
 from MahjongAI.turn import HalfTurn, DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.utils.constants import DECISION_AGARI_IDX, DECISION_REACH_IDX, DECISION_NAKI_IDX
+from MahjongAI.model import TransformerModel
 
 
 class DataLoader:
-    def __init__(self, path: str):
+    def __init__(self, path: str, model: TransformerModel):
         self.path = path
         self.file_list = os.listdir(self.path)
         self.current_index = 0
+        self.model = model
 
     def __iter__(self):
         return self
@@ -83,7 +85,9 @@ class DataLoader:
                 
                 filter_tensors[i, 0] = 1 # pass is always an option
 
-            # TODO: create state object tensor
+            # TODO: optimize this
+            # create state object tensor
+            X.append(self.model.encoder(turn.encoding_tokens, turn.encoding_idx))
         
         return torch.cat(X, dim=0), y, filter_tensors
 

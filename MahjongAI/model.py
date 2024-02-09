@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 
 # Hyperparameters
-ENCODER_EMBD_DIM = 314
+ENCODER_EMBD_DIM = 315
 DECODER_STATE_OBJ_DIM = [(37, 3), (4, 7), (1, 4)]
 DECODER_EMBD_DIM = 1024
 DISCARD_ACTION_DIM = 37
@@ -57,6 +57,10 @@ class Encoder(nn.Module):
         # self.position_embedding_table = nn.Embedding(MAX_ACTION_LEN, EMBD_SIZE)
         self.embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
         self.position_coding_table = self._get_position_encoding(MAX_ACTION_LEN, EMBD_SIZE)
+        self.player_coding_table = self._get_player_encoding(4, EMBD_SIZE)
+
+        # Set the weights for index 0 to be zeros; this has to be done after every iteration as well;
+        self.embedding_table.weight.data[0] = torch.zeros(EMBD_SIZE)
 
         self.blocks = nn.Sequential(
             *[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)]
@@ -82,7 +86,37 @@ class Encoder(nn.Module):
         return pos_encoding
 
     def _get_player_encoding():
-        pass
+        encoding = torch.empty((4, EMBD_SIZE), dtype=torch.float32)
+
+        base = torch.pow(10000, torch.arange(EMBD_SIZE, dtype=torch.float32) / EMBD_SIZE)
+
+        player_numbers = torch.arange(4).float()
+        angle_rads = player_numbers * (2 * np.pi) / 4
+
+        angle_rads_matrix = angle_rads[:, None] / base[None, :]
+
+        sin = torch.sin(angle_rads_matrix)
+        cos = torch.cos(angle_rads_matrix)
+
+        encoding[:, 0::2] = sin
+        encoding[:, 1::2] = cos
+
+        return encoding
+
+
+    def _get_player_encoding(self, turns, n_turns):
+        t = turns[:n_turns]
+        t1, t2, t_who = t & 0x1FF, (t >> 9) & 0x1FF, (t >> 27) & 0x3
+
+        encoding_t1 = self.embedding_table(t1)
+        encoding_t2 = self.embedding_table(t2)
+
+        encoding_who = self.player_coding_table[t_who]
+
+        # Summing the encodings
+        encoding = encoding_t1 + encoding_t2 + encoding_who
+
+        return encoding
 
 
     def forward(self, enc_indices: torch.Tensor):
