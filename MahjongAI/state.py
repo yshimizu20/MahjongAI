@@ -21,8 +21,9 @@ class StateObject:
         honba: int,
         dora: List[int],
         parent_tensor: np.ndarray,
-        rounds_remaining: List[int],
+        rounds_remaining: int,
         parent_rounds_remaining: List[int],
+        remaining_tsumo: int,
     ):
         self.remaining_turns = remaining_turns
         self.hand_tensor = hand_tensor
@@ -40,3 +41,4 @@ class StateObject:
         self.parent_tensor = parent_tensor
         self.rounds_remaining = rounds_remaining
         self.parent_rounds_remaining = parent_rounds_remaining
+        self.remaining_tsumo = remaining_tsumo
