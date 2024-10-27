@@ -215,25 +215,35 @@ class Naki(Draw):
         return exposed, acquired  # 0-135
     
     def get_during_turn_filter_idx(self):
-        if self.is_ankan():
-            color, number, _, _, _, _ = self.pattern_ankan()
-            return 3 + 9 * color + number
+        """
+        Returns the index of the filter that should be applied during the turn
+        Outputs should land within the range [0, 70]
+        """
+        ANKAN_START = 3 # 0: pass, 1: agari (tsumo), 2: riichi
+        KAKAN_START = 37
 
-        elif self.is_kakan():
+        if self.is_ankan(): # 34 patterns
+            color, number, _, _, _, _ = self.pattern_ankan()
+            return ANKAN_START + 9 * color + number
+
+        elif self.is_kakan(): # 34 patterns
             color, number, _, _, _, _ = self.pattern_kakan()
-            return 37 + 9 * color + number
+            return KAKAN_START + 9 * color + number
         
         raise ZeroDivisionError("Invalid naki code")
 
     def get_post_turn_filter_idx(self):
-        CHI_START = 2 # 0: pass, 1: agari (ron), 2: riichi
+        """
+        Returns the index of the filter that should be applied after the turn
+        Outputs should land within the range [0, 153]
+        """
+        CHI_START = 2 # 0: pass, 1: agari (ron)
         PON_START = 83
         MINKAN_START = 120
 
         if self.is_chi():
             color, number, which, has_red, _, _ = self.pattern_chi()
             if has_red and number + which != 4:
-                assert (number + which) % 2 == 0
                 return CHI_START + 63 + 6 * color + number * 2 + (number + which - 3) // 2
             else:
                 return CHI_START + color * 21 + number * 3 + which

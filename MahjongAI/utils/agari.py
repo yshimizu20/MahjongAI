@@ -171,7 +171,7 @@ def evaluate_tsumo(
     kyotaku: int,
     honba: int,
     verbose: bool = False,
-):
+) -> List[AgariDecision]:
     decisions = []
     hand_tensor = hand_tensors_full[player]
 

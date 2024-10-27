@@ -15,6 +15,7 @@ class StateObject:
         is_menzen: List[int],
         double_reaches: List[int],
         reaches: List[int],
+        ippatsu: List[int],
         melds: List[List[Naki]],
         scores: List[int],
         kyotaku: int,
@@ -33,6 +34,7 @@ class StateObject:
         self.is_menzen = is_menzen
         self.double_reaches = double_reaches
         self.reaches = reaches
+        self.ippatsu = ippatsu
         self.melds = melds
         self.scores = scores
         self.kyotaku = kyotaku
