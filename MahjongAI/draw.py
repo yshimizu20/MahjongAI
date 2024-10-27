@@ -225,6 +225,34 @@ class Naki(Draw):
         
         raise ZeroDivisionError("Invalid naki code")
 
+    def get_post_turn_filter_idx(self):
+        CHI_START = 2 # 0: pass, 1: agari (ron), 2: riichi
+        PON_START = 83
+        MINKAN_START = 120
+
+        if self.is_chi():
+            color, number, which, has_red, _, _ = self.pattern_chi()
+            if has_red and number + which != 4:
+                assert (number + which) % 2 == 0
+                return CHI_START + 63 + 6 * color + number * 2 + (number + which - 3) // 2
+            else:
+                return CHI_START + color * 21 + number * 3 + which
+
+        elif self.is_pon():
+            color, number, which, has_red, _, acquired = self.pattern_pon()
+            if color == 3:
+                return PON_START + 30 + number
+            elif has_red and acquired % 4 == 3:
+                return PON_START + 27 + color
+            else:
+                return PON_START + 9 * color + number
+
+        elif self.is_minkan():
+            color, number, _, _, _, _ = self.pattern_minkan()
+            return MINKAN_START + 9 * color + number
+
+        raise ZeroDivisionError("Invalid naki code")
+
 
 class Tsumo(Draw):
     def __init__(self, tile: int):
