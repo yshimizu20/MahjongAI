@@ -24,3 +24,19 @@ DECISION_REACH_IDX = 1
 DECISION_NAKI_IDX = 2
 
 PAD_ID = 0
+
+
+class EventTypes:
+    EMPTY = 0
+    DISCARD = 1
+    NAKI = 2
+    RIICHI = 3
+    NEW_DORA = 4
+
+
+class EventStateTypes:
+    EMPTY = 0
+    DISCARD = 1
+    DURING = 2
+    POST = 3
+    NEW_DORA = 4
