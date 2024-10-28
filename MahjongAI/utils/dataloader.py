@@ -27,10 +27,11 @@ class DataLoader:
         return self
 
     def __next__(self):
-        if self.current_index == len(self.file_list):
-            self.current_index = 0
+        if self.current_index >= len(self.file_list):
+            raise StopIteration
 
         filename = self.file_list[self.current_index]
+        print("\n===============================")
         print(f"Processing file: {filename}")
         self.current_index += 1
 

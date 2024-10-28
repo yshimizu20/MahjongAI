@@ -8,7 +8,7 @@ class StateObject:
     def __init__(
         self,
         remaining_turns: int,
-        hand_tensor: List[int],
+        hand_tensor: np.ndarray,
         remaining_tiles: np.ndarray,
         remaining_tiles_pov: np.ndarray,
         sutehai_tensor: np.ndarray,

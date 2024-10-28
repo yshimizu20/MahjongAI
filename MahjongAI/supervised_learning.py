@@ -13,16 +13,22 @@ learning_rate = 1e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def train(max_iters: int):
+def train(max_iters: int, verbose: bool = True):
     model = TransformerModel().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     dataloader = DataLoader("data/processed/2021/", model)
 
     for iter in range(max_iters):
-        halfturns = []
-        for _ in range(10):
-            turns = next(dataloader)
-            halfturns.extend(turns)
+        for tensors_during, tensors_discard, tensors_post in dataloader:
+            if verbose is True:
+                # print the shape of each of the tensors in tensors_during
+                print(f"tensors_during: shape = Tuple({tensors_during[0].shape}, Tuple({tensors_during[1][0].shape}, {tensors_during[1][1].shape}, {tensors_during[1][2].shape}), {tensors_during[2].shape}, {tensors_during[3].shape})")
+
+                # print the shape of each of the tensors in tensors_discard
+                print(f"tensors_discard: shape = Tuple({tensors_discard[0].shape}, Tuple({tensors_discard[1][0].shape}, {tensors_discard[1][1].shape}, {tensors_discard[1][2].shape}), {tensors_discard[2].shape}, {tensors_discard[3].shape})")
+
+                # print the shape of each of the tensors in tensors_post
+                print(f"tensors_post: shape = Tuple({tensors_post[0].shape}, Tuple({tensors_post[1][0].shape}, {tensors_post[1][1].shape}, {tensors_post[1][2].shape}), {tensors_post[2].shape}, {tensors_post[3].shape}")
 
     # logits, loss = model(xb, yb)
     # optimizer.zero_grad()
