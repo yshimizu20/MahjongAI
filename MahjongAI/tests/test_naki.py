@@ -1,8 +1,8 @@
 import sys
 
-sys.path.append("../")
+sys.path.append("../../")
 
-from draw import Naki
+from MahjongAI.draw import Naki
 
 
 def test_naki_from_chi_info1():
