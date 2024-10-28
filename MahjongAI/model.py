@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from MahjongAI.utils.constants import EventTypes, EventStateTypes
+from MahjongAI.utils.constants import EventStateTypes
 
 # Hyperparameters
 ENCODER_EMBD_DIM = 315

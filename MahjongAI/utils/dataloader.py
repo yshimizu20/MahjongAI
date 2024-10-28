@@ -51,9 +51,7 @@ class DataLoader:
 
         raise StopIteration
 
-    def build_tensors(
-        self, turns: List[HalfTurn], encoding_tokens: List[int]
-    ) -> Tuple[
+    def build_tensors(self, turns: List[HalfTurn], encoding_tokens: List[int]) -> Tuple[
         Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor],
@@ -84,8 +82,12 @@ class DataLoader:
                 raise ValueError(f"Unknown turn type: {turn.type_}")
 
         # convert encoding_tokens to tensor and pad it to 150
-        encoding_token_tensor = torch.tensor(encoding_tokens, dtype=torch.int64, device=device)
-        encoding_token_tensor = torch.nn.functional.pad(encoding_token_tensor, (0, 150 - len(encoding_tokens)))
+        encoding_token_tensor = torch.tensor(
+            encoding_tokens, dtype=torch.int64, device=device
+        )
+        encoding_token_tensor = torch.nn.functional.pad(
+            encoding_token_tensor, (0, 150 - len(encoding_tokens))
+        )
 
         # Build tensors for each turn type
         tensors_during = self._build_during_tensor(during_turns, encoding_token_tensor)
@@ -139,7 +141,7 @@ class DataLoader:
 
             # Create filter_tensor
             filter_tensor = torch.zeros(71, dtype=torch.float32, device=device)
-            filter_tensor[0] = 1.0 # pass
+            filter_tensor[0] = 1.0  # pass
 
             decision_idx = 0
 
@@ -254,9 +256,7 @@ class DataLoader:
             y.append(discarded_tile_idx)
 
         # Stack embeddings
-        embeddings_tensor = torch.stack(
-            X_embeddings
-        )  # Shape: (batch_size, 150)
+        embeddings_tensor = torch.stack(X_embeddings)  # Shape: (batch_size, 150)
 
         # Stack state_obj_tensors
         # Assuming each state_obj_tensor is a tuple (x1, x2, x3)
@@ -283,7 +283,9 @@ class DataLoader:
 
         return embeddings_tensor, state_obj_tensor_batch, filter_tensor_batch, y_tensor
 
-    def _build_post_tensor(self, post_turns: List[PostTurn], encoding_token_tensor: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
+    def _build_post_tensor(
+        self, post_turns: List[PostTurn], encoding_token_tensor: torch.Tensor
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
@@ -312,7 +314,7 @@ class DataLoader:
             x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
 
             action_player = turn.player
-            for player_idx in players[action_player + 1:] + players[:action_player]:
+            for player_idx in players[action_player + 1 :] + players[:action_player]:
                 if len(decisions[player_idx]) == 0:
                     continue
 
@@ -365,9 +367,16 @@ class DataLoader:
         filter_tensor_batch = torch.stack(filter_tensors)  # Shape: (batch_size, 154)
 
         # Convert target labels to tensor
-        y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (batch_size,)
+        y_tensor = torch.tensor(
+            y, dtype=torch.long, device=device
+        )  # Shape: (batch_size,)
 
-        return X_embeddings_tensor, state_obj_tensor_batch, filter_tensor_batch, y_tensor
+        return (
+            X_embeddings_tensor,
+            state_obj_tensor_batch,
+            filter_tensor_batch,
+            y_tensor,
+        )
 
     def _convert_state_obj_to_tensors(
         self, stateObj
