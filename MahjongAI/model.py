@@ -2,17 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from MahjongAI.utils.constants import EventTypes, EventStateTypes
 
 # Hyperparameters
 ENCODER_EMBD_DIM = 315
 DECODER_STATE_OBJ_DIM = [(37, 3), (4, 7), (1, 4)]
 DECODER_EMBD_DIM = 1024
 DISCARD_ACTION_DIM = 37
-# REACH_ACTION_DIM = 2
-# AGARI_ACTION_DIM = 2
 DURING_TURN_ACTION_DIM = 34 * 2 + 1 + 1 + 1 # 71; ankan, kakan, riichi, tsumo, pass
-# MELD_ACTION_DIM = 1024
-POST_TURN_ACTION_DIM = 1024 # ron, naki
+POST_TURN_ACTION_DIM = 154 # pass, agari (ron), naki
 MAX_ACTION_LEN = 150
 EMBD_SIZE = 128
 N_HEADS = 8
@@ -52,21 +50,26 @@ class TransformerModel(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, n_layers=N_LAYERS):
         super().__init__()
-        # TODO: replace token_embedding with neural network (keep position_embedding_table)
-        # self.token_embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
-        # self.position_embedding_table = nn.Embedding(MAX_ACTION_LEN, EMBD_SIZE)
-        self.embedding_table = nn.Embedding(ENCODER_EMBD_DIM, EMBD_SIZE)
-        self.position_coding_table = self._get_position_encoding(MAX_ACTION_LEN, EMBD_SIZE)
-        self.player_coding_table = self._get_player_encoding(4, EMBD_SIZE)
+        self.type_embedding = nn.Embedding(5, EMBD_SIZE)  # embedding_type: 0-4
+        self.tile_embedding = nn.Embedding(37, EMBD_SIZE)  # tile_encoding: 0-36
+        self.tsumogiri_embedding = nn.Embedding(1, EMBD_SIZE)
 
-        # Set the weights for index 0 to be zeros; this has to be done after every iteration as well;
-        self.embedding_table.weight.data[0] = torch.zeros(EMBD_SIZE)
+        self.position_coding_table = (
+            self._get_position_encoding().detach()
+        )  # Non-trainable
+        self.player_coding_table = self._get_player_encoding().detach()  # Non-trainable
+
+        self._init_embeddings()
 
         self.blocks = nn.Sequential(
             *[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)]
         )
 
         self.apply(self._init_weights)
+
+    def _init_embeddings(self):
+        nn.init.normal_(self.type_embedding.weight, std=0.02)
+        nn.init.normal_(self.tile_embedding.weight, std=0.02)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -76,19 +79,24 @@ class Encoder(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, std=0.02)
 
-
+    @staticmethod
     def _get_position_encoding():
         position = torch.arange(MAX_ACTION_LEN).unsqueeze(1).float()
-        div_term = torch.exp(torch.arange(0, EMBD_SIZE, 2).float() * -(np.log(10000.0) / EMBD_SIZE))
+        div_term = torch.exp(
+            torch.arange(0, EMBD_SIZE, 2).float() * -(np.log(10000.0) / EMBD_SIZE)
+        )
         pos_encoding = torch.zeros(MAX_ACTION_LEN, EMBD_SIZE)
         pos_encoding[:, 0::2] = torch.sin(position * div_term)
         pos_encoding[:, 1::2] = torch.cos(position * div_term)
-        return pos_encoding
+        return pos_encoding.requires_grad_(False)  # Ensure non-trainable
 
+    @staticmethod
     def _get_player_encoding():
         encoding = torch.empty((4, EMBD_SIZE), dtype=torch.float32)
 
-        base = torch.pow(10000, torch.arange(EMBD_SIZE, dtype=torch.float32) / EMBD_SIZE)
+        base = torch.pow(
+            10000, torch.arange(0, EMBD_SIZE, 2, dtype=torch.float32) / EMBD_SIZE
+        )
 
         player_numbers = torch.arange(4).float()
         angle_rads = player_numbers * (2 * np.pi) / 4
@@ -101,31 +109,64 @@ class Encoder(nn.Module):
         encoding[:, 0::2] = sin
         encoding[:, 1::2] = cos
 
-        return encoding
+        return encoding.requires_grad_(False)  # Ensure non-trainable
 
+    def forward(self, tokens: torch.tensor):
+        """
+        Args:
+            tokens: (B, 150) tensor of token indices
 
-    def _get_player_encoding(self, turns, n_turns):
-        t = turns[:n_turns]
-        t1, t2, t_who = t & 0x1FF, (t >> 9) & 0x1FF, (t >> 27) & 0x3
+        Returns:
+            x: (B, 150, 128) tensor of embeddings
+        """
+        event_type = (tokens >> 13) & 7
+        embedding_type = (tokens >> 10) & 7
+        player_idx = (tokens >> 8) & 3
+        tile_encoding = tokens & 0x7F
+        tsumogiri = (tokens >> 7) & 1
+        naki_idx = tokens & 0xFF
 
-        encoding_t1 = self.embedding_table(t1)
-        encoding_t2 = self.embedding_table(t2)
+        type_emb = self.type_embedding(embedding_type)  # Shape: (B, T, EMBD_SIZE)
 
-        encoding_who = self.player_coding_table[t_who]
+        # retrieve tile embeddings if event_type is DISCARD or NEW_DORA
+        tile_emb = self.tile_embedding(tile_encoding)  # Shape: (B, T, EMBD_SIZE)
+        mask = (event_type != EventStateTypes.DISCARD) & (
+            event_type != EventStateTypes.NEW_DORA
+        )
+        tile_emb = tile_emb * mask.unsqueeze(-1).float()
 
-        # Summing the encodings
-        encoding = encoding_t1 + encoding_t2 + encoding_who
+        # Retrieve player encodings if event_type is DISCARD, DURING, or POST
+        player_emb = self.player_coding_table[player_idx]  # Shape: (B, T, EMBD_SIZE)
+        mask = (event_type != EventStateTypes.DISCARD) & (
+            event_type != EventStateTypes.DURING
+        ) & (event_type != EventStateTypes.POST)
+        player_emb = player_emb * mask.unsqueeze(-1).float()
 
-        return encoding
+        # tsumogiri embedding only if event_type is DISCARD and tsumogiri is 1
+        tsumogiri_emb = self.tsumogiri_embedding(tsumogiri)  # Shape: (B, T, EMBD_SIZE)
+        mask = (event_type != EventStateTypes.DISCARD) | (tsumogiri == 0)
+        tsumogiri_emb = tsumogiri_emb * mask.unsqueeze(-1).float()
 
+        # Retrieve position encodings (shape: (150, EMBD_SIZE)) if embedding type is not EMPTY
+        pos_emb = self.position_coding_table[: tokens.size(1)]  # Shape: (T, EMBD_SIZE)
+        pos_emb = pos_emb.unsqueeze(0)  # Shape: (1, T, EMBD_SIZE)
+        mask = event_type != EventStateTypes.EMPTY
+        pos_emb = pos_emb * mask.unsqueeze(-1).float()
 
-    def forward(self, enc_indices: torch.Tensor):
-        B, T = enc_indices.shape
-        tok = self.token_embedding_table(enc_indices)
-        pos = self.position_embedding_table(torch.arange(T, device=device))
-        x = tok + pos
+        # Retrieve during naki encodings if event_type is DURING and naki_idx is >= 3
+        during_naki_emb = self.tile_embedding(naki_idx)  # Shape: (B, T, EMBD_SIZE)
+        mask = (event_type != EventStateTypes.DURING) | (naki_idx < 3)
+        during_naki_emb = during_naki_emb * mask.unsqueeze(-1).float()
+
+        # retrieve post naki encodings if event_type is POST and naki_idx is >= 2
+        post_naki_emb = self.tile_embedding(naki_idx)  # Shape: (B, T, EMBD_SIZE)
+        mask = (event_type != EventStateTypes.POST) | (naki_idx < 2)
+        post_naki_emb = post_naki_emb * mask.unsqueeze(-1).float()
+
+        x = type_emb + tile_emb + player_emb + tsumogiri_emb + pos_emb + during_naki_emb + post_naki_emb # Shape: (B, T, EMBD_SIZE)
+
         x = self.blocks(x)
-        return x
+        return x  # Shape: (B, T, EMBD_SIZE)
 
 
 class Decoder(nn.Module):
@@ -137,17 +178,11 @@ class Decoder(nn.Module):
         )
         self.ln_f = nn.LayerNorm(EMBD_SIZE)
         self.discard_head = nn.Linear(EMBD_SIZE, DISCARD_ACTION_DIM)
-        # self.reach_head = nn.Linear(EMBD_SIZE, REACH_ACTION_DIM)
-        # self.agari_head = nn.Linear(EMBD_SIZE, AGARI_ACTION_DIM)
-        # self.meld_head = nn.Linear(EMBD_SIZE, MELD_ACTION_DIM)
         self.during_head = nn.Linear(EMBD_SIZE, DURING_TURN_ACTION_DIM)
         self.post_head = nn.Linear(EMBD_SIZE, POST_TURN_ACTION_DIM)
 
         self.heads = {
             "discard": self.discard_head,
-            # "reach": self.reach_head,
-            # "agari": self.agari_head,
-            # "meld": self.meld_head,
             "during": self.during_head,
             "post": self.post_head,
         }

@@ -16,7 +16,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def train(max_iters: int):
     model = TransformerModel().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    dataloader = DataLoader("data/processed/2021/")
+    dataloader = DataLoader("data/processed/2021/", model)
 
     for iter in range(max_iters):
         halfturns = []
