@@ -252,9 +252,6 @@ class Decoder(nn.Module):
             y_tensor: (B,) tensor
             head: str indicating the head to use
         """
-        assert (
-            logits.shape == action_mask_batch.shape
-        ), f"Logits shape {logits.shape} and mask shape {action_mask_batch.shape} do not match."
         assert torch.all(
             (action_mask_batch == 0) | (action_mask_batch == 1)
         ), "action_mask_batch must be binary"
@@ -266,6 +263,10 @@ class Decoder(nn.Module):
         x = self.blocks(enc_out, enc_out, q)
         x = self.ln_f(x)
         logits = self.heads[head](x)
+
+        assert (
+            logits.shape == action_mask_batch.shape
+        ), f"Logits shape {logits.shape} and mask shape {action_mask_batch.shape} do not match."
 
         # mask out invalid actions
         logits = logits.masked_fill(action_mask_batch == 0, -1e9)
