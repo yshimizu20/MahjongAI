@@ -109,7 +109,7 @@ def test_discard(dataloader):
         ),
     ]
 
-    embeddings_tensor, state_obj_tensor_batch, filter_tensor_batch, y_tensor = (
+    embeddings_tensor, state_obj_tensor_batch, action_mask_batch, y_tensor = (
         dataloader._build_discard_tensor(halfturns, encodings)
     )
 
@@ -132,8 +132,8 @@ def test_discard(dataloader):
     assert x2.shape == torch.Size([7, 7, 4])
     assert x3.shape == torch.Size([7, 4])
 
-    assert filter_tensor_batch.shape == (7, 37)
-    assert (filter_tensor_batch[:, :14] == 1).all()
-    assert (filter_tensor_batch[:, 14:] == 0).all()
+    assert action_mask_batch.shape == (7, 37)
+    assert (action_mask_batch[:, :14] == 1).all()
+    assert (action_mask_batch[:, 14:] == 0).all()
 
     assert (y_tensor == torch.tensor([0, 1, 2, 3, 4, 5, 6]).to(device)).all().item()

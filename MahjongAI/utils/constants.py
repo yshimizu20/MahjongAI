@@ -13,6 +13,7 @@ TILE2IDX = np.array(TILE2IDX, dtype=object)
 
 
 REMAINING_TSUMO = 70
+MAX_SEQUENCE_LENGTH = 150
 
 
 YAOCHU_TENSOR = np.zeros(37)

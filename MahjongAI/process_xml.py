@@ -120,7 +120,6 @@ def process(file_path: str, verbose: bool = False):
             print("\n" + "=" * 20 + "\n")
 
         for event_idx, event in enumerate(kyoku_events[1:]):
-            # print(event)
             eventtype = event["event"]
 
             if eventtype == "DORA":

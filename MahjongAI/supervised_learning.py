@@ -19,6 +19,8 @@ def train(max_iters: int, verbose: bool = True):
     dataloader = DataLoader("data/processed/2021/", model)
 
     for iter in range(max_iters):
+        print(f"iter {iter}")
+
         for tensors_during, tensors_discard, tensors_post in dataloader:
             if verbose is True:
                 # print the shape of each of the tensors in tensors_during
@@ -29,6 +31,17 @@ def train(max_iters: int, verbose: bool = True):
 
                 # print the shape of each of the tensors in tensors_post
                 print(f"tensors_post: shape = Tuple({tensors_post[0].shape}, Tuple({tensors_post[1][0].shape}, {tensors_post[1][1].shape}, {tensors_post[1][2].shape}), {tensors_post[2].shape}, {tensors_post[3].shape}")
+
+            # process tensors_during
+            encoding_tokens_batch, state_obj_tensor_batch, action_mask_batch, y_tensor = tensors_during
+            encoding_tokens_batch = encoding_tokens_batch.to(device)
+            for state_obj_tensor in state_obj_tensor_batch:
+                state_obj_tensor = state_obj_tensor.to(device)
+            action_mask_batch = action_mask_batch.to(device)
+            y_tensor = y_tensor.to(device)
+
+            # TODO
+            
 
     # logits, loss = model(xb, yb)
     # optimizer.zero_grad()
