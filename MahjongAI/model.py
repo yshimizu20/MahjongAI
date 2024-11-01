@@ -19,7 +19,7 @@ POST_TURN_ACTION_DIM = 154  # pass, agari (ron), naki
 MAX_ACTION_LEN = 150
 EMBD_SIZE = 128
 N_HEADS = 8
-N_LAYERS = 3
+N_LAYERS = 2
 DROPOUT_RATIO = 0.2
 
 max_iters = 10_000
@@ -178,7 +178,9 @@ class Encoder(nn.Module):
         player_emb = player_emb.to(device)
 
         # tsumogiri embedding only if event_type is DISCARD and tsumogiri is 1
-        tsumogiri_emb = self.tsumogiri_embedding(torch.tensor([0], device=device))  # Shape: (B, T, EMBD_SIZE)
+        tsumogiri_emb = self.tsumogiri_embedding(
+            torch.tensor([0], device=device)
+        )  # Shape: (B, T, EMBD_SIZE)
         mask = (event_type != EventStateTypes.DISCARD) | (tsumogiri == 0)
         tsumogiri_emb = tsumogiri_emb * mask.unsqueeze(-1).float()
 
@@ -260,7 +262,7 @@ class Decoder(nn.Module):
         """
         Args:
             enc_out: (B, 150, EMBD_SIZE) tensor
-            state_obj_tensor_batch: Tuple of (B, 37, 3), (B, 4, 7), (B, 1, 4) tensors
+            state_obj_tensor_batch: Tuple of (B, 3, 37), (B, 7, 4), (B, 4) tensors
             action_mask_batch: (B, action_dim) tensor
             y_tensor: (B,) tensor
             head: str indicating the head to use
@@ -272,8 +274,9 @@ class Decoder(nn.Module):
             action_mask_batch, dim=1
         ).all(), "Each sample must have at least one allowed action"
 
-        q = self.state_net(state_obj_tensor_batch)
-        x = self.blocks(enc_out, enc_out, q)
+        x = self.state_net(state_obj_tensor_batch)  # [B, EMBD_SIZE]
+        for block in self.blocks:
+            x = block(enc_out, enc_out, x)
         x = self.ln_f(x)
         logits = self.heads[head](x)
 
@@ -327,40 +330,70 @@ class DecoderBlock(nn.Module):
 
 class StateNet(nn.Module):
     def __init__(self):
-        super().__init__()
+        super(StateNet, self).__init__()
 
-        # subnetwork 1
-        self.conv1_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[0][1], 8, 3, padding=1)
-        self.norm1_1 = nn.BatchNorm2d(8)
-        self.conv1_2 = nn.Conv2d(8, 8, 3, padding=1)
-        self.norm1_2 = nn.BatchNorm2d(8)
-        self.fc1 = nn.Linear(DECODER_STATE_OBJ_DIM[0][0] * 8, 64)
-
-        # subnetwork 2
-        self.conv2_1 = nn.Conv2d(DECODER_STATE_OBJ_DIM[1][1], 8, 3, padding=1)
-        self.norm2_1 = nn.BatchNorm2d(8)
-        self.fc2 = nn.Linear(DECODER_STATE_OBJ_DIM[1][0] * 8, 16)
-
-        # main network
-        self.fc = nn.Linear(
-            64 + 16 + DECODER_STATE_OBJ_DIM[2][0] * DECODER_STATE_OBJ_DIM[2][1],
-            EMBD_SIZE,
+        # --- Preprocessing x1 with Conv1d ---
+        # Conv1d expects input shape: [batch_size, channels, length]
+        # Here, channels=3, length=37
+        self.conv1d_x1_1 = nn.Conv1d(
+            in_channels=3, out_channels=8, kernel_size=3, padding=1
+        )
+        self.conv1d_x1_2 = nn.Conv1d(
+            in_channels=8, out_channels=16, kernel_size=3, padding=1
         )
 
+        self.relu = nn.ReLU()
+
+        # Linear layer to process concatenated Conv1d output with raw x1
+        self.fc_x1 = nn.Linear(16 * 37 + 3 * 37, 64)  # 16*37 + 3*37 = 703
+        self.relu_fc_x1 = nn.ReLU()
+
+        # Main network to combine with x2 and x3
+        self.fc_main_1 = nn.Linear(64 + 7 * 4 + 4, EMBD_SIZE)  # 64 + 28 + 4 = 96
+        self.fc_main_2 = nn.Linear(EMBD_SIZE, EMBD_SIZE)
+        self.relu_fc_main = nn.ReLU()
+
     def forward(self, state_obj):
-        x1, x2, x3 = state_obj
+        x1, x2, x3 = state_obj  # Unpack the tuple
 
-        x1 = F.relu(self.norm1_1(self.conv1_1(x1)))
-        x1 = F.relu(self.norm1_2(self.conv1_2(x1)))
-        x1 = x1.view(x1.shape[0], -1)
-        x1 = F.relu(self.fc1(x1))
+        # --- Conv1d processing of x1 ---
+        # Initial x1 shape: [batch_size, 3, 37]
+        conv_x1 = self.conv1d_x1_1(x1)  # After first Conv1d: [batch_size, 16, 37]
+        conv_x1 = self.relu(conv_x1)  # First ReLU activation
+        conv_x1 = self.conv1d_x1_2(conv_x1)  # After second Conv1d: [batch_size, 16, 37]
+        conv_x1 = self.relu(conv_x1)  # Second ReLU activation
 
-        x2 = F.relu(self.norm2_1(self.conv2_1(x2)))
-        x2 = x2.view(x2.shape[0], -1)
-        x2 = F.relu(self.fc2(x2))
+        # Flatten Conv1d output
+        conv_x1_flat = conv_x1.view(conv_x1.size(0), -1)  # Shape: [batch_size, 16 * 37]
 
-        x = torch.cat([x1, x2, x3], dim=-1)
-        x = F.relu(self.fc(x))
+        # Flatten raw x1
+        raw_x1_flat = x1.view(x1.size(0), -1)  # Shape: [batch_size, 3 * 37]
+
+        # Concatenate Conv1d features with raw x1 features
+        x1_combined = torch.cat(
+            [conv_x1_flat, raw_x1_flat], dim=1
+        )  # Shape: [batch_size, 703]
+
+        # Pass through Linear layer
+        x1_processed = self.fc_x1(x1_combined)  # Shape: [batch_size, 128]
+        x1_processed = self.relu_fc_x1(x1_processed)  # Apply ReLU activation
+
+        # Flatten x2
+        x2_flat = x2.view(x2.size(0), -1)  # Shape: [batch_size, 28]
+
+        # x3 remains as [batch_size, 4]
+
+        # Concatenate all processed features
+        combined = torch.cat(
+            [x1_processed, x2_flat, x3], dim=1
+        )  # Shape: [batch_size, 160]
+
+        # Pass through main Linear layer
+        x = self.fc_main_1(combined)  # Shape: [batch_size, EMBD_SIZE]
+        x = self.relu_fc_main(x)  # Apply ReLU activation
+        x = self.fc_main_2(x)
+        x = self.relu_fc_main(x)
+
         return x
 
 
@@ -423,8 +456,8 @@ if __name__ == "__main__":
     # encoding_tokens_batch = torch.ones((B, 150), dtype=torch.long).to(device)
     # state_obj_tensor_batch = (
     #     torch.randn(B, 3, 37).to(device),
-    #     torch.randn(B, 4, 7).to(device),
-    #     torch.randn(B, 1, 4).to(device),
+    #     torch.randn(B, 7, 4).to(device),
+    #     torch.randn(B, 4).to(device),
     # )
     # action_mask_batch = torch.ones((B, DURING_TURN_ACTION_DIM), dtype=torch.float32).to(
     #     device
