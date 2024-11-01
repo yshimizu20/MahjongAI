@@ -14,7 +14,7 @@ ENCODER_EMBD_DIM = 315
 DECODER_STATE_OBJ_DIM = [(37, 3), (4, 7), (1, 4)]
 DECODER_EMBD_DIM = 1024
 DISCARD_ACTION_DIM = 37
-DURING_TURN_ACTION_DIM = 34 * 2 + 1 + 1 + 1  # 71; ankan, kakan, riichi, tsumo, pass
+DURING_TURN_ACTION_DIM = 71  # pass, agari (tsumo), riichi, ankan, kakan
 POST_TURN_ACTION_DIM = 154  # pass, agari (ron), naki
 MAX_ACTION_LEN = 150
 EMBD_SIZE = 128
@@ -69,9 +69,11 @@ class Encoder(nn.Module):
         self.type_embedding = nn.Embedding(4, EMBD_SIZE)  # embedding_type: 1-4
         self.tile_embedding = nn.Embedding(37, EMBD_SIZE)  # tile_encoding: 0-36
         self.tsumogiri_embedding = nn.Embedding(1, EMBD_SIZE)
+        self.during_naki_embedding = nn.Embedding(DURING_TURN_ACTION_DIM, EMBD_SIZE)
+        self.post_naki_embedding = nn.Embedding(POST_TURN_ACTION_DIM, EMBD_SIZE)
 
         self.position_coding_table = (
-            self._get_position_encoding().detach()
+            self._get_position_encoding().to(device).detach()
         )  # Non-trainable
         self.player_coding_table = self._get_player_encoding().detach()  # Non-trainable
 
@@ -135,6 +137,9 @@ class Encoder(nn.Module):
         Returns:
             x: (B, 150, 128) tensor of embeddings
         """
+        # TODO: instead of doing this makeshift adjustment, find the root cause
+        encoding_tokens_batch = encoding_tokens_batch.to(torch.int64)
+
         event_type = (encoding_tokens_batch >> 13) & 7
         embedding_type = (encoding_tokens_batch >> 10) & 7
         player_idx = (encoding_tokens_batch >> 8) & 3
@@ -142,36 +147,38 @@ class Encoder(nn.Module):
         tsumogiri = (encoding_tokens_batch >> 7) & 1
         naki_idx = encoding_tokens_batch & 0xFF
 
-        assert 0 <= event_type.min() <= event_type.max() < 5
-        assert 0 <= embedding_type.min() <= embedding_type.max() < 5
-        assert 0 <= player_idx.min() <= player_idx.max() < 4
-        assert 0 <= tile_encoding.min() <= tile_encoding.max() < 37
-        assert 0 <= tsumogiri.min() <= tsumogiri.max() < 2
-        assert 0 <= naki_idx.min() <= naki_idx.max() < 155
-
         # retrieve type embeddings if event_type is not EMPTY
-        type_emb = self.type_embedding(embedding_type - 1)  # Shape: (B, T, EMBD_SIZE)
+        adjusted_embedding_type = torch.clamp(embedding_type - 1, min=0)
+        type_emb = self.type_embedding(
+            adjusted_embedding_type
+        )  # Shape: (B, T, EMBD_SIZE)
         mask = event_type == EventStateTypes.EMPTY
         type_emb = type_emb * mask.unsqueeze(-1).float()
 
         # retrieve tile embeddings if event_type is DISCARD or NEW_DORA
-        tile_emb = self.tile_embedding(tile_encoding)  # Shape: (B, T, EMBD_SIZE)
+        # clamp tile_encoding to max 36
+        adjusted_tile_encoding = torch.clamp(tile_encoding, max=36)
+        tile_emb = self.tile_embedding(
+            adjusted_tile_encoding
+        )  # Shape: (B, T, EMBD_SIZE)
         mask = (event_type != EventStateTypes.DISCARD) & (
             event_type != EventStateTypes.NEW_DORA
         )
         tile_emb = tile_emb * mask.unsqueeze(-1).float()
 
         # Retrieve player encodings if event_type is DISCARD, DURING, or POST
+        player_idx = player_idx.to(self.player_coding_table.device)
         player_emb = self.player_coding_table[player_idx]  # Shape: (B, T, EMBD_SIZE)
         mask = (
             (event_type != EventStateTypes.DISCARD)
             & (event_type != EventStateTypes.DURING)
             & (event_type != EventStateTypes.POST)
-        )
+        ).to(player_emb.device)
         player_emb = player_emb * mask.unsqueeze(-1).float()
+        player_emb = player_emb.to(device)
 
         # tsumogiri embedding only if event_type is DISCARD and tsumogiri is 1
-        tsumogiri_emb = self.tsumogiri_embedding(0)  # Shape: (B, T, EMBD_SIZE)
+        tsumogiri_emb = self.tsumogiri_embedding(torch.tensor([0], device=device))  # Shape: (B, T, EMBD_SIZE)
         mask = (event_type != EventStateTypes.DISCARD) | (tsumogiri == 0)
         tsumogiri_emb = tsumogiri_emb * mask.unsqueeze(-1).float()
 
@@ -184,12 +191,18 @@ class Encoder(nn.Module):
         pos_emb = pos_emb * mask.unsqueeze(-1).float()
 
         # Retrieve during naki encodings if event_type is DURING and naki_idx is >= 3
-        during_naki_emb = self.tile_embedding(naki_idx)  # Shape: (B, T, EMBD_SIZE)
+        adjusted_during_naki_idx = torch.clamp(naki_idx, max=DURING_TURN_ACTION_DIM - 1)
+        during_naki_emb = self.during_naki_embedding(
+            adjusted_during_naki_idx
+        )  # Shape: (B, T, EMBD_SIZE)
         mask = (event_type != EventStateTypes.DURING) | (naki_idx < 3)
         during_naki_emb = during_naki_emb * mask.unsqueeze(-1).float()
 
         # retrieve post naki encodings if event_type is POST and naki_idx is >= 2
-        post_naki_emb = self.tile_embedding(naki_idx)  # Shape: (B, T, EMBD_SIZE)
+        adjusted_post_naki_idx = torch.clamp(naki_idx, max=POST_TURN_ACTION_DIM - 1)
+        post_naki_emb = self.post_naki_embedding(
+            adjusted_post_naki_idx
+        )  # Shape: (B, T, EMBD_SIZE)
         mask = (event_type != EventStateTypes.POST) | (naki_idx < 2)
         post_naki_emb = post_naki_emb * mask.unsqueeze(-1).float()
 
