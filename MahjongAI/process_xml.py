@@ -485,6 +485,9 @@ def process(file_path: str, verbose: bool = False):
                 )
 
                 for p, decision_lst in enumerate(naki_decisions):
+                    if p == player:
+                        assert len(decision_lst) == 0
+                        continue
                     post_decisions[p][DECISION_NAKI_IDX] = decision_lst
 
                 half_turn = PostTurn(

@@ -264,6 +264,20 @@ class Naki(Draw):
             return MINKAN_START + 9 * color + number
 
         raise ZeroDivisionError("Invalid naki code")
+    
+    def __repr__(self):
+        if self.is_chi():
+            return f"Chi: {self.get_post_turn_filter_idx()}"
+        elif self.is_pon():
+            return f"Pon: {self.get_post_turn_filter_idx()}"
+        elif self.is_kakan():
+            return f"Kakan: {self.get_during_turn_filter_idx()}"
+        elif self.is_minkan():
+            return f"Minkan: {self.get_post_turn_filter_idx()}"
+        elif self.is_ankan():
+            return f"Ankan: {self.get_during_turn_filter_idx()}"
+        else:
+            return "Invalid naki code"
 
 
 class Tsumo(Draw):
