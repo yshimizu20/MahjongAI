@@ -170,18 +170,18 @@ class DataLoader:
                 - filter_tensors: Tensor of shape (sum_N, 37)
                 - y: Tensor of target labels
         """
-        # Return empty tensors if discard_turns is empty
-        if not discard_turns:
-            return (
-                torch.empty((0, MAX_SEQUENCE_LENGTH), device=device),
-                (
-                    torch.empty((0, 3, 37), device=device),
-                    torch.empty((0, 7, 4), device=device),
-                    torch.empty((0, 4), device=device),
-                ),
-                torch.empty((0, 37), device=device),
-                torch.empty((0,), dtype=torch.long, device=device),
-            )
+        # # Return empty tensors if discard_turns is empty
+        # if not discard_turns:
+        #     return (
+        #         torch.empty((0, MAX_SEQUENCE_LENGTH), device=device),
+        #         (
+        #             torch.empty((0, 3, 37), device=device),
+        #             torch.empty((0, 7, 4), device=device),
+        #             torch.empty((0, 4), device=device),
+        #         ),
+        #         torch.empty((0, 37), device=device),
+        #         torch.empty((0,), dtype=torch.long, device=device),
+        #     )
 
         X_embeddings = []
         state_obj_tensors = []
@@ -220,21 +220,46 @@ class DataLoader:
             y.append(discarded_tile_idx)
 
         # Concatenate lists into single tensors
-        encoding_tokens_batch = torch.cat(X_embeddings, dim=0)  # Shape: (sum_N, 150)
-        x1_list, x2_list, x3_list = zip(*state_obj_tensors)
+        encoding_tokens_batch = (
+            torch.cat(X_embeddings, dim=0)
+            if X_embeddings
+            else torch.empty(0, 150, device=device)
+        )
+
+        if state_obj_tensors:
+            x1_list, x2_list, x3_list = zip(*state_obj_tensors)
+        else:
+            x1_list, x2_list, x3_list = [], [], []
+
         state_obj_tensor_batch = (
-            torch.cat(x1_list, dim=0),  # Shape: (sum_N, 3, 37)
-            torch.cat(x2_list, dim=0),  # Shape: (sum_N, 7, 4)
-            torch.cat(x3_list, dim=0),  # Shape: (sum_N, 4)
+            (
+                torch.cat(x1_list, dim=0)
+                if x1_list
+                else torch.empty(0, 3, 37, device=device)
+            ),
+            (
+                torch.cat(x2_list, dim=0)
+                if x2_list
+                else torch.empty(0, 7, 4, device=device)
+            ),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4, device=device),
         )
 
         filter_tensors_2d = [
             ft.unsqueeze(0) for ft in filter_tensors
         ]  # List of (1, 37)
-        action_mask_batch = torch.cat(filter_tensors_2d, dim=0)  # shape: (sum_N, 37)
+        action_mask_batch = (
+            torch.cat(filter_tensors_2d, dim=0)
+            if filter_tensors_2d
+            else torch.empty(0, 37, device=device)
+        )
 
         assert len(action_mask_batch.shape) == 2
         assert action_mask_batch.shape[1] == 37
+        if action_mask_batch.numel() > 0:
+            assert torch.any(
+                action_mask_batch, dim=1
+            ).all(), "Each sample must have at least one allowed action"
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
@@ -262,18 +287,18 @@ class DataLoader:
                 - filter_tensors: Tensor of shape (sum_N, 71)
                 - y: Tensor of target labels
         """
-        # Return empty tensors if during_turns is empty
-        if not during_turns:
-            return (
-                torch.empty((0, MAX_SEQUENCE_LENGTH), device=device),
-                (
-                    torch.empty((0, 3, 37), device=device),
-                    torch.empty((0, 7, 4), device=device),
-                    torch.empty((0, 4), device=device),
-                ),
-                torch.empty((0, 71), device=device),
-                torch.empty((0,), dtype=torch.long, device=device),
-            )
+        # # Return empty tensors if during_turns is empty
+        # if not during_turns:
+        #     return (
+        #         torch.empty((0, MAX_SEQUENCE_LENGTH), device=device),
+        #         (
+        #             torch.empty((0, 3, 37), device=device),
+        #             torch.empty((0, 7, 4), device=device),
+        #             torch.empty((0, 4), device=device),
+        #         ),
+        #         torch.empty((0, 71), device=device),
+        #         torch.empty((0,), dtype=torch.long, device=device),
+        #     )
 
         X_embeddings = []
         state_obj_tensors = []
@@ -281,6 +306,10 @@ class DataLoader:
         y = []
 
         for turn in during_turns:
+            n_decisions = sum(map(len, turn.decisions))
+            if n_decisions == 0:
+                continue
+
             encoding_idx = turn.encoding_idx
             assert encoding_idx < MAX_SEQUENCE_LENGTH
 
@@ -310,6 +339,8 @@ class DataLoader:
                 if not decision_type:
                     continue
 
+                filter_tensor[0] = 1.0  # pass
+
                 if decision_idx == DECISION_AGARI_IDX:
                     filter_tensor[1] = 1.0
                     if decision_type[0].executed:
@@ -335,22 +366,46 @@ class DataLoader:
             y.append(decision_idx)
             filter_tensors.append(filter_tensor)  # Shape: (71,)
 
-        # Concatenate lists into single tensors
-        encoding_tokens_batch = torch.cat(X_embeddings, dim=0)  # Shape: (sum_N, 150)
-        x1_list, x2_list, x3_list = zip(*state_obj_tensors)
+        encoding_tokens_batch = (
+            torch.cat(X_embeddings, dim=0)
+            if X_embeddings
+            else torch.empty(0, 150, device=device)
+        )
+
+        if state_obj_tensors:
+            x1_list, x2_list, x3_list = zip(*state_obj_tensors)
+        else:
+            x1_list, x2_list, x3_list = [], [], []
+
         state_obj_tensor_batch = (
-            torch.cat(x1_list, dim=0),  # Shape: (sum_N, 3, 37)
-            torch.cat(x2_list, dim=0),  # Shape: (sum_N, 7, 4)
-            torch.cat(x3_list, dim=0),  # Shape: (sum_N, 4)
+            (
+                torch.cat(x1_list, dim=0)
+                if x1_list
+                else torch.empty(0, 3, 37, device=device)
+            ),
+            (
+                torch.cat(x2_list, dim=0)
+                if x2_list
+                else torch.empty(0, 7, 4, device=device)
+            ),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4, device=device),
         )
 
         filter_tensors_2d = [
             ft.unsqueeze(0) for ft in filter_tensors
         ]  # Each filter_tensor is now (1, 71)
-        action_mask_batch = torch.cat(filter_tensors_2d, dim=0)  # shape: (sum_N, 71)
+        action_mask_batch = (
+            torch.cat(filter_tensors_2d, dim=0)
+            if filter_tensors_2d
+            else torch.empty(0, 71, device=device)
+        )
 
         assert len(action_mask_batch.shape) == 2
         assert action_mask_batch.shape[1] == 71
+        if action_mask_batch.numel() > 0:
+            assert (
+                torch.sum(action_mask_batch, dim=1).min() >= 2
+            ), "Each sample must have at least two allowed actions"
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
@@ -378,19 +433,6 @@ class DataLoader:
                 - filter_tensors: Tensor of shape (sum_N, 154)
                 - y: Tensor of target labels
         """
-        # Return empty tensors if post_turns is empty
-        if not post_turns:
-            return (
-                torch.empty((0, MAX_SEQUENCE_LENGTH), device=device),
-                (
-                    torch.empty((0, 3, 37), device=device),
-                    torch.empty((0, 7, 4), device=device),
-                    torch.empty((0, 4), device=device),
-                ),
-                torch.empty((0, 154), device=device),
-                torch.empty((0,), dtype=torch.long, device=device),
-            )
-
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
@@ -399,9 +441,11 @@ class DataLoader:
 
         for turn in post_turns:
             decisions = turn.decisions  # type: List[List[List[Decision]]]
-            n_decisions = sum(map(len, decisions))
+            n_decisions = sum(len(item) for sublist in decisions for item in sublist)
             if n_decisions == 0:
                 continue
+
+            print(decisions, turn.player)
 
             encoding_idx = turn.encoding_idx
             assert encoding_idx < MAX_SEQUENCE_LENGTH
@@ -419,9 +463,10 @@ class DataLoader:
             # Create state object tensor
             x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
 
+            # TODO: instead of going player by player, go decision type by decision type
             action_player = turn.player
             for player_idx in players[action_player + 1 :] + players[:action_player]:
-                if len(decisions[player_idx]) == 0:
+                if sum(map(len, decisions[player_idx])) == 0:
                     continue
 
                 contains_executed = False
@@ -431,6 +476,8 @@ class DataLoader:
                 for decision_idx, decision_type in enumerate(decisions[player_idx]):
                     if len(decision_type) == 0:
                         continue
+
+                    decision_mask[0] = 1.0  # pass
 
                     if decision_idx == DECISION_AGARI_IDX:
                         decision_mask[1] = 1.0
@@ -445,11 +492,12 @@ class DataLoader:
                             contains_executed = True
 
                     elif decision_idx == DECISION_NAKI_IDX:
-                        for meld in decision_type:
-                            idx = meld.get_post_turn_filter_idx()
+                        for meld_decision in decision_type:
+                            print(meld_decision.naki)
+                            idx = meld_decision.naki.get_post_turn_filter_idx()
                             decision_mask[idx] = 1.0
 
-                            if meld.executed:
+                            if meld_decision.executed:
                                 result = idx
                                 contains_executed = True
 
@@ -464,22 +512,46 @@ class DataLoader:
                 if contains_executed:
                     break
 
-        # Concatenate lists into single tensors
-        encoding_tokens_batch = torch.cat(X_embeddings, dim=0)  # Shape: (sum_N, 150)
-        x1_list, x2_list, x3_list = zip(*state_obj_tensors)
+        encoding_tokens_batch = (
+            torch.cat(X_embeddings, dim=0)
+            if X_embeddings
+            else torch.empty(0, 150, device=device)
+        )
+
+        if state_obj_tensors:
+            x1_list, x2_list, x3_list = zip(*state_obj_tensors)
+        else:
+            x1_list, x2_list, x3_list = [], [], []
+
         state_obj_tensor_batch = (
-            torch.cat(x1_list, dim=0),  # Shape: (sum_N, 3, 37)
-            torch.cat(x2_list, dim=0),  # Shape: (sum_N, 7, 4)
-            torch.cat(x3_list, dim=0),  # Shape: (sum_N, 4)
+            (
+                torch.cat(x1_list, dim=0)
+                if x1_list
+                else torch.empty(0, 3, 37, device=device)
+            ),
+            (
+                torch.cat(x2_list, dim=0)
+                if x2_list
+                else torch.empty(0, 7, 4, device=device)
+            ),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4, device=device),
         )
 
         filter_tensors_2d = [
             ft.unsqueeze(0) for ft in filter_tensors
         ]  # Each filter_tensor is now (1, 154)
-        action_mask_batch = torch.cat(filter_tensors_2d, dim=0)  # shape: (sum_N, 154)
+        action_mask_batch = (
+            torch.cat(filter_tensors_2d, dim=0)
+            if filter_tensors_2d
+            else torch.empty(0, 154, device=device)
+        )
 
         assert len(action_mask_batch.shape) == 2
         assert action_mask_batch.shape[1] == 154
+        if action_mask_batch.numel() > 0:
+            assert (
+                torch.sum(action_mask_batch, dim=1).min() >= 2
+            ), "Each sample must have at least two allowed actions"
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
