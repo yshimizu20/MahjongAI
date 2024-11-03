@@ -10,16 +10,13 @@ sys.path.append("..")
 from MahjongAI.utils.constants import EventStateTypes
 
 # Hyperparameters
-ENCODER_EMBD_DIM = 315
-DECODER_STATE_OBJ_DIM = [(37, 3), (4, 7), (1, 4)]
-DECODER_EMBD_DIM = 1024
 DISCARD_ACTION_DIM = 37
 DURING_TURN_ACTION_DIM = 71  # pass, agari (tsumo), riichi, ankan, kakan
 POST_TURN_ACTION_DIM = 154  # pass, agari (ron), naki
 MAX_ACTION_LEN = 150
-EMBD_SIZE = 128
+EMBD_SIZE = 64
 N_HEADS = 8
-N_LAYERS = 2
+N_LAYERS = 1
 DROPOUT_RATIO = 0.2
 
 max_iters = 10_000
@@ -135,7 +132,7 @@ class Encoder(nn.Module):
             encoding_tokens_batch: (B, 150) tensor of encoding tokens
 
         Returns:
-            x: (B, 150, 128) tensor of embeddings
+            x: (B, 150, EMBD_SIZE) tensor of embeddings
         """
         # TODO: instead of doing this makeshift adjustment, find the root cause
         encoding_tokens_batch = encoding_tokens_batch.to(torch.int64)
@@ -219,7 +216,8 @@ class Encoder(nn.Module):
             + post_naki_emb
         )  # Shape: (B, T, EMBD_SIZE)
 
-        x = self.blocks(x)
+        for block in self.blocks:
+            x = block(x)
         return x  # Shape: (B, T, EMBD_SIZE)
 
 
@@ -276,7 +274,7 @@ class Decoder(nn.Module):
 
         x = self.state_net(state_obj_tensor_batch)  # [B, EMBD_SIZE]
         for block in self.blocks:
-            x = block(enc_out, enc_out, x)
+            x = block(x, enc_out)
         x = self.ln_f(x)
         logits = self.heads[head](x)
 
@@ -295,15 +293,15 @@ class EncoderBlock(nn.Module):
     def __init__(self, EMBD_SIZE, num_heads):
         super().__init__()
         head_size = EMBD_SIZE // num_heads
-        self.attention = MultiHeadAttention(num_heads, head_size)
+        self.self_attention = MultiHeadAttention(num_heads, head_size)
         self.ffwd = FeedForward(EMBD_SIZE)
         self.ln1 = nn.LayerNorm(EMBD_SIZE)
         self.ln2 = nn.LayerNorm(EMBD_SIZE)
 
     def forward(self, x):
-        x = self.ln1(x)
-        x = x + self.attention(x, x, x)
+        x = x + self.self_attention(self.ln1(x), self.ln1(x), self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
+
         return x
 
 
@@ -311,21 +309,32 @@ class DecoderBlock(nn.Module):
     def __init__(self, EMBD_SIZE, num_heads):
         super().__init__()
         head_size = EMBD_SIZE // num_heads
-        self.attention = MultiHeadAttention(num_heads, head_size)
+        self.self_attention = MultiHeadAttention(num_heads, head_size)
+        self.cross_attention = MultiHeadAttention(num_heads, head_size)
         self.ffwd = FeedForward(EMBD_SIZE)
         self.ln1 = nn.LayerNorm(EMBD_SIZE)
         self.ln2 = nn.LayerNorm(EMBD_SIZE)
         self.ln3 = nn.LayerNorm(EMBD_SIZE)
-        self.ln4 = nn.LayerNorm(EMBD_SIZE)
 
-    def forward(self, k, v, q):
-        k = self.ln1(k)
-        v = self.ln2(v)
-        q = self.ln3(q)
+    def forward(self, x, enc_out):
+        # Self-Attention
+        x_norm = self.ln1(x).unsqueeze(1)  # [B, 1, EMBD_SIZE]
+        self_attn = self.self_attention(enc_out, enc_out, x_norm)  # [B, 1, EMBD_SIZE]
+        self_attn = self_attn.squeeze(1)  # [B, EMBD_SIZE]
+        x = x + self_attn  # [B, EMBD_SIZE]
 
-        q = q + self.attention(k, v, q)
-        q = q + self.ffwd(self.ln4(q))
-        return q
+        # Cross-Attention
+        x_norm = self.ln2(x).unsqueeze(1)  # [B, 1, EMBD_SIZE]
+        cross_attn = self.cross_attention(enc_out, enc_out, x_norm)  # [B, 1, EMBD_SIZE]
+        cross_attn = cross_attn.squeeze(1)  # [B, EMBD_SIZE]
+        x = x + cross_attn  # [B, EMBD_SIZE]
+
+        # Feed Forward Network
+        x_norm = self.ln3(x)  # [B, EMBD_SIZE]
+        ffwd = self.ffwd(x_norm)  # [B, EMBD_SIZE]
+        x = x + ffwd  # [B, EMBD_SIZE]
+
+        return x  # [B, EMBD_SIZE]
 
 
 class StateNet(nn.Module):
@@ -405,32 +414,49 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(DROPOUT_RATIO)
 
     def forward(self, k, v, q):
-        out = torch.cat([h(k, v, q) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
+        head_outputs = [head(k, v, q) for head in self.heads]  # Each [B, Q, head_size]
+        out = torch.cat(head_outputs, dim=-1)  # [B, Q, head_size * num_heads]
+        out = self.proj(out)  # [B, Q, EMBD_SIZE]
+        out = self.dropout(out)  # [B, Q, EMBD_SIZE]
+        return out  # [B, Q, EMBD_SIZE]
 
 
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
-        self.key = nn.Linear(EMBD_SIZE, head_size, bias=False)
-        self.query = nn.Linear(EMBD_SIZE, head_size, bias=False)
-        self.value = nn.Linear(EMBD_SIZE, head_size, bias=False)
-
+        self.key = nn.Linear(EMBD_SIZE, head_size, bias=True)
+        self.query = nn.Linear(EMBD_SIZE, head_size, bias=True)
+        self.value = nn.Linear(EMBD_SIZE, head_size, bias=True)
         self.dropout = nn.Dropout(DROPOUT_RATIO)
 
     def forward(self, k, v, q):
-        k = self.key(k)
-        q = self.query(q)
+        """
+        Args:
+            k: Key tensor of shape [B, T, EMBD_SIZE]
+            v: Value tensor of shape [B, T, EMBD_SIZE]
+            q: Query tensor of shape [B, Q, EMBD_SIZE]
+               - Q can be 1 (for cross-attention) or T (for self-attention)
 
-        # compute attention scores
-        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** 0.5
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
+        Returns:
+            out: Tensor of shape [B, Q, head_size]
+        """
+        k = self.key(k)  # [B, T, head_size]
+        q = self.query(q)  # [B, Q, head_size]
+        v = self.value(v)  # [B, T, head_size]
 
-        v = self.value(v)
-        out = wei @ v
-        return out
+        # Transpose k for batched matrix multiplication
+        k_transposed = k.transpose(1, 2)  # [B, head_size, T]
+
+        # Compute attention scores
+        wei = torch.bmm(q, k_transposed)  # [B, Q, T]
+        wei = wei / (k.size(-1) ** 0.5)  # Scaling
+        wei = F.softmax(wei, dim=-1)  # [B, Q, T]
+        wei = self.dropout(wei)  # [B, Q, T]
+
+        # Weighted sum of values
+        out = torch.bmm(wei, v)  # [B, Q, head_size]
+
+        return out  # [B, Q, head_size]
 
 
 class FeedForward(nn.Module):
@@ -450,25 +476,3 @@ class FeedForward(nn.Module):
 if __name__ == "__main__":
     model = TransformerModel().to(device)
     print(f"{sum(p.numel() for p in model.parameters()) / 1e6} M params")
-
-    # # Create dummy data
-    # B = 2  # Batch size
-    # encoding_tokens_batch = torch.ones((B, 150), dtype=torch.long).to(device)
-    # state_obj_tensor_batch = (
-    #     torch.randn(B, 3, 37).to(device),
-    #     torch.randn(B, 7, 4).to(device),
-    #     torch.randn(B, 4).to(device),
-    # )
-    # action_mask_batch = torch.ones((B, DURING_TURN_ACTION_DIM), dtype=torch.float32).to(
-    #     device
-    # )
-    # y_tensor = torch.randint(0, DURING_TURN_ACTION_DIM, (B,), dtype=torch.long).to(
-    #     device
-    # )
-    # head = "during"
-
-    # logits, loss = model(
-    #     encoding_tokens_batch, state_obj_tensor_batch, action_mask_batch, y_tensor, head
-    # )
-    # print("Logits shape:", logits.shape)  # Expected: (B, DURING_TURN_ACTION_DIM)
-    # print("Loss:", loss.item())
