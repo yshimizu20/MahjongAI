@@ -191,6 +191,7 @@ def process(file_path: str, verbose: bool = False):
                     for lst in curr_halfturn.decisions:
                         for decision in lst[DECISION_NAKI_IDX]:
                             assert isinstance(decision, NakiDecision)
+                            # TODO: check if this is correct
                             if (
                                 decision.naki.convenient_naki_code
                                 == naki.convenient_naki_code
@@ -483,8 +484,8 @@ def process(file_path: str, verbose: bool = False):
                     player, hand_tensors, tile_idx[0], len(tile_idx) == 2
                 )
 
-                for decision_lst in naki_decisions:
-                    post_decisions[player][DECISION_NAKI_IDX] = decision_lst
+                for p, decision_lst in enumerate(naki_decisions):
+                    post_decisions[p][DECISION_NAKI_IDX] = decision_lst
 
                 half_turn = PostTurn(
                     player=player,
