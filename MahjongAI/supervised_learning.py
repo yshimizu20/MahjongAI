@@ -4,14 +4,14 @@ import sys
 import re
 import glob
 from datetime import datetime
-from typing import Tuple, str
+from typing import Tuple
 
 sys.path.append("..")
 
 from MahjongAI.agents.transformer import TransformerModel
 from MahjongAI.utils.dataloader import DataLoader
 
-eval_interval = 10
+eval_interval = 5
 learning_rate = 1e-2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -75,42 +75,18 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
         start_iter = 0
 
     train_dataloaders = [
-        DataLoader(f"data/processed/{yr}/", model) for yr in range(2012, 2020)
+        DataLoader(f"data/processed/{yr}/") for yr in range(2012, 2020)
     ]
-    val_dataloader = DataLoader("data/processed/2021/", model)  # Validation DataLoader
+    val_dataloader = DataLoader("data/processed/2021/")  # Validation DataLoader
 
     for iter in range(start_iter, start_iter + max_iters):
         log_message(f"iter {iter}")
 
         for train_dataloader in train_dataloaders:
-            for game, (tensors_during, tensors_discard, tensors_post) in enumerate(
+            for game, (all_halfturns, all_encoding_tokens) in enumerate(
                 train_dataloader
             ):
-                # Training code for each turn type (DURING, DISCARD, POST)
-                for tensors, turn_type in zip(
-                    [tensors_during, tensors_discard, tensors_post],
-                    ["during", "discard", "post"],
-                ):
-                    (
-                        encoding_tokens_batch,
-                        state_obj_tensor_batch,
-                        action_mask_batch,
-                        y_tensor,
-                    ) = tensors
-                    encoding_tokens_batch = encoding_tokens_batch.to(device)
-                    state_obj_tensor_batch = tuple(
-                        tensor.to(device) for tensor in state_obj_tensor_batch
-                    )
-                    action_mask_batch = action_mask_batch.to(device)
-                    y_tensor = y_tensor.to(device)
-
-                    logits, loss = model(
-                        encoding_tokens_batch,
-                        state_obj_tensor_batch,
-                        action_mask_batch,
-                        y_tensor,
-                        turn_type,
-                    )
+                for logits, loss in model(all_halfturns, all_encoding_tokens, train=True):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
@@ -138,33 +114,16 @@ def estimate_loss(val_dataloader, model):
     total_loss = 0
     num_batches = 0
 
-    for _, (tensors_during, tensors_discard, tensors_post) in enumerate(val_dataloader):
-        for tensors, turn_type in zip(
-            [tensors_during, tensors_discard, tensors_post],
-            ["during", "discard", "post"],
-        ):
-            (
-                encoding_tokens_batch,
-                state_obj_tensor_batch,
-                action_mask_batch,
-                y_tensor,
-            ) = tensors
-            encoding_tokens_batch = encoding_tokens_batch.to(device)
-            state_obj_tensor_batch = tuple(
-                tensor.to(device) for tensor in state_obj_tensor_batch
-            )
-            action_mask_batch = action_mask_batch.to(device)
-            y_tensor = y_tensor.to(device)
+    for game, (all_halfturns, all_encoding_tokens) in enumerate(val_dataloader):
+        total_loss = 0
+        num_batches = 0
 
-            _, loss = model(
-                encoding_tokens_batch,
-                state_obj_tensor_batch,
-                action_mask_batch,
-                y_tensor,
-                turn_type,
-            )
+        for logits, loss in model(all_halfturns, all_encoding_tokens, train=False):
             total_loss += loss.item()
             num_batches += 1
+
+        if game >= 100:
+            break
 
     val_dataloader.reset()
 
@@ -181,8 +140,8 @@ def log_message(message: str):
 
 if __name__ == "__main__":
     # get argv (first check if two arguments are provided and the first one is a string and the second one should be an integer)
-    if len(sys.argv) != 2:
-        raise ValueError("Please provide the number of iterations as an argument.")
+    if len(sys.argv) != 3:
+        raise ValueError("Usage: `python3 supervised_learning.py <model_name> <max_iters>`")
     
     model_name = sys.argv[1]
     assert model_name in ["transformer"]
