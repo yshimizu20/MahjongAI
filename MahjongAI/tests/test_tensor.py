@@ -22,7 +22,7 @@ def model():
 
 @pytest.fixture(scope="module")
 def dataloader(model):
-    return dl.DataLoader("data/", model)
+    return dl.DataLoader("data/")
 
 
 def test_discard(dataloader):
