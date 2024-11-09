@@ -3,7 +3,7 @@ import sys
 sys.path.append("../../")
 
 import MahjongAI.utils.dataloader as dl
-from MahjongAI.model import TransformerModel
+from MahjongAI.agents.transformer import TransformerModel
 import MahjongAI.process_xml as px
 from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.state import StateObject

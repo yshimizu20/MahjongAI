@@ -11,7 +11,7 @@ from MahjongAI.utils.constants import (
     TILE2IDX,
     MAX_SEQUENCE_LENGTH,
 )
-from MahjongAI.model import TransformerModel
+from MahjongAI.agents.transformer import TransformerModel
 from MahjongAI.decision import Decision, NakiDecision
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

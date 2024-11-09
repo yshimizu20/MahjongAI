@@ -8,7 +8,7 @@ from typing import Tuple
 
 sys.path.append("..")
 
-from MahjongAI.model import TransformerModel
+from MahjongAI.agents.transformer import TransformerModel
 from MahjongAI.utils.dataloader import DataLoader
 
 eval_interval = 10
@@ -71,57 +71,60 @@ def train(max_iters: int, verbose: bool = True):
         log_message("No checkpoint found. Starting training from iter 0.")
         start_iter = 0
 
-    train_dataloader = DataLoader("data/processed/2021/", model)
-    val_dataloader = DataLoader("data/processed/test/", model)  # Validation DataLoader
+    train_dataloaders = [
+        DataLoader(f"data/processed/{yr}/", model) for yr in range(2012, 2020)
+    ]
+    val_dataloader = DataLoader("data/processed/2021/", model)  # Validation DataLoader
 
     for iter in range(start_iter, start_iter + max_iters):
         log_message(f"iter {iter}")
 
-        for game, (tensors_during, tensors_discard, tensors_post) in enumerate(
-            train_dataloader
-        ):
-            # Training code for each turn type (DURING, DISCARD, POST)
-            for tensors, turn_type in zip(
-                [tensors_during, tensors_discard, tensors_post],
-                ["during", "discard", "post"],
+        for train_dataloader in train_dataloaders:
+            for game, (tensors_during, tensors_discard, tensors_post) in enumerate(
+                train_dataloader
             ):
-                (
-                    encoding_tokens_batch,
-                    state_obj_tensor_batch,
-                    action_mask_batch,
-                    y_tensor,
-                ) = tensors
-                encoding_tokens_batch = encoding_tokens_batch.to(device)
-                state_obj_tensor_batch = tuple(
-                    tensor.to(device) for tensor in state_obj_tensor_batch
+                # Training code for each turn type (DURING, DISCARD, POST)
+                for tensors, turn_type in zip(
+                    [tensors_during, tensors_discard, tensors_post],
+                    ["during", "discard", "post"],
+                ):
+                    (
+                        encoding_tokens_batch,
+                        state_obj_tensor_batch,
+                        action_mask_batch,
+                        y_tensor,
+                    ) = tensors
+                    encoding_tokens_batch = encoding_tokens_batch.to(device)
+                    state_obj_tensor_batch = tuple(
+                        tensor.to(device) for tensor in state_obj_tensor_batch
+                    )
+                    action_mask_batch = action_mask_batch.to(device)
+                    y_tensor = y_tensor.to(device)
+
+                    logits, loss = model(
+                        encoding_tokens_batch,
+                        state_obj_tensor_batch,
+                        action_mask_batch,
+                        y_tensor,
+                        turn_type,
+                    )
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+            # Evaluate and save model every eval_interval iterations
+            val_loss = estimate_loss(val_dataloader, model)
+            log_message(f"iter {iter} | val loss {val_loss}")
+
+            if (iter + 1) % eval_interval == 0:
+                # Save model checkpoint
+                model_path = os.path.join(
+                    checkpoint_dir, f"model_checkpoint_iter_{iter}.pt"
                 )
-                action_mask_batch = action_mask_batch.to(device)
-                y_tensor = y_tensor.to(device)
+                torch.save(model.state_dict(), model_path)
+                log_message(f"Model saved at {model_path}")
 
-                logits, loss = model(
-                    encoding_tokens_batch,
-                    state_obj_tensor_batch,
-                    action_mask_batch,
-                    y_tensor,
-                    turn_type,
-                )
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-        # Evaluate and save model every eval_interval iterations
-        val_loss = estimate_loss(val_dataloader, model)
-        log_message(f"iter {iter} | val loss {val_loss}")
-
-        if (iter + 1) % eval_interval == 0:
-            # Save model checkpoint
-            model_path = os.path.join(
-                checkpoint_dir, f"model_checkpoint_iter_{iter}.pt"
-            )
-            torch.save(model.state_dict(), model_path)
-            log_message(f"Model saved at {model_path}")
-
-        train_dataloader.reset()
+            train_dataloader.reset()
 
     log_message("Training completed.")
 
