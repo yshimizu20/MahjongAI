@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from typing import Tuple
 import numpy as np
 
-sys.path.append("..")
+sys.path.append("../..")
 
 from MahjongAI.utils.constants import EventStateTypes
 

@@ -4,7 +4,7 @@ import sys
 import re
 import glob
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, str
 
 sys.path.append("..")
 
@@ -46,13 +46,16 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Tuple[int, str]:
         return 0, None
 
 
-def train(max_iters: int, verbose: bool = True):
+def train(model_name: str, max_iters: int, verbose: bool = True):
     # Ensure 'saved_models/' directory exists
     checkpoint_dir = "saved_models"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Initialize model
-    model = TransformerModel().to(device)
+    if model_name == "transformer":
+        model = TransformerModel().to(device)
+    else:
+        raise NotImplementedError(f"Model {model_name} not implemented.")
 
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -177,4 +180,17 @@ def log_message(message: str):
 
 
 if __name__ == "__main__":
-    train(100)
+    # get argv (first check if two arguments are provided and the first one is a string and the second one should be an integer)
+    if len(sys.argv) != 2:
+        raise ValueError("Please provide the number of iterations as an argument.")
+    
+    model_name = sys.argv[1]
+    assert model_name in ["transformer"]
+
+    try:
+        max_iters = int(sys.argv[2])
+    except ValueError:
+        raise ValueError("Please provide the number of iterations as an integer.")
+    
+
+    train(model_name, max_iters)
