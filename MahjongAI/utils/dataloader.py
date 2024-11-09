@@ -30,7 +30,7 @@ class DataLoader:
     def __next__(self):
         while self.current_index < len(self.file_list):
             filename = self.file_list[self.current_index]
-            print(f"\nProcessing file: {filename}")
+            # print(f"\nProcessing file: {filename}")
             self.current_index += 1
 
             try:
@@ -38,7 +38,7 @@ class DataLoader:
                     os.path.join(self.path, filename)
                 )
             except InvalidGameException as e:
-                print(f"Invalid game detected: {e.msg}")
+                # print(f"Invalid game detected: {e.msg}")
                 continue  # Skip to the next file
 
             return self.prepare_batches(all_halfturns, all_encoding_tokens)
@@ -445,8 +445,6 @@ class DataLoader:
             if n_decisions == 0:
                 continue
 
-            print(decisions, turn.player)
-
             encoding_idx = turn.encoding_idx
             assert encoding_idx < MAX_SEQUENCE_LENGTH
 
@@ -493,7 +491,6 @@ class DataLoader:
 
                     elif decision_idx == DECISION_NAKI_IDX:
                         for meld_decision in decision_type:
-                            print(meld_decision.naki)
                             idx = meld_decision.naki.get_post_turn_filter_idx()
                             decision_mask[idx] = 1.0
 
@@ -664,3 +661,7 @@ class DataLoader:
         )  # Shape: (1, 4)
 
         return x1, x2, x3
+
+    def reset(self):
+        """Resets the dataloader's current index for re-iteration."""
+        self.current_index = 0

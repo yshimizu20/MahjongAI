@@ -19,9 +19,6 @@ N_HEADS = 8
 N_LAYERS = 1
 DROPOUT_RATIO = 0.2
 
-max_iters = 10_000
-eval_interval = 100
-learning_rate = 3e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
