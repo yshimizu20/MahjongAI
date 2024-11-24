@@ -50,20 +50,25 @@ class TransformerModel(nn.Module):
 
     def forward(
         self,
-        all_halfturns,
-        all_encoding_tokens,
+        all_halfturns_list: List[list[HalfTurn]],
+        all_encoding_tokens_list: List[list[int]],
         train=True,
     ):
         (
             tensors_during,
             tensors_discard,
             tensors_post,
-        ) = self.tensor_processor.prepare_batches(all_halfturns, all_encoding_tokens)
+        ) = self.tensor_processor.prepare_batches(
+            all_halfturns_list, all_encoding_tokens_list
+        )
 
         for tensors, head in zip(
             [tensors_during, tensors_discard, tensors_post],
             ["during", "discard", "post"],
         ):
+            if len(tensors[0]) == 0:
+                continue
+
             (
                 encoding_tokens_batch,
                 state_obj_tensor_batch,
@@ -401,6 +406,7 @@ class StateNet(nn.Module):
         conv_x1 = self.relu(conv_x1)  # Second ReLU activation
 
         # Flatten Conv1d output
+        assert conv_x1.size(0) > 0, "conv_x1 is empty, cannot reshape."
         conv_x1_flat = conv_x1.view(conv_x1.size(0), -1)  # Shape: [batch_size, 16 * 37]
 
         # Flatten raw x1
@@ -506,7 +512,9 @@ class TransformerTensorProcessor:
         pass
 
     def prepare_batches(
-        self, all_halfturns, all_encoding_tokens
+        self,
+        all_halfturns_list: List[list[HalfTurn]],
+        all_encoding_tokens_list: List[list[int]],
     ) -> Tuple[
         Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]
     ]:
@@ -515,14 +523,17 @@ class TransformerTensorProcessor:
         tensors_discard_batch = []
         tensors_post_batch = []
 
-        for halfturns, encoding_tokens in zip(all_halfturns, all_encoding_tokens):
-            tensors_during, tensors_discard, tensors_post = self.build_tensors(
-                halfturns, encoding_tokens
-            )
+        for all_halfturns, all_encoding_tokens in zip(
+            all_halfturns_list, all_encoding_tokens_list
+        ):
+            for halfturns, encoding_tokens in zip(all_halfturns, all_encoding_tokens):
+                tensors_during, tensors_discard, tensors_post = self.build_tensors(
+                    halfturns, encoding_tokens
+                )
 
-            tensors_during_batch.append(tensors_during)
-            tensors_discard_batch.append(tensors_discard)
-            tensors_post_batch.append(tensors_post)
+                tensors_during_batch.append(tensors_during)
+                tensors_discard_batch.append(tensors_discard)
+                tensors_post_batch.append(tensors_post)
 
         return self.stack_batches(
             tensors_during_batch, tensors_discard_batch, tensors_post_batch
@@ -1121,6 +1132,7 @@ class TransformerTensorProcessor:
         )  # Shape: (1, 4)
 
         return x1, x2, x3
+
 
 if __name__ == "__main__":
     model = TransformerModel().to(device)

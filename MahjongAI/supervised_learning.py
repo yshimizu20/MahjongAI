@@ -75,7 +75,7 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
         start_iter = 0
 
     train_dataloaders = [
-        DataLoader(f"data/processed/{yr}/") for yr in range(2012, 2020)
+        DataLoader(f"data/processed/{yr}/", 10) for yr in range(2012, 2020)
     ]
     val_dataloader = DataLoader("data/processed/2021/")  # Validation DataLoader
 
@@ -83,27 +83,29 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
         log_message(f"iter {iter}")
 
         for train_dataloader in train_dataloaders:
-            for game, (all_halfturns, all_encoding_tokens) in enumerate(
+            for _, (all_halfturns_list, all_encoding_tokens_list) in enumerate(
                 train_dataloader
             ):
-                for logits, loss in model(all_halfturns, all_encoding_tokens, train=True):
+                for logits, loss in model(
+                    all_halfturns_list, all_encoding_tokens_list, train=True
+                ):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
 
-            # Evaluate and save model every eval_interval iterations
-            val_loss = estimate_loss(val_dataloader, model)
-            log_message(f"iter {iter} | val loss {val_loss}")
+        # Evaluate and save model every eval_interval iterations
+        val_loss = estimate_loss(val_dataloader, model)
+        log_message(f"iter {iter} | val loss {val_loss}")
 
-            if (iter + 1) % eval_interval == 0:
-                # Save model checkpoint
-                model_path = os.path.join(
-                    checkpoint_dir, f"model_checkpoint_iter_{iter}.pt"
-                )
-                torch.save(model.state_dict(), model_path)
-                log_message(f"Model saved at {model_path}")
+        if (iter + 1) % eval_interval == 0:
+            # Save model checkpoint
+            model_path = os.path.join(
+                checkpoint_dir, f"model_checkpoint_iter_{iter}.pt"
+            )
+            torch.save(model.state_dict(), model_path)
+            log_message(f"Model saved at {model_path}")
 
-            train_dataloader.reset()
+        train_dataloader.reset()
 
     log_message("Training completed.")
 
@@ -133,16 +135,20 @@ def estimate_loss(val_dataloader, model):
 
 def log_message(message: str):
     """Logs a message to the console and to a log file."""
-    print(message)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
     with open(log_file, "a") as f:
-        f.write(message + "\n")
+        f.write(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
+        )
 
 
 if __name__ == "__main__":
     # get argv (first check if two arguments are provided and the first one is a string and the second one should be an integer)
     if len(sys.argv) != 3:
-        raise ValueError("Usage: `python3 supervised_learning.py <model_name> <max_iters>`")
-    
+        raise ValueError(
+            "Usage: `python3 supervised_learning.py <model_name> <max_iters>`"
+        )
+
     model_name = sys.argv[1]
     assert model_name in ["transformer"]
 
@@ -150,6 +156,5 @@ if __name__ == "__main__":
         max_iters = int(sys.argv[2])
     except ValueError:
         raise ValueError("Please provide the number of iterations as an integer.")
-    
 
     train(model_name, max_iters)
