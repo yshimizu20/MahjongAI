@@ -52,7 +52,8 @@ class TransformerModel(nn.Module):
         self,
         all_halfturns_list: List[list[HalfTurn]],
         all_encoding_tokens_list: List[list[int]],
-        train=True,
+        sample=False,
+        sample_size=2250,
     ):
         (
             tensors_during,
@@ -68,6 +69,20 @@ class TransformerModel(nn.Module):
         ):
             if len(tensors[0]) == 0:
                 continue
+
+            if sample and len(tensors[0]) > sample_size:
+                idx = torch.randperm(len(tensors[0]))[:sample_size]
+
+                tensors = (
+                    tensors[0][idx],
+                    (
+                        tensors[1][0][idx],
+                        tensors[1][1][idx],
+                        tensors[1][2][idx],
+                    ),
+                    tensors[2][idx],
+                    tensors[3][idx],
+                )
 
             (
                 encoding_tokens_batch,

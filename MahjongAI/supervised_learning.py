@@ -9,9 +9,10 @@ from typing import Tuple
 sys.path.append("..")
 
 from MahjongAI.agents.transformer import TransformerModel
+from MahjongAI.agents.transformer_conv import TransformerConvModel
 from MahjongAI.utils.dataloader import DataLoader
 
-eval_interval = 5
+eval_interval = 1
 learning_rate = 1e-2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -21,19 +22,22 @@ with open(log_file, "w") as f:
     f.write("Training log started\n")
 
 
-def find_latest_checkpoint(checkpoint_dir: str) -> Tuple[int, str]:
+def find_latest_checkpoint(model_name: str, checkpoint_dir: str) -> Tuple[int, str]:
     """
     Finds the latest checkpoint in the given directory.
     Returns a tuple of (latest_iter, checkpoint_path).
     If no checkpoint is found, returns (0, None).
     """
-    pattern = os.path.join(checkpoint_dir, "model_checkpoint_iter_*.pt")
+    pattern = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_iter_*.pt")
     checkpoint_files = glob.glob(pattern)
     max_iter = -1
     latest_checkpoint = None
 
+    # Updated regex to include model_name
+    regex = rf"model_{re.escape(model_name)}_checkpoint_iter_(\d+)\.pt"
+
     for file in checkpoint_files:
-        match = re.search(r"model_checkpoint_iter_(\d+)\.pt", file)
+        match = re.search(regex, file)
         if match:
             iter_num = int(match.group(1))
             if iter_num > max_iter:
@@ -54,6 +58,8 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
     # Initialize model
     if model_name == "transformer":
         model = TransformerModel().to(device)
+    elif model_name == "transformer_conv":
+        model = TransformerConvModel().to(device)
     else:
         raise NotImplementedError(f"Model {model_name} not implemented.")
 
@@ -61,7 +67,7 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
     # Find latest checkpoint
-    latest_iter, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
+    latest_iter, latest_checkpoint = find_latest_checkpoint(model_name, checkpoint_dir)
 
     if latest_checkpoint:
         # Load the model state
@@ -75,23 +81,28 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
         start_iter = 0
 
     train_dataloaders = [
-        DataLoader(f"data/processed/{yr}/", 10) for yr in range(2012, 2020)
+        DataLoader(f"data/processed/{yr}/", 5, log_message) for yr in range(2012, 2020)
     ]
-    val_dataloader = DataLoader("data/processed/2021/")  # Validation DataLoader
+    val_dataloader = DataLoader("data/processed/2021/", 3)  # Validation DataLoader
 
     for iter in range(start_iter, start_iter + max_iters):
         log_message(f"iter {iter}")
 
-        for train_dataloader in train_dataloaders:
-            for _, (all_halfturns_list, all_encoding_tokens_list) in enumerate(
-                train_dataloader
+        # for train_dataloader in train_dataloaders:
+        train_dataloader = train_dataloaders[iter % len(train_dataloaders)]
+        log_message(f"iter {iter} | Loading {repr(train_dataloader)}")
+
+        for _, (all_halfturns_list, all_encoding_tokens_list) in enumerate(
+            train_dataloader
+        ):
+            for logits, loss in model(
+                all_halfturns_list, all_encoding_tokens_list, sample=True
             ):
-                for logits, loss in model(
-                    all_halfturns_list, all_encoding_tokens_list, train=True
-                ):
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        log_message(f"iter {iter} | Processed {repr(train_dataloader)}")
 
         # Evaluate and save model every eval_interval iterations
         val_loss = estimate_loss(val_dataloader, model)
@@ -100,7 +111,7 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
         if (iter + 1) % eval_interval == 0:
             # Save model checkpoint
             model_path = os.path.join(
-                checkpoint_dir, f"model_checkpoint_iter_{iter}.pt"
+                checkpoint_dir, f"model_{model_name}_checkpoint_iter_{iter}.pt"
             )
             torch.save(model.state_dict(), model_path)
             log_message(f"Model saved at {model_path}")
@@ -120,11 +131,11 @@ def estimate_loss(val_dataloader, model):
         total_loss = 0
         num_batches = 0
 
-        for logits, loss in model(all_halfturns, all_encoding_tokens, train=False):
+        for logits, loss in model(all_halfturns, all_encoding_tokens, sample=False):
             total_loss += loss.item()
             num_batches += 1
 
-        if game >= 100:
+        if game >= 20:
             break
 
     val_dataloader.reset()
@@ -137,9 +148,7 @@ def log_message(message: str):
     """Logs a message to the console and to a log file."""
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
     with open(log_file, "a") as f:
-        f.write(
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
-        )
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
 
 
 if __name__ == "__main__":
@@ -150,11 +159,13 @@ if __name__ == "__main__":
         )
 
     model_name = sys.argv[1]
-    assert model_name in ["transformer"]
+    assert model_name in ["transformer", "transformer_conv"]
 
     try:
         max_iters = int(sys.argv[2])
     except ValueError:
         raise ValueError("Please provide the number of iterations as an integer.")
+    
+    log_message(f"Training {model_name} for {max_iters} iterations")
 
     train(model_name, max_iters)

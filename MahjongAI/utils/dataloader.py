@@ -3,20 +3,22 @@ import torch
 
 from MahjongAI.process_xml import process, InvalidGameException
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 class DataLoader:
-    def __init__(self, path: str, batch_size: int = 1):
+    def __init__(self, path: str, batch_size: int = 1, log_func: callable = print):
         self.path = path
         self.file_list = os.listdir(self.path)
         self.current_index = 0
-        self.batch_size = 1
+        self.batch_size = batch_size
+        self.batch_count = 0
+        self.log_func = log_func
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        self.batch_count += 1
+
         if self.current_index >= len(self.file_list):
             raise StopIteration
 
@@ -39,8 +41,13 @@ class DataLoader:
             all_halfturns_list.append(all_halfturns)
             all_encoding_tokens_list.append(all_encoding_tokens)
 
+        self.log_func(f"{self.__repr__()} - Batch {self.batch_count}")
+
         return all_halfturns_list, all_encoding_tokens_list
 
     def reset(self):
         """Resets the dataloader's current index for re-iteration."""
         self.current_index = 0
+
+    def __repr__(self):
+        return f"DataLoader(path={self.path}, batch_size={self.batch_size})"

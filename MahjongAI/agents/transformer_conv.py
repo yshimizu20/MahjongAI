@@ -52,7 +52,8 @@ class TransformerConvModel(nn.Module):
         self,
         all_halfturns_list: List[list[HalfTurn]],
         all_encoding_tokens_list: List[list[int]],
-        train=True,
+        sample=False,
+        sample_size=2250,
     ):
         (
             tensors_during,
@@ -68,6 +69,20 @@ class TransformerConvModel(nn.Module):
         ):
             if len(tensors[0]) == 0:
                 continue
+
+            if sample and len(tensors[0]) > sample_size:
+                idx = torch.randperm(len(tensors[0]))[:sample_size]
+
+                tensors = (
+                    tensors[0][idx],
+                    (
+                        tensors[1][0][idx],
+                        tensors[1][1][idx],
+                        tensors[1][2][idx],
+                    ),
+                    tensors[2][idx],
+                    tensors[3][idx],
+                )
 
             (
                 encoding_tokens_batch,
@@ -374,20 +389,24 @@ class StateNet(nn.Module):
     def __init__(self):
         super(StateNet, self).__init__()
 
-        # --- Preprocessing x1 with Conv1d ---
-        # Conv1d expects input shape: [batch_size, channels, length]
-        # Here, channels=3, length=37
-        self.conv1d_x1_1 = nn.Conv1d(
-            in_channels=3, out_channels=8, kernel_size=3, padding=1
-        )
-        self.conv1d_x1_2 = nn.Conv1d(
-            in_channels=8, out_channels=16, kernel_size=3, padding=1
-        )
+        # --- Preprocessing x1 with Conv2d ---
+        # conv2d gets input of shape (batch_size, 3, 37, 4)
+        self.conv2d_x1_1 = nn.Conv2d(
+            in_channels=3, out_channels=8, kernel_size=(3, 3), padding=(1, 1)
+        )  # Output shape: (batch_size, 8, 37, 4)
+        self.conv2d_x1_2 = nn.Conv2d(
+            in_channels=8, out_channels=8, kernel_size=(3, 3), padding=(1, 1)
+        )  # Output shape: (batch_size, 16, 37, 4)
 
         self.relu = nn.ReLU()
 
-        # Linear layer to process concatenated Conv1d output with raw x1
-        self.fc_x1 = nn.Linear(16 * 37 + 3 * 37, 64)  # 16*37 + 3*37 = 703
+        # Calculate the actual input size for fc_x1
+        conv_x1_output_size = 8 * 37 * 4  # After second Conv2d
+        raw_x1_output_size = 3 * 37 * 4  # Raw x1 flattened
+        fc_x1_input_size = conv_x1_output_size + raw_x1_output_size
+
+        # Linear layer to process concatenated Conv2d output with raw x1
+        self.fc_x1 = nn.Linear(fc_x1_input_size, 64)
         self.relu_fc_x1 = nn.ReLU()
 
         # Main network to combine with x2 and x3
@@ -398,27 +417,28 @@ class StateNet(nn.Module):
     def forward(self, state_obj):
         x1, x2, x3 = state_obj  # Unpack the tuple
 
-        # --- Conv1d processing of x1 ---
-        # Initial x1 shape: [batch_size, 3, 37]
-        conv_x1 = self.conv1d_x1_1(x1)  # After first Conv1d: [batch_size, 16, 37]
-        conv_x1 = self.relu(conv_x1)  # First ReLU activation
-        conv_x1 = self.conv1d_x1_2(conv_x1)  # After second Conv1d: [batch_size, 16, 37]
-        conv_x1 = self.relu(conv_x1)  # Second ReLU activation
+        # --- Conv2d processing of x1 ---
+        # Initial x1 shape: [batch_size, 3, 37, 4]
+        conv_x1 = self.conv2d_x1_1(x1)  # Output shape: [batch_size, 8, 37, 4]
+        conv_x1 = self.relu(conv_x1)
+        conv_x1 = self.conv2d_x1_2(conv_x1)  # Output shape: [batch_size, 16, 37, 4]
+        conv_x1 = self.relu(conv_x1)
 
-        # Flatten Conv1d output
-        assert conv_x1.size(0) > 0, "conv_x1 is empty, cannot reshape."
-        conv_x1_flat = conv_x1.view(conv_x1.size(0), -1)  # Shape: [batch_size, 16 * 37]
+        # Flatten Conv2d output
+        conv_x1_flat = conv_x1.view(
+            conv_x1.size(0), -1
+        )  # Shape: [batch_size, 16 * 37 * 4]
 
         # Flatten raw x1
-        raw_x1_flat = x1.view(x1.size(0), -1)  # Shape: [batch_size, 3 * 37]
+        raw_x1_flat = x1.view(x1.size(0), -1)  # Shape: [batch_size, 3 * 37 * 4]
 
-        # Concatenate Conv1d features with raw x1 features
+        # Concatenate Conv2d features with raw x1 features
         x1_combined = torch.cat(
             [conv_x1_flat, raw_x1_flat], dim=1
-        )  # Shape: [batch_size, 703]
+        )  # Shape: [batch_size, conv_x1_output_size + raw_x1_output_size]
 
         # Pass through Linear layer
-        x1_processed = self.fc_x1(x1_combined)  # Shape: [batch_size, 128]
+        x1_processed = self.fc_x1(x1_combined)  # Shape: [batch_size, 64]
         x1_processed = self.relu_fc_x1(x1_processed)  # Apply ReLU activation
 
         # Flatten x2
@@ -429,7 +449,7 @@ class StateNet(nn.Module):
         # Concatenate all processed features
         combined = torch.cat(
             [x1_processed, x2_flat, x3], dim=1
-        )  # Shape: [batch_size, 160]
+        )  # Shape: [batch_size, 96]
 
         # Pass through main Linear layer
         x = self.fc_main_1(combined)  # Shape: [batch_size, EMBD_SIZE]
@@ -641,19 +661,6 @@ class TransformerTensorProcessor:
                 - filter_tensors: Tensor of shape (sum_N, 37)
                 - y: Tensor of target labels
         """
-        # # Return empty tensors if discard_turns is empty
-        # if not discard_turns:
-        #     return (
-        #         torch.empty((0, MAX_SEQUENCE_LENGTH), device=device),
-        #         (
-        #             torch.empty((0, 3, 37), device=device),
-        #             torch.empty((0, 7, 4), device=device),
-        #             torch.empty((0, 4), device=device),
-        #         ),
-        #         torch.empty((0, 37), device=device),
-        #         torch.empty((0,), dtype=torch.long, device=device),
-        #     )
-
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
@@ -706,7 +713,7 @@ class TransformerTensorProcessor:
             (
                 torch.cat(x1_list, dim=0)
                 if x1_list
-                else torch.empty(0, 3, 37, device=device)
+                else torch.empty(0, 3, 37, 4, device=device)
             ),
             (
                 torch.cat(x2_list, dim=0)
@@ -758,19 +765,6 @@ class TransformerTensorProcessor:
                 - filter_tensors: Tensor of shape (sum_N, 71)
                 - y: Tensor of target labels
         """
-        # # Return empty tensors if during_turns is empty
-        # if not during_turns:
-        #     return (
-        #         torch.empty((0, MAX_SEQUENCE_LENGTH), device=device),
-        #         (
-        #             torch.empty((0, 3, 37), device=device),
-        #             torch.empty((0, 7, 4), device=device),
-        #             torch.empty((0, 4), device=device),
-        #         ),
-        #         torch.empty((0, 71), device=device),
-        #         torch.empty((0,), dtype=torch.long, device=device),
-        #     )
-
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
@@ -852,7 +846,7 @@ class TransformerTensorProcessor:
             (
                 torch.cat(x1_list, dim=0)
                 if x1_list
-                else torch.empty(0, 3, 37, device=device)
+                else torch.empty(0, 3, 37, 4, device=device)
             ),
             (
                 torch.cat(x2_list, dim=0)
@@ -995,7 +989,7 @@ class TransformerTensorProcessor:
             (
                 torch.cat(x1_list, dim=0)
                 if x1_list
-                else torch.empty(0, 3, 37, device=device)
+                else torch.empty(0, 3, 37, 4, device=device)
             ),
             (
                 torch.cat(x2_list, dim=0)
@@ -1041,31 +1035,34 @@ class TransformerTensorProcessor:
 
         Returns:
             Tuple containing:
-                - x1: Tensor of shape (1, 3, 37)
+                - x1: Tensor of shape (1, 3, 37, 4)
                 - x2: Tensor of shape (1, 7, 4)
                 - x3: Tensor of shape (1, 4)
         """
         # x1: Contains hand_tensor, remaining_tiles_pov, sutehai_tensor
+        # Transform hand_tensor
         hand_tensor = torch.tensor(
-            stateObj.hand_tensor, dtype=torch.float32, device=device
-        ).unsqueeze(
-            0
-        )  # Shape: (1, 37)
+            stateObj.hand_tensor, dtype=torch.long, device=device
+        )
+        range_tensor = torch.arange(4, device=device)
+        hand_tensor = (range_tensor < hand_tensor.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
+
+        # Transform remaining_tiles_pov
         remaining_tiles_pov = torch.tensor(
-            stateObj.remaining_tiles_pov, dtype=torch.float32, device=device
-        ).unsqueeze(
-            0
-        )  # Shape: (1, 37)
+            stateObj.remaining_tiles_pov, dtype=torch.long, device=device
+        )
+        remaining_tiles_pov = (range_tensor < remaining_tiles_pov.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
+
+        # Transform sutehai_tensor
         sutehai_tensor = torch.tensor(
-            stateObj.sutehai_tensor, dtype=torch.float32, device=device
-        ).unsqueeze(
-            0
-        )  # Shape: (1, 37)
+            stateObj.sutehai_tensor, dtype=torch.long, device=device
+        )
+        sutehai_tensor = (range_tensor < sutehai_tensor.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
 
         # **Ensure 2D Tensor by Stacking Along New Dimension**
         x1 = torch.stack(
             [hand_tensor, remaining_tiles_pov, sutehai_tensor], dim=1
-        )  # Shape: (1, 3, 37)
+        )  # Shape: (1, 3, 37, 4)
 
         # x2: Contains scores, parent_tensor, parent_rounds_remaining, double_reaches, reaches, ippatsu, is_menzen
         scores = torch.tensor(
@@ -1135,5 +1132,5 @@ class TransformerTensorProcessor:
 
 
 if __name__ == "__main__":
-    model = TransformerModel().to(device)
+    model = TransformerConvModel().to(device)
     print(f"{sum(p.numel() for p in model.parameters()) / 1e6} M params")
