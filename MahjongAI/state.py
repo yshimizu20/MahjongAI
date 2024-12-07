@@ -11,7 +11,7 @@ class StateObject:
         hand_tensor: np.ndarray,
         remaining_tiles: np.ndarray,
         remaining_tiles_pov: np.ndarray,
-        sutehai_tensor: np.ndarray,
+        sutehai_tensors: np.ndarray,
         is_menzen: List[int],
         double_reaches: List[int],
         reaches: List[int],
@@ -25,12 +25,13 @@ class StateObject:
         rounds_remaining: int,
         parent_rounds_remaining: List[int],
         remaining_tsumo: int,
+        player: int
     ):
         self.remaining_turns = remaining_turns
         self.hand_tensor = hand_tensor
         self.remaining_tiles = remaining_tiles
         self.remaining_tiles_pov = remaining_tiles_pov
-        self.sutehai_tensor = sutehai_tensor
+        self.sutehai_tensors = sutehai_tensors
         self.is_menzen = is_menzen
         self.double_reaches = double_reaches
         self.reaches = reaches
@@ -44,3 +45,4 @@ class StateObject:
         self.rounds_remaining = rounds_remaining
         self.parent_rounds_remaining = parent_rounds_remaining
         self.remaining_tsumo = remaining_tsumo
+        self.player = player

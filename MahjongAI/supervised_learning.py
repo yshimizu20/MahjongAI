@@ -10,6 +10,9 @@ sys.path.append("..")
 
 from MahjongAI.agents.transformer import TransformerModel
 from MahjongAI.agents.transformer_conv import TransformerConvModel
+from MahjongAI.agents.transformer_conv_large import TransformerConvLargeModel
+from MahjongAI.agents.transformer_conv_ordered import TransformerConvOrderedModel
+from MahjongAI.agents.transformer_conv_ordered_large import TransformerConvOrderedLargeModel
 from MahjongAI.utils.dataloader import DataLoader
 
 eval_interval = 1
@@ -58,8 +61,46 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
     # Initialize model
     if model_name == "transformer":
         model = TransformerModel().to(device)
+        train_dataloaders = [
+            DataLoader(f"data/processed/{yr}/", 5, log_message)
+            for yr in range(2012, 2020)
+        ]
     elif model_name == "transformer_conv":
         model = TransformerConvModel().to(device)
+        train_dataloaders = [
+            DataLoader(f"data/processed/{yr}/", 5, log_message)
+            for yr in range(2012, 2020)
+        ]
+    elif model_name == "transformer_conv_large":
+        model = TransformerConvLargeModel(2).to(device)
+        train_dataloaders = [
+            DataLoader(f"data/processed/{yr}/", 2, log_message)
+            for yr in range(2012, 2020)
+        ]
+    elif model_name == "transformer_conv_large_3":
+        model = TransformerConvLargeModel(3).to(device)
+        train_dataloaders = [
+            DataLoader(f"data/processed/{yr}/", 2, log_message)
+            for yr in range(2012, 2020)
+        ]
+    elif model_name == "transformer_conv_ordered":
+        model = TransformerConvOrderedModel().to(device)
+        train_dataloaders = [
+            DataLoader(f"data/processed/{yr}/", 4, log_message)
+            for yr in range(2012, 2020)
+        ]
+    elif model_name == "transformer_conv_ordered_large":
+        model = TransformerConvOrderedLargeModel(2).to(device)
+        train_dataloaders = [
+            DataLoader(f"data/processed/{yr}/", 2, log_message)
+            for yr in range(2012, 2020)
+        ]
+    elif model_name == "transformer_conv_ordered_large_3":
+        model = TransformerConvOrderedLargeModel(3).to(device)
+        train_dataloaders = [
+            DataLoader(f"data/processed/{yr}/", 2, log_message)
+            for yr in range(2012, 2020)
+        ]
     else:
         raise NotImplementedError(f"Model {model_name} not implemented.")
 
@@ -80,10 +121,10 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
         log_message("No checkpoint found. Starting training from iter 0.")
         start_iter = 0
 
-    train_dataloaders = [
-        DataLoader(f"data/processed/{yr}/", 5, log_message) for yr in range(2012, 2020)
-    ]
-    val_dataloader = DataLoader("data/processed/2021/", 3)  # Validation DataLoader
+    # train_dataloaders = [
+    #     DataLoader(f"data/processed/{yr}/", 5, log_message) for yr in range(2012, 2020)
+    # ]
+    val_dataloader = DataLoader("data/processed/2021/", 2)  # Validation DataLoader
 
     for iter in range(start_iter, start_iter + max_iters):
         log_message(f"iter {iter}")
@@ -159,13 +200,21 @@ if __name__ == "__main__":
         )
 
     model_name = sys.argv[1]
-    assert model_name in ["transformer", "transformer_conv"]
+    assert model_name in [
+        "transformer",
+        "transformer_conv",
+        "transformer_conv_large",
+        "transformer_conv_large_3",
+        "transformer_conv_ordered",
+        "transformer_conv_ordered_large",
+        "transformer_conv_ordered_large_3",
+    ], f"Model {model_name} not implemented."
 
     try:
         max_iters = int(sys.argv[2])
     except ValueError:
         raise ValueError("Please provide the number of iterations as an integer.")
-    
+
     log_message(f"Training {model_name} for {max_iters} iterations")
 
     train(model_name, max_iters)

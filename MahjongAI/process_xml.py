@@ -69,7 +69,7 @@ def process(file_path: str, verbose: bool = False):
         remaining_tiles_pov = [REMAINING_TILES.copy() for _ in range(4)]
         remaining_tsumo = REMAINING_TSUMO
         hand_tensors = [np.zeros(37, dtype=np.float32) for _ in range(4)]  # 0-36
-        sutehai_tensor = np.zeros((4, 37), dtype=np.float32)  # to check furiten
+        sutehai_tensors = np.zeros((4, 37), dtype=np.float32)  # to check furiten
 
         for hi, ht, pov in zip(hand_indices, hand_tensors, remaining_tiles_pov):
             for tile in hi:
@@ -225,7 +225,7 @@ def process(file_path: str, verbose: bool = False):
                     hand_tensor=hand_tensors[player],
                     remaining_tiles=remaining_tiles,
                     remaining_tiles_pov=remaining_tiles_pov[player][:],
-                    sutehai_tensor=sutehai_tensor[player][:],
+                    sutehai_tensors=np.copy(sutehai_tensors),
                     is_menzen=is_menzen,
                     double_reaches=double_reaches,
                     reaches=reaches,  # share same reach list
@@ -239,6 +239,7 @@ def process(file_path: str, verbose: bool = False):
                     rounds_remaining=rounds_remaining,
                     parent_rounds_remaining=parent_rounds_remaining,
                     remaining_tsumo=remaining_tsumo,
+                    player=player,
                 )
 
                 if naki.from_who() != 0:
@@ -263,7 +264,7 @@ def process(file_path: str, verbose: bool = False):
                         player=player,
                         hand_tensors_full=hand_tensors_full,
                         naki_list=melds,
-                        sutehai_tensor=sutehai_tensor,
+                        sutehai_tensor=sutehai_tensors,
                         discarded_tile=exposed[0],
                         doras=doras,
                         reaches=reaches,
@@ -362,7 +363,6 @@ def process(file_path: str, verbose: bool = False):
                         NakiDecision(player, Naki.from_ankan_info(i), executed=False)
                     )
 
-                # TODO: make it cleaner
                 # check if kakan is possible
                 for meld in melds[player]:
                     if meld.is_pon():
@@ -389,7 +389,7 @@ def process(file_path: str, verbose: bool = False):
                     hand_tensor=hand_tensors[player],
                     remaining_tiles=remaining_tiles,
                     remaining_tiles_pov=remaining_tiles_pov[player][:],
-                    sutehai_tensor=sutehai_tensor[player][:],
+                    sutehai_tensors=np.copy(sutehai_tensors),
                     is_menzen=is_menzen,
                     double_reaches=double_reaches,
                     reaches=reaches,  # share same reach list
@@ -403,6 +403,7 @@ def process(file_path: str, verbose: bool = False):
                     rounds_remaining=rounds_remaining,
                     parent_rounds_remaining=parent_rounds_remaining,
                     remaining_tsumo=remaining_tsumo,
+                    player=player,
                 )
 
                 halfturn = DuringTurn(
@@ -445,7 +446,7 @@ def process(file_path: str, verbose: bool = False):
                 assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[
                     player
                 ].sum()
-                sutehai_tensor[player, tile_idx] = 1.0
+                sutehai_tensors[player, tile_idx] = 1.0
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1.0
@@ -458,7 +459,7 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     hand_tensors_full=hand_tensors_full,
                     naki_list=melds,
-                    sutehai_tensor=sutehai_tensor,
+                    sutehai_tensor=sutehai_tensors,
                     discarded_tile=tile,
                     doras=doras,
                     reaches=reaches,

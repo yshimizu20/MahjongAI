@@ -25,17 +25,17 @@ POST_TURN_ACTION_DIM = 154  # pass, agari (ron), naki
 MAX_ACTION_LEN = 150
 EMBD_SIZE = 64
 N_HEADS = 8
-N_LAYERS = 2
 DROPOUT_RATIO = 0.2
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class TransformerConvLargeModel(nn.Module):
-    def __init__(self):
+    def __init__(self, n_layers: int):
         super().__init__()
-        self.encoder = Encoder()
-        self.decoder = Decoder()
+        self.n_layers = n_layers
+        self.encoder = Encoder(n_layers)
+        self.decoder = Decoder(n_layers)
         self.tensor_processor = TransformerTensorProcessor()
 
         self.apply(self._init_weights)
@@ -105,7 +105,7 @@ class TransformerConvLargeModel(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, n_layers=N_LAYERS):
+    def __init__(self, n_layers):
         super().__init__()
 
         self.empty_embedding = torch.zeros(
@@ -270,7 +270,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, n_layers=N_LAYERS):
+    def __init__(self, n_layers):
         super().__init__()
         self.state_net = StateNet()
         self.blocks = nn.Sequential(

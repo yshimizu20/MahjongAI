@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 
 from MahjongAI.process_xml import process, InvalidGameException
@@ -36,6 +37,12 @@ class DataLoader:
             except InvalidGameException as e:
                 # print(f"Invalid game detected: {e.msg}")
                 continue  # Skip to the next file
+            except AssertionError as e:
+                print(f"Assertion error: {e} happened in {filename}")
+                sys.exit(1) # TODO: remove this line
+            except Exception as e:
+                print(f"Unexpected error: {e} happened in {filename}")
+                continue
 
             # return all_halfturns, all_encoding_tokens
             all_halfturns_list.append(all_halfturns)
