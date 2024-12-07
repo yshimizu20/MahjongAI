@@ -1072,7 +1072,7 @@ class TransformerTensorProcessor:
             0
         )  # Shape: (1, 37)
         sutehai_tensor = torch.tensor(
-            stateObj.sutehai_tensor, dtype=torch.float32, device=device
+            stateObj.sutehai_tensors[stateObj.player], dtype=torch.float32, device=device
         ).unsqueeze(
             0
         )  # Shape: (1, 37)

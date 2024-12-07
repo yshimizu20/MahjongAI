@@ -31,7 +31,7 @@ DROPOUT_RATIO = 0.2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class TransformerConvModel(nn.Module):
+class TransformerConvOrderedModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -82,6 +82,7 @@ class TransformerConvModel(nn.Module):
                     ),
                     tensors[2][idx],
                     tensors[3][idx],
+                    tensors[4][idx],
                 )
 
             (
@@ -89,6 +90,7 @@ class TransformerConvModel(nn.Module):
                 state_obj_tensor_batch,
                 action_mask_batch,
                 y_tensor,
+                player_batch,
             ) = tensors
             encoding_tokens_batch = encoding_tokens_batch.to(device)
             state_obj_tensor_batch = tuple(
@@ -97,7 +99,7 @@ class TransformerConvModel(nn.Module):
             action_mask_batch = action_mask_batch.to(device)
             y_tensor = y_tensor.to(device)
 
-            enc_out = self.encoder(encoding_tokens_batch)  # Shape: (B, 150, EMBD_SIZE)
+            enc_out = self.encoder(encoding_tokens_batch, player_batch)  # Shape: (B, 150, EMBD_SIZE)
             logits, loss = self.decoder(
                 enc_out, state_obj_tensor_batch, action_mask_batch, y_tensor, head
             )
@@ -174,7 +176,7 @@ class Encoder(nn.Module):
 
         return encoding.requires_grad_(False)  # Ensure non-trainable
 
-    def forward(self, encoding_tokens_batch: torch.tensor):
+    def forward(self, encoding_tokens_batch: torch.tensor, player_batch: torch.tensor):
         """
         Args:
             encoding_tokens_batch: (B, 150) tensor of encoding tokens
@@ -212,6 +214,9 @@ class Encoder(nn.Module):
         tile_emb = tile_emb * mask.unsqueeze(-1).float()
 
         # Retrieve player encodings if event_type is DISCARD, DURING, or POST
+        # CHANGE: player index should be from the perspective of the player. player 0: action player, player 1: right, player 2: across, player 3: left
+        player_batch = player_batch.unsqueeze(1)
+        player_idx = (player_idx - player_batch) % 4
         player_idx = player_idx.to(self.player_coding_table.device)
         player_emb = self.player_coding_table[player_idx]  # Shape: (B, T, EMBD_SIZE)
         mask = (
@@ -308,7 +313,7 @@ class Decoder(nn.Module):
         """
         Args:
             enc_out: (B, 150, EMBD_SIZE) tensor
-            state_obj_tensor_batch: Tuple of (B, 3, 37), (B, 7, 4), (B, 4) tensors
+            state_obj_tensor_batch: Tuple of (B, 6, 37), (B, 7, 4), (B, 4) tensors
             action_mask_batch: (B, action_dim) tensor
             y_tensor: (B,) tensor
             head: str indicating the head to use
@@ -390,19 +395,19 @@ class StateNet(nn.Module):
         super(StateNet, self).__init__()
 
         # --- Preprocessing x1 with Conv2d ---
-        # conv2d gets input of shape (batch_size, 3, 37, 4)
+        # conv2d gets input of shape (batch_size, 6, 37, 4)
         self.conv2d_x1_1 = nn.Conv2d(
-            in_channels=3, out_channels=8, kernel_size=(3, 3), padding=(1, 1)
+            in_channels=6, out_channels=8, kernel_size=(3, 3), padding=(1, 1)
         )  # Output shape: (batch_size, 8, 37, 4)
         self.conv2d_x1_2 = nn.Conv2d(
             in_channels=8, out_channels=8, kernel_size=(3, 3), padding=(1, 1)
-        )  # Output shape: (batch_size, 16, 37, 4)
+        )  # Output shape: (batch_size, 8, 37, 4)
 
         self.relu = nn.ReLU()
 
         # Calculate the actual input size for fc_x1
         conv_x1_output_size = 8 * 37 * 4  # After second Conv2d
-        raw_x1_output_size = 3 * 37 * 4  # Raw x1 flattened
+        raw_x1_output_size = 6 * 37 * 4  # Raw x1 flattened
         fc_x1_input_size = conv_x1_output_size + raw_x1_output_size
 
         # Linear layer to process concatenated Conv2d output with raw x1
@@ -536,7 +541,7 @@ class TransformerTensorProcessor:
         all_halfturns_list: List[list[HalfTurn]],
         all_encoding_tokens_list: List[list[int]],
     ) -> Tuple[
-        Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]
+        Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor],
     ]:
         # Prepare batched tensors for all types of turns
         tensors_during_batch = []
@@ -563,7 +568,7 @@ class TransformerTensorProcessor:
         self, tensors_during_batch, tensors_discard_batch, tensors_post_batch
     ):
         # --------------------- During Turns ---------------------
-        during_encodings, during_state_obj, during_filter, during_y = zip(
+        during_encodings, during_state_obj, during_filter, during_y, during_player = zip(
             *tensors_during_batch
         )
         during_x1, during_x2, during_x3 = zip(*during_state_obj)
@@ -575,9 +580,10 @@ class TransformerTensorProcessor:
         )
         during_filter = torch.cat(during_filter, dim=0)
         during_y = torch.cat(during_y, dim=0)
+        during_player = torch.cat(during_player, dim=0)
 
         # --------------------- Discard Turns ---------------------
-        discard_encodings, discard_state_obj, discard_filter, discard_y = zip(
+        discard_encodings, discard_state_obj, discard_filter, discard_y, discard_player = zip(
             *tensors_discard_batch
         )
         discard_x1, discard_x2, discard_x3 = zip(*discard_state_obj)
@@ -589,9 +595,10 @@ class TransformerTensorProcessor:
         )
         discard_filter = torch.cat(discard_filter, dim=0)
         discard_y = torch.cat(discard_y, dim=0)
+        discard_player = torch.cat(discard_player, dim=0)
 
         # --------------------- Post Turns ---------------------
-        post_encodings, post_state_obj, post_filter, post_y = zip(*tensors_post_batch)
+        post_encodings, post_state_obj, post_filter, post_y, post_player = zip(*tensors_post_batch)
         post_x1, post_x2, post_x3 = zip(*post_state_obj)
         post_encodings = torch.cat(post_encodings, dim=0)
         post_state_obj = (
@@ -601,17 +608,18 @@ class TransformerTensorProcessor:
         )
         post_filter = torch.cat(post_filter, dim=0)
         post_y = torch.cat(post_y, dim=0)
+        post_player = torch.cat(post_player, dim=0)
 
         return (
-            (during_encodings, during_state_obj, during_filter, during_y),
-            (discard_encodings, discard_state_obj, discard_filter, discard_y),
-            (post_encodings, post_state_obj, post_filter, post_y),
+            (during_encodings, during_state_obj, during_filter, during_y, during_player),
+            (discard_encodings, discard_state_obj, discard_filter, discard_y, discard_player),
+            (post_encodings, post_state_obj, post_filter, post_y, post_player),
         )
 
     def build_tensors(self, turns: List[HalfTurn], encoding_tokens: List[int]) -> Tuple[
-        Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor],
     ]:
         """
         Processes the list of turns and builds tensors for each turn type.
@@ -657,14 +665,16 @@ class TransformerTensorProcessor:
         Returns:
             Tuple containing:
                 - embeddings: Tensor of shape (sum_N, 150)
-                - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
+                - state_obj_tensors: Tuple of tensors (sum_N, 6, 37, 4), (sum_N, 7, 4), (sum_N, 4)
                 - filter_tensors: Tensor of shape (sum_N, 37)
                 - y: Tensor of target labels
+                - player_tensor: Tensor of player indices
         """
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
         y = []
+        player_tensor = []
 
         for turn in discard_turns:
             encoding_idx = turn.encoding_idx
@@ -696,6 +706,7 @@ class TransformerTensorProcessor:
             state_obj_tensors.append((x1, x2, x3))
             filter_tensors.append(filter_tensor)
             y.append(discarded_tile_idx)
+            player_tensor.append(turn.player)
 
         # Concatenate lists into single tensors
         encoding_tokens_batch = (
@@ -713,7 +724,7 @@ class TransformerTensorProcessor:
             (
                 torch.cat(x1_list, dim=0)
                 if x1_list
-                else torch.empty(0, 3, 37, 4, device=device)
+                else torch.empty(0, 6, 37, 4, device=device)
             ),
             (
                 torch.cat(x2_list, dim=0)
@@ -741,16 +752,19 @@ class TransformerTensorProcessor:
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
+        player_tensor = torch.tensor(player_tensor, dtype=torch.long, device=device)
+
         return (
             encoding_tokens_batch,
             state_obj_tensor_batch,
             action_mask_batch,
             y_tensor,
+            player_tensor,
         )
 
     def _build_during_tensor(
         self, during_turns: List[DuringTurn], encoding_token_tensor: torch.Tensor
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Builds tensors for during turns.
 
@@ -761,14 +775,16 @@ class TransformerTensorProcessor:
         Returns:
             Tuple containing:
                 - embeddings: Tensor of shape (sum_N, 150)
-                - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
+                - state_obj_tensors: Tuple of tensors (sum_N, 6, 37, 4), (sum_N, 7, 4), (sum_N, 4)
                 - filter_tensors: Tensor of shape (sum_N, 71)
                 - y: Tensor of target labels
+                - player_tensor: Tensor of player indices
         """
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
         y = []
+        player_tensor = []
 
         for turn in during_turns:
             n_decisions = sum(map(len, turn.decisions))
@@ -830,6 +846,7 @@ class TransformerTensorProcessor:
 
             y.append(decision_idx)
             filter_tensors.append(filter_tensor)  # Shape: (71,)
+            player_tensor.append(turn.player)
 
         encoding_tokens_batch = (
             torch.cat(X_embeddings, dim=0)
@@ -846,7 +863,7 @@ class TransformerTensorProcessor:
             (
                 torch.cat(x1_list, dim=0)
                 if x1_list
-                else torch.empty(0, 3, 37, 4, device=device)
+                else torch.empty(0, 6, 37, 4, device=device)
             ),
             (
                 torch.cat(x2_list, dim=0)
@@ -874,16 +891,19 @@ class TransformerTensorProcessor:
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
+        player_tensor = torch.tensor(player_tensor, dtype=torch.long, device=device)
+
         return (
             encoding_tokens_batch,
             state_obj_tensor_batch,
             action_mask_batch,
             y_tensor,
+            player_tensor,
         )
 
     def _build_post_tensor(
         self, post_turns: List[PostTurn], encoding_token_tensor: torch.Tensor
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Builds tensors for post turns.
 
@@ -894,14 +914,17 @@ class TransformerTensorProcessor:
         Returns:
             Tuple containing:
                 - embeddings: Tensor of shape (sum_N, 150)
-                - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
+                - state_obj_tensors: Tuple of tensors (sum_N, 6, 37, 4), (sum_N, 7, 4), (sum_N, 4)
                 - filter_tensors: Tensor of shape (sum_N, 154)
                 - y: Tensor of target labels
+                - player_tensor: Tensor of player indices
         """
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
         y = []
+        player_tensor = []
+
         players = [0, 1, 2, 3]
 
         for turn in post_turns:
@@ -970,6 +993,7 @@ class TransformerTensorProcessor:
                 state_obj_tensors.append((x1, x2, x3))
                 filter_tensors.append(decision_mask)
                 y.append(result)
+                player_tensor.append(player_idx)
 
                 if contains_executed:
                     break
@@ -989,7 +1013,7 @@ class TransformerTensorProcessor:
             (
                 torch.cat(x1_list, dim=0)
                 if x1_list
-                else torch.empty(0, 3, 37, 4, device=device)
+                else torch.empty(0, 6, 37, 4, device=device)
             ),
             (
                 torch.cat(x2_list, dim=0)
@@ -1017,11 +1041,14 @@ class TransformerTensorProcessor:
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
+        player_tensor = torch.tensor(player_tensor, dtype=torch.long, device=device)
+
         return (
             encoding_tokens_batch,
             state_obj_tensor_batch,
             action_mask_batch,
             y_tensor,
+            player_tensor,
         )
 
     def _convert_state_obj_to_tensors(
@@ -1040,29 +1067,35 @@ class TransformerTensorProcessor:
                 - x3: Tensor of shape (1, 4)
         """
         # x1: Contains hand_tensor, remaining_tiles_pov, sutehai_tensor
+        range_tensor = torch.arange(4, device=device)
+
         # Transform hand_tensor
         hand_tensor = torch.tensor(
             stateObj.hand_tensor, dtype=torch.long, device=device
         )
-        range_tensor = torch.arange(4, device=device)
-        hand_tensor = (range_tensor < hand_tensor.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
+        hand_tensor = (range_tensor < hand_tensor.unsqueeze(1)).float().unsqueeze(0)  # Shape: (1, 37, 4)
 
         # Transform remaining_tiles_pov
         remaining_tiles_pov = torch.tensor(
             stateObj.remaining_tiles_pov, dtype=torch.long, device=device
         )
-        remaining_tiles_pov = (range_tensor < remaining_tiles_pov.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
+        remaining_tiles_pov = (range_tensor < remaining_tiles_pov.unsqueeze(1)).float().unsqueeze(0)  # Shape: (1, 37, 4)
 
-        # Transform sutehai_tensor
-        sutehai_tensor = torch.tensor(
-            stateObj.sutehai_tensors[stateObj.player], dtype=torch.long, device=device
+        range_tensor = torch.arange(4, device=device).view(1, 1, 4)
+
+        # Reorder and transform sutehai_tensors
+        sutehai_tensors = torch.tensor(
+            np.roll(stateObj.sutehai_tensors, shift=-stateObj.player, axis=0),
+            dtype=torch.long,
+            device=device
         )
-        sutehai_tensor = (range_tensor < sutehai_tensor.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
+        sutehai_tensors = (range_tensor < sutehai_tensors.unsqueeze(2)).float()  # Shape: (4, 37, 4)
 
         # **Ensure 2D Tensor by Stacking Along New Dimension**
         x1 = torch.stack(
-            [hand_tensor, remaining_tiles_pov, sutehai_tensor], dim=1
-        )  # Shape: (1, 3, 37, 4)
+            [hand_tensor, remaining_tiles_pov] + [sutehai_tensors[i].unsqueeze(0) for i in range(4)],
+            dim=1
+        )  # Shape: (1, 6, 37, 4)
 
         # x2: Contains scores, parent_tensor, parent_rounds_remaining, double_reaches, reaches, ippatsu, is_menzen
         scores = torch.tensor(

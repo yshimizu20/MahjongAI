@@ -25,13 +25,13 @@ POST_TURN_ACTION_DIM = 154  # pass, agari (ron), naki
 MAX_ACTION_LEN = 150
 EMBD_SIZE = 64
 N_HEADS = 8
-N_LAYERS = 1
+N_LAYERS = 2
 DROPOUT_RATIO = 0.2
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class TransformerConvModel(nn.Module):
+class TransformerConvLargeModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
