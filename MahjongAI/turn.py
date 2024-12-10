@@ -34,6 +34,11 @@ class DuringTurn(HalfTurn):
         super().__init__(player, HalfTurn.DURING, stateObj, encoding_idx)
         self.decisions = decisions
 
+    def __repr__(self):
+        return "DuringTurn Object | Player: {} | Decisions: {}".format(
+            self.player, self.decisions
+        )
+
 
 class DiscardTurn(HalfTurn):
     def __init__(
@@ -46,6 +51,11 @@ class DiscardTurn(HalfTurn):
         super().__init__(player, HalfTurn.DISCARD, stateObj, encoding_idx)
         self.discarded_tile = discarded_tile
 
+    def __repr__(self):
+        return "DiscardTurn Object | Player: {} | Discarded Tile: {}".format(
+            self.player, self.discarded_tile
+        )
+
 
 class PostTurn(HalfTurn):
     def __init__(
@@ -57,6 +67,11 @@ class PostTurn(HalfTurn):
     ):
         super().__init__(player, HalfTurn.POST, stateObj, encoding_idx)
         self.decisions = decisions
+
+    def __repr__(self):
+        return "PostTurn Object | Player: {} | Decisions: {}".format(
+            self.player, self.decisions
+        )
 
 
 # class EmptyTurn(HalfTurn):

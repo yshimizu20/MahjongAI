@@ -1045,19 +1045,25 @@ class TransformerTensorProcessor:
             stateObj.hand_tensor, dtype=torch.long, device=device
         )
         range_tensor = torch.arange(4, device=device)
-        hand_tensor = (range_tensor < hand_tensor.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
+        hand_tensor = (
+            (range_tensor < hand_tensor.unsqueeze(1)).float().unsqueeze(0)
+        )  # Shape: (1, 37, 4)
 
         # Transform remaining_tiles_pov
         remaining_tiles_pov = torch.tensor(
             stateObj.remaining_tiles_pov, dtype=torch.long, device=device
         )
-        remaining_tiles_pov = (range_tensor < remaining_tiles_pov.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
+        remaining_tiles_pov = (
+            (range_tensor < remaining_tiles_pov.unsqueeze(1)).float().unsqueeze(0)
+        )  # Shape: (1, 37, 4)
 
         # Transform sutehai_tensor
         sutehai_tensor = torch.tensor(
             stateObj.sutehai_tensors[stateObj.player], dtype=torch.long, device=device
         )
-        sutehai_tensor = (range_tensor < sutehai_tensor.unsqueeze(1)).float().unsqueeze(0) # Shape: (1, 37, 4)
+        sutehai_tensor = (
+            (range_tensor < sutehai_tensor.unsqueeze(1)).float().unsqueeze(0)
+        )  # Shape: (1, 37, 4)
 
         # **Ensure 2D Tensor by Stacking Along New Dimension**
         x1 = torch.stack(
