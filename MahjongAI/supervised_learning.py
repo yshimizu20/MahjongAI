@@ -3,6 +3,7 @@ import os
 import sys
 import re
 import glob
+import math
 from datetime import datetime
 from typing import Tuple
 
@@ -70,7 +71,7 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
     elif model_name == "transformer_conv_large_3":
         model = TransformerConvLargeModel(3).to(device)
         batch_size = 2
-    elif model_name == "transformer_conv_ordered_new":
+    elif model_name == "transformer_conv_ordered":
         model = TransformerConvOrderedModel(1).to(device)
         batch_size = 4
     elif model_name == "transformer_conv_ordered_large_2":
@@ -91,6 +92,31 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
+    # Define learning rate scheduler parameters
+    warmup_steps = 1000  # 0.1% of 1,000,000
+    total_steps = 1000000  # Total training steps
+
+    # Initialize the scheduler with a linear warmup and cosine decay
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: (
+            float(step) / float(max(1, warmup_steps))
+            if step < warmup_steps
+            else 0.5
+            * (
+                1.0
+                + math.cos(
+                    math.pi
+                    * (step - warmup_steps)
+                    / float(max(1, total_steps - warmup_steps))
+                )
+            )
+        ),
+    )
+
+    # Initialize step counter
+    current_step = 0
+
     # Find latest checkpoint
     latest_iter, latest_checkpoint = find_latest_checkpoint(model_name, checkpoint_dir)
 
@@ -105,15 +131,19 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
         log_message("No checkpoint found. Starting training from iter 0.")
         start_iter = 0
 
+    # Initialize dataloaders
     train_dataloaders = [
-        DataLoader(f"data/processed/{yr}/", batch_size, log_message) for yr in range(2012, 2020)
+        DataLoader(f"data/processed/{yr}/", batch_size, log_message)
+        for yr in range(2012, 2020)
     ]
-    val_dataloader = DataLoader("data/processed/2021/", batch_size)  # Validation DataLoader
+    val_dataloader = DataLoader(
+        "data/processed/2021/", batch_size
+    )  # Validation DataLoader
 
     for iter in range(start_iter, start_iter + max_iters):
         log_message(f"iter {iter}")
 
-        # for train_dataloader in train_dataloaders:
+        # Select dataloader in a round-robin fashion
         train_dataloader = train_dataloaders[iter % len(train_dataloaders)]
         log_message(f"iter {iter} | Loading {repr(train_dataloader)}")
 
@@ -126,6 +156,15 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+                # Update the scheduler and step counter
+                scheduler.step()
+                current_step += 1
+
+                # Log learning rate every 100,000 steps
+                if current_step % 10000 == 0:
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    log_message(f"Current learning rate: {current_lr}")
 
             if (batch_count * batch_size) % 1000 < batch_size:
                 val_loss = estimate_loss(val_dataloader, model, batch_size)
@@ -155,9 +194,6 @@ def estimate_loss(val_dataloader: DataLoader, model, batch_size: int):
     num_batches = 0
 
     for batch_count, (all_halfturns, all_encoding_tokens) in enumerate(val_dataloader):
-        total_loss = 0
-        num_batches = 0
-
         for logits, loss in model(all_halfturns, all_encoding_tokens, sample=False):
             total_loss += loss.item()
             num_batches += 1
@@ -173,13 +209,14 @@ def estimate_loss(val_dataloader: DataLoader, model, batch_size: int):
 
 def log_message(message: str):
     """Logs a message to the console and to a log file."""
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
     with open(log_file, "a") as f:
-        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+        f.write(f"[{timestamp}] {message}\n")
 
 
 if __name__ == "__main__":
-    # get argv (first check if two arguments are provided and the first one is a string and the second one should be an integer)
+    # Check if two arguments are provided: model_name (string) and max_iters (integer)
     if len(sys.argv) != 3:
         raise ValueError(
             "Usage: `python3 supervised_learning.py <model_name> <max_iters>`"
@@ -191,7 +228,7 @@ if __name__ == "__main__":
         "transformer_conv",
         "transformer_conv_large",
         "transformer_conv_large_3",
-        "transformer_conv_ordered_new",
+        "transformer_conv_ordered",
         "transformer_conv_ordered_large_2",
         "transformer_conv_ordered_large_3",
         "transformer_conv_ordered_large_4",
