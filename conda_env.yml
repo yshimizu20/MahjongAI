@@ -1,0 +1,16 @@
+name: mahjong
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - numpy
+  - jupyter
+  - ipykernel
+  - pip
+  - pip:
+      - mahjong
+      - requests
+      - pytest
