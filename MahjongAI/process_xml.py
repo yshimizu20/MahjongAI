@@ -595,7 +595,7 @@ def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
     assert 0 <= tile_idx < 37
     return (
         EventStateTypes.DISCARD << 13
-        | EventTypes.NAKI << 10
+        | EventTypes.DISCARD << 10
         | who << 8
         | int(is_tsumogiri) << 7
         | tile_idx
