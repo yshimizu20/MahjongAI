@@ -87,6 +87,10 @@ graph LR
 | 0-6 | Tile Index | For DISCARD and NEW_DORA events | 0-36 (37 tile types) |
 | 0-7 | Naki Index | For DURING and POST naki events | 0-70 for during, 0-153 for post |
 
+**Note on EventStateTypes vs EventTypes:**
+- `EventStateTypes` (bits 13-15): Indicates the phase of decision context - whether we're in a discard phase, during-turn decision, post-turn decision, etc.
+- `EventTypes` (bits 10-12): Indicates the concrete event kind - what action was recorded (discard, naki call, riichi declaration, new dora reveal).
+
 **Note on Tile vs Naki Encoding:**
 - **Tile events** (DISCARD, NEW_DORA) use bits 0-6 (7 bits) to store tile index 0-36
 - **Naki events** (DURING/POST naki) use bits 0-7 (8 bits) to store action index:
@@ -169,15 +173,15 @@ The encoder uses multiple embedding tables to convert bit-packed tokens into ric
 graph TB
     subgraph BitExtraction [Bit Extraction]
         Token[Encoding Token<br/>16-bit integer]
-        EventType[Event Type<br/>bits 13-15]
-        EmbedType[Embedding Type<br/>bits 10-12]
+        EventStateType[Event State Type<br/>bits 13-15]
+        EventType[Event Type<br/>bits 10-12]
         PlayerIdx[Player Index<br/>bits 8-9]
         TileEnc[Tile Encoding<br/>bits 0-6]
         Tsumogiri[Tsumogiri<br/>bit 7]
         NakiIdx[Naki Index<br/>bits 0-7]
         
+        Token --> EventStateType
         Token --> EventType
-        Token --> EmbedType
         Token --> PlayerIdx
         Token --> TileEnc
         Token --> Tsumogiri
@@ -185,7 +189,7 @@ graph TB
     end
     
     subgraph EmbeddingTables [Embedding Tables]
-        TypeEmb[Type Embedding<br/>4 types x 64 dims]
+        EventTypeEmb[Event Type Embedding<br/>4 non-EMPTY types x 64 dims]
         TileEmb[Tile Embedding<br/>37 tiles x 64 dims]
         TsumoEmb[Tsumogiri Embedding<br/>1 x 64 dims]
         DuringNakiEmb[During Naki Embedding<br/>71 x 64 dims]
@@ -197,14 +201,14 @@ graph TB
         PlayerEnc[Player Encoding<br/>Circular Sinusoidal]
     end
     
-    EmbedType --> TypeEmb
+    EventType --> EventTypeEmb
     TileEnc --> TileEmb
     Tsumogiri --> TsumoEmb
     NakiIdx --> DuringNakiEmb
     NakiIdx --> PostNakiEmb
     PlayerIdx --> PlayerEnc
     
-    TypeEmb --> Sum[Element-wise Sum]
+    EventTypeEmb --> Sum[Element-wise Sum]
     TileEmb --> Sum
     TsumoEmb --> Sum
     DuringNakiEmb --> Sum
@@ -217,7 +221,7 @@ graph TB
 
 **Embedding Details:**
 
-1. **Type Embedding** (4 types): Distinguishes between different event categories
+1. **Event Type Embedding** (4 non-EMPTY types): Embeds the `EventTypes` field (bits 10-12). For tokens where EventTypes == EMPTY, the embedding is not applied (vector = 0). For non-EMPTY EventTypes in {DISCARD, NAKI, RIICHI, NEW_DORA}, we index the 4-slot embedding table with (EventTypes - 1).
 2. **Tile Embedding** (37 tiles): Learned representation for each tile type
 3. **Tsumogiri Embedding**: Indicates if a discard was from the draw
 4. **During Naki Embedding** (71 actions): For ankan/kakan decisions
@@ -818,7 +822,7 @@ DROPOUT_RATIO = 0.2            # Dropout probability
 
 ```
 Encoder:
-  - type_embedding:        4 × 64 = 256
+  - event_type_embedding:  4 × 64 = 256  # 4 non-EMPTY EventTypes
   - tile_embedding:       37 × 64 = 2,368
   - tsumogiri_embedding:   1 × 64 = 64
   - during_naki_embedding: 71 × 64 = 4,544
