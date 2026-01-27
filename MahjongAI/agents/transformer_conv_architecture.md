@@ -373,7 +373,7 @@ The Decoder takes the StateNet output and attends to the full game history (enco
 
 ### Decoder Blocks
 
-Each `DecoderBlock` applies two types of attention:
+Each `DecoderBlock` applies cross-attention in two passes:
 
 ```mermaid
 graph TB
@@ -383,13 +383,13 @@ graph TB
     subgraph DecoderBlock [Decoder Block]
         LN1[Layer Norm]
         Unsqueeze1[Unsqueeze<br/>B x 64 → B x 1 x 64]
-        SelfAttn[Self-Attention<br/>Q from state K V from encoder]
+        CrossAttn1[Cross-Attn history 1<br/>Q from state K V from encoder]
         Squeeze1[Squeeze<br/>B x 1 x 64 → B x 64]
         Residual1[Residual Add]
         
         LN2[Layer Norm]
         Unsqueeze2[Unsqueeze]
-        CrossAttn[Cross-Attention<br/>Q from state K V from encoder]
+        CrossAttn2[Cross-Attn history 2<br/>Q from updated state K V from encoder]
         Squeeze2[Squeeze]
         Residual2[Residual Add]
         
@@ -400,17 +400,17 @@ graph TB
     
     StateEmbedding --> LN1
     LN1 --> Unsqueeze1
-    Unsqueeze1 --> SelfAttn
-    EncOut --> SelfAttn
-    SelfAttn --> Squeeze1
+    Unsqueeze1 --> CrossAttn1
+    EncOut --> CrossAttn1
+    CrossAttn1 --> Squeeze1
     Squeeze1 --> Residual1
     StateEmbedding --> Residual1
     
     Residual1 --> LN2
     LN2 --> Unsqueeze2
-    Unsqueeze2 --> CrossAttn
-    EncOut --> CrossAttn
-    CrossAttn --> Squeeze2
+    Unsqueeze2 --> CrossAttn2
+    EncOut --> CrossAttn2
+    CrossAttn2 --> Squeeze2
     Squeeze2 --> Residual2
     Residual1 --> Residual2
     
@@ -424,15 +424,15 @@ graph TB
 
 **Attention Mechanism Details**:
 
-1. **Self-Attention**: 
+1. **Cross-attention pass 1**: 
+   - State queries history to get a context vector
    - Query from state embedding (current decision point)
    - Keys & Values from encoder output (all past events)
-   - Allows state to gather relevant historical context
 
-2. **Cross-Attention**:
-   - Second pass of attention over history
-   - Refines the attended features
-   - Provides richer context integration
+2. **Cross-attention pass 2**:
+   - State queries history again after one residual update (a refinement pass)
+   - Query from updated state (post-pass-1 residual, then layer normalized)
+   - Keys & Values from encoder output (all past events)
 
 3. **Feed-Forward Network**:
    - Non-linear transformation

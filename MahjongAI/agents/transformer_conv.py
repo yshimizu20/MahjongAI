@@ -380,8 +380,8 @@ class DecoderBlock(nn.Module):
     def __init__(self, EMBD_SIZE, num_heads):
         super().__init__()
         head_size = EMBD_SIZE // num_heads
-        self.self_attention = MultiHeadAttention(num_heads, head_size)
-        self.cross_attention = MultiHeadAttention(num_heads, head_size)
+        self.cross_attention_history_1 = MultiHeadAttention(num_heads, head_size)
+        self.cross_attention_history_2 = MultiHeadAttention(num_heads, head_size)
         self.ffwd = FeedForward(EMBD_SIZE)
         self.ln1 = nn.LayerNorm(EMBD_SIZE)
         self.ln2 = nn.LayerNorm(EMBD_SIZE)
@@ -395,17 +395,17 @@ class DecoderBlock(nn.Module):
             encoder_mask: Optional boolean tensor of shape [B, 1, T].
                           True = keep (valid position), False = mask out (padded position)
         """
-        # Self-Attention (queries state against encoder outputs)
+        # Cross-attention pass 1: state queries history to get a context vector
         x_norm = self.ln1(x).unsqueeze(1)  # [B, 1, EMBD_SIZE]
-        self_attn = self.self_attention(enc_out, enc_out, x_norm, encoder_mask)  # [B, 1, EMBD_SIZE]
-        self_attn = self_attn.squeeze(1)  # [B, EMBD_SIZE]
-        x = x + self_attn  # [B, EMBD_SIZE]
+        cross_attn_1 = self.cross_attention_history_1(enc_out, enc_out, x_norm, encoder_mask)  # [B, 1, EMBD_SIZE]
+        cross_attn_1 = cross_attn_1.squeeze(1)  # [B, EMBD_SIZE]
+        x = x + cross_attn_1  # [B, EMBD_SIZE]
 
-        # Cross-Attention (queries state against encoder outputs)
-        x_norm = self.ln2(x).unsqueeze(1)  # [B, 1, EMBD_SIZE]
-        cross_attn = self.cross_attention(enc_out, enc_out, x_norm, encoder_mask)  # [B, 1, EMBD_SIZE]
-        cross_attn = cross_attn.squeeze(1)  # [B, EMBD_SIZE]
-        x = x + cross_attn  # [B, EMBD_SIZE]
+        # Cross-attention pass 2: state queries history again after residual update (refinement)
+        x_norm = self.ln2(x).unsqueeze(1)  # [B, 1, EMBD_SIZE] - query is post-pass-1 residual, then LN
+        cross_attn_2 = self.cross_attention_history_2(enc_out, enc_out, x_norm, encoder_mask)  # [B, 1, EMBD_SIZE]
+        cross_attn_2 = cross_attn_2.squeeze(1)  # [B, EMBD_SIZE]
+        x = x + cross_attn_2  # [B, EMBD_SIZE]
 
         # Feed Forward Network
         x_norm = self.ln3(x)  # [B, EMBD_SIZE]
