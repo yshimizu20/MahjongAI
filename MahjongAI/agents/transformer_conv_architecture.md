@@ -590,9 +590,10 @@ Training data consists of three types of `HalfTurn` objects:
 
 For each turn type, the processor:
 
-1. **Masks encoding sequence**: Zero out events after `encoding_idx` (causal masking)
+1. **Masks encoding sequence**: Zero out token values after `encoding_idx` and generate padding mask
    ```python
    masked_tokens = concat([tokens[:encoding_idx], zeros(150 - encoding_idx)])
+   padding_mask = arange(150) < encoding_idx  # Boolean: True = valid position
    ```
 
 2. **Converts state object**: Transform `StateObject` → `(x1, x2, x3)` tensors
@@ -601,7 +602,9 @@ For each turn type, the processor:
 
 4. **Extracts target**: Index of the action that was actually taken
 
-5. **Stacks into batch**: Concatenate all examples of same type
+5. **Generates padding mask**: Boolean tensor derived from `encoding_idx` (not token values)
+
+6. **Stacks into batch**: Concatenate all examples of same type
 
 ### Training Loop
 
@@ -681,16 +684,23 @@ Where:
 
 **Benefit**: Better generalization across different seating positions
 
-### 4. Masked Causal Attention
+### 4. Key-Padding Attention Masking
 
-**Motivation**: Model should only see events that occurred before the current decision
+**Motivation**: Model should only attend to events that occurred before the current decision point (`encoding_idx`). Positions beyond `encoding_idx` are padding and must not influence the model's outputs.
 
 **Implementation**:
-- Zero out encoding tokens after `encoding_idx`
-- Prevents information leakage from future events
-- Ensures valid supervised learning setup
+- Generate a boolean padding mask from `encoding_idx`: `mask[i] = (i < encoding_idx)` where `True` = valid position
+- Apply mask in attention: `attn_scores.masked_fill(~mask, -inf)` before softmax
+- Zero out encoder outputs at padded positions after transformer blocks to prevent signal leakage through bias terms and LayerNorm
+- Pass the same mask to decoder cross-attention to prevent attending to padded encoder positions
 
-**Critical**: Without this, model would cheat by seeing future events
+**Why attention masking (not just token zeroing)**:
+- Simply zeroing token values still allows attention to padded positions
+- Linear layers have bias terms, so zero embeddings produce non-zero keys/values
+- Softmax normalization distributes probability mass across all positions including padding
+- Proper attention masking with `-inf` ensures padded positions contribute exactly zero to attention outputs
+
+**Note**: This is a **bidirectional encoder** with key-padding masking, not a causal (autoregressive) encoder. All valid positions can attend to all other valid positions within the prefix. Causal masking (preventing position `t` from attending to positions `> t` within the valid prefix) is not applied.
 
 ### 5. Action Masking
 

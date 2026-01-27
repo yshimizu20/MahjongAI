@@ -82,6 +82,7 @@ class TransformerConvModel(nn.Module):
                     ),
                     tensors[2][idx],
                     tensors[3][idx],
+                    tensors[4][idx],  # padding_mask
                 )
 
             (
@@ -89,6 +90,7 @@ class TransformerConvModel(nn.Module):
                 state_obj_tensor_batch,
                 action_mask_batch,
                 y_tensor,
+                padding_mask_batch,
             ) = tensors
             encoding_tokens_batch = encoding_tokens_batch.to(device)
             state_obj_tensor_batch = tuple(
@@ -96,10 +98,11 @@ class TransformerConvModel(nn.Module):
             )
             action_mask_batch = action_mask_batch.to(device)
             y_tensor = y_tensor.to(device)
+            padding_mask_batch = padding_mask_batch.to(device)
 
-            enc_out = self.encoder(encoding_tokens_batch)  # Shape: (B, 150, EMBD_SIZE)
+            enc_out = self.encoder(encoding_tokens_batch, padding_mask_batch)  # Shape: (B, 150, EMBD_SIZE)
             logits, loss = self.decoder(
-                enc_out, state_obj_tensor_batch, action_mask_batch, y_tensor, head
+                enc_out, state_obj_tensor_batch, action_mask_batch, y_tensor, head, padding_mask_batch
             )
             yield logits, loss
 
@@ -174,10 +177,11 @@ class Encoder(nn.Module):
 
         return encoding.requires_grad_(False)  # Ensure non-trainable
 
-    def forward(self, encoding_tokens_batch: torch.tensor):
+    def forward(self, encoding_tokens_batch: torch.tensor, padding_mask: torch.tensor):
         """
         Args:
             encoding_tokens_batch: (B, 150) tensor of encoding tokens
+            padding_mask: (B, 150) boolean tensor where True = valid position, False = padded (REQUIRED)
 
         Returns:
             x: (B, 150, EMBD_SIZE) tensor of embeddings
@@ -264,8 +268,15 @@ class Encoder(nn.Module):
             + post_naki_emb
         )  # Shape: (B, T, EMBD_SIZE)
 
+        # Prepare attention mask: (B, 150) -> (B, 1, 150) for broadcasting over queries
+        attn_mask = padding_mask.unsqueeze(1)  # (B, 1, T)
+
         for block in self.blocks:
-            x = block(x)
+            x = block(x, attn_mask)
+
+        # Zero out encoder outputs at padded positions to prevent signal leakage
+        x = x.masked_fill(~padding_mask.unsqueeze(-1), 0.0)
+
         return x  # Shape: (B, T, EMBD_SIZE)
 
 
@@ -304,6 +315,7 @@ class Decoder(nn.Module):
         action_mask_batch: torch.tensor,
         y_tensor: torch.tensor,
         head: str,
+        encoder_padding_mask: torch.tensor,
     ):
         """
         Args:
@@ -312,6 +324,7 @@ class Decoder(nn.Module):
             action_mask_batch: (B, action_dim) tensor
             y_tensor: (B,) tensor
             head: str indicating the head to use
+            encoder_padding_mask: (B, 150) boolean tensor where True = valid position, False = padded (REQUIRED)
         """
         assert torch.all(
             (action_mask_batch == 0) | (action_mask_batch == 1)
@@ -320,9 +333,12 @@ class Decoder(nn.Module):
             action_mask_batch, dim=1
         ).all(), "Each sample must have at least one allowed action"
 
+        # Prepare encoder mask for cross-attention: (B, 150) -> (B, 1, 150)
+        encoder_mask = encoder_padding_mask.unsqueeze(1)  # (B, 1, T)
+
         x = self.state_net(state_obj_tensor_batch)  # [B, EMBD_SIZE]
         for block in self.blocks:
-            x = block(x, enc_out)
+            x = block(x, enc_out, encoder_mask)
         x = self.ln_f(x)
         logits = self.heads[head](x)
 
@@ -346,8 +362,15 @@ class EncoderBlock(nn.Module):
         self.ln1 = nn.LayerNorm(EMBD_SIZE)
         self.ln2 = nn.LayerNorm(EMBD_SIZE)
 
-    def forward(self, x):
-        x = x + self.self_attention(self.ln1(x), self.ln1(x), self.ln1(x))
+    def forward(self, x, attn_mask):
+        """
+        Args:
+            x: Input tensor of shape [B, T, EMBD_SIZE]
+            attn_mask: Optional boolean tensor of shape [B, 1, T].
+                       True = keep (valid position), False = mask out (padded position)
+        """
+        x_norm = self.ln1(x)
+        x = x + self.self_attention(x_norm, x_norm, x_norm, attn_mask)
         x = x + self.ffwd(self.ln2(x))
 
         return x
@@ -364,16 +387,23 @@ class DecoderBlock(nn.Module):
         self.ln2 = nn.LayerNorm(EMBD_SIZE)
         self.ln3 = nn.LayerNorm(EMBD_SIZE)
 
-    def forward(self, x, enc_out):
-        # Self-Attention
+    def forward(self, x, enc_out, encoder_mask):
+        """
+        Args:
+            x: State embedding of shape [B, EMBD_SIZE]
+            enc_out: Encoder output of shape [B, T, EMBD_SIZE]
+            encoder_mask: Optional boolean tensor of shape [B, 1, T].
+                          True = keep (valid position), False = mask out (padded position)
+        """
+        # Self-Attention (queries state against encoder outputs)
         x_norm = self.ln1(x).unsqueeze(1)  # [B, 1, EMBD_SIZE]
-        self_attn = self.self_attention(enc_out, enc_out, x_norm)  # [B, 1, EMBD_SIZE]
+        self_attn = self.self_attention(enc_out, enc_out, x_norm, encoder_mask)  # [B, 1, EMBD_SIZE]
         self_attn = self_attn.squeeze(1)  # [B, EMBD_SIZE]
         x = x + self_attn  # [B, EMBD_SIZE]
 
-        # Cross-Attention
+        # Cross-Attention (queries state against encoder outputs)
         x_norm = self.ln2(x).unsqueeze(1)  # [B, 1, EMBD_SIZE]
-        cross_attn = self.cross_attention(enc_out, enc_out, x_norm)  # [B, 1, EMBD_SIZE]
+        cross_attn = self.cross_attention(enc_out, enc_out, x_norm, encoder_mask)  # [B, 1, EMBD_SIZE]
         cross_attn = cross_attn.squeeze(1)  # [B, EMBD_SIZE]
         x = x + cross_attn  # [B, EMBD_SIZE]
 
@@ -467,8 +497,16 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(head_size * num_heads, EMBD_SIZE)
         self.dropout = nn.Dropout(DROPOUT_RATIO)
 
-    def forward(self, k, v, q):
-        head_outputs = [head(k, v, q) for head in self.heads]  # Each [B, Q, head_size]
+    def forward(self, k, v, q, attn_mask):
+        """
+        Args:
+            k: Key tensor of shape [B, T, EMBD_SIZE]
+            v: Value tensor of shape [B, T, EMBD_SIZE]
+            q: Query tensor of shape [B, Q, EMBD_SIZE]
+            attn_mask: Optional boolean tensor of shape [B, 1, T] or broadcastable.
+                       True = keep (valid position), False = mask out (padded position)
+        """
+        head_outputs = [head(k, v, q, attn_mask) for head in self.heads]  # Each [B, Q, head_size]
         out = torch.cat(head_outputs, dim=-1)  # [B, Q, head_size * num_heads]
         out = self.proj(out)  # [B, Q, EMBD_SIZE]
         out = self.dropout(out)  # [B, Q, EMBD_SIZE]
@@ -483,13 +521,15 @@ class Head(nn.Module):
         self.value = nn.Linear(EMBD_SIZE, head_size, bias=True)
         self.dropout = nn.Dropout(DROPOUT_RATIO)
 
-    def forward(self, k, v, q):
+    def forward(self, k, v, q, attn_mask):
         """
         Args:
             k: Key tensor of shape [B, T, EMBD_SIZE]
             v: Value tensor of shape [B, T, EMBD_SIZE]
             q: Query tensor of shape [B, Q, EMBD_SIZE]
                - Q can be 1 (for cross-attention) or T (for self-attention)
+            attn_mask: Optional boolean tensor of shape [B, 1, T] or broadcastable.
+                       True = keep (valid position), False = mask out (padded position)
 
         Returns:
             out: Tensor of shape [B, Q, head_size]
@@ -504,6 +544,11 @@ class Head(nn.Module):
         # Compute attention scores
         wei = torch.bmm(q, k_transposed)  # [B, Q, T]
         wei = wei / (k.size(-1) ** 0.5)  # Scaling
+
+        # Apply attention mask: mask out padded positions with -inf
+        # attn_mask is boolean with True = keep, False = mask
+        wei = wei.masked_fill(~attn_mask, float('-inf'))
+
         wei = F.softmax(wei, dim=-1)  # [B, Q, T]
         wei = self.dropout(wei)  # [B, Q, T]
 
@@ -563,7 +608,7 @@ class TransformerTensorProcessor:
         self, tensors_during_batch, tensors_discard_batch, tensors_post_batch
     ):
         # --------------------- During Turns ---------------------
-        during_encodings, during_state_obj, during_filter, during_y = zip(
+        during_encodings, during_state_obj, during_filter, during_y, during_padding_mask = zip(
             *tensors_during_batch
         )
         during_x1, during_x2, during_x3 = zip(*during_state_obj)
@@ -575,9 +620,10 @@ class TransformerTensorProcessor:
         )
         during_filter = torch.cat(during_filter, dim=0)
         during_y = torch.cat(during_y, dim=0)
+        during_padding_mask = torch.cat(during_padding_mask, dim=0)  # Shape: (sum_N, 150)
 
         # --------------------- Discard Turns ---------------------
-        discard_encodings, discard_state_obj, discard_filter, discard_y = zip(
+        discard_encodings, discard_state_obj, discard_filter, discard_y, discard_padding_mask = zip(
             *tensors_discard_batch
         )
         discard_x1, discard_x2, discard_x3 = zip(*discard_state_obj)
@@ -589,9 +635,10 @@ class TransformerTensorProcessor:
         )
         discard_filter = torch.cat(discard_filter, dim=0)
         discard_y = torch.cat(discard_y, dim=0)
+        discard_padding_mask = torch.cat(discard_padding_mask, dim=0)  # Shape: (sum_N, 150)
 
         # --------------------- Post Turns ---------------------
-        post_encodings, post_state_obj, post_filter, post_y = zip(*tensors_post_batch)
+        post_encodings, post_state_obj, post_filter, post_y, post_padding_mask = zip(*tensors_post_batch)
         post_x1, post_x2, post_x3 = zip(*post_state_obj)
         post_encodings = torch.cat(post_encodings, dim=0)
         post_state_obj = (
@@ -601,11 +648,12 @@ class TransformerTensorProcessor:
         )
         post_filter = torch.cat(post_filter, dim=0)
         post_y = torch.cat(post_y, dim=0)
+        post_padding_mask = torch.cat(post_padding_mask, dim=0)  # Shape: (sum_N, 150)
 
         return (
-            (during_encodings, during_state_obj, during_filter, during_y),
-            (discard_encodings, discard_state_obj, discard_filter, discard_y),
-            (post_encodings, post_state_obj, post_filter, post_y),
+            (during_encodings, during_state_obj, during_filter, during_y, during_padding_mask),
+            (discard_encodings, discard_state_obj, discard_filter, discard_y, discard_padding_mask),
+            (post_encodings, post_state_obj, post_filter, post_y, post_padding_mask),
         )
 
     def build_tensors(self, turns: List[HalfTurn], encoding_tokens: List[int]) -> Tuple[
@@ -646,7 +694,7 @@ class TransformerTensorProcessor:
 
     def _build_discard_tensor(
         self, discard_turns: List[DiscardTurn], encoding_token_tensor: torch.Tensor
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Builds tensors for discard turns.
 
@@ -660,11 +708,13 @@ class TransformerTensorProcessor:
                 - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
                 - filter_tensors: Tensor of shape (sum_N, 37)
                 - y: Tensor of target labels
+                - padding_mask: Boolean tensor of shape (sum_N, 150), True = valid position
         """
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
         y = []
+        encoding_indices = []
 
         for turn in discard_turns:
             encoding_idx = turn.encoding_idx
@@ -681,6 +731,7 @@ class TransformerTensorProcessor:
             )  # Shape: (1, 150)
 
             X_embeddings.append(masked_encoding_token_tensor)
+            encoding_indices.append(encoding_idx)
 
             x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
 
@@ -741,16 +792,25 @@ class TransformerTensorProcessor:
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
+        # Generate padding mask from encoding_idx: True = valid position
+        if encoding_indices:
+            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long, device=device)  # (N,)
+            position_indices = torch.arange(150, device=device).unsqueeze(0)  # (1, 150)
+            padding_mask = position_indices < encoding_idx_tensor.unsqueeze(1)  # (N, 150) boolean
+        else:
+            padding_mask = torch.empty(0, 150, dtype=torch.bool, device=device)
+
         return (
             encoding_tokens_batch,
             state_obj_tensor_batch,
             action_mask_batch,
             y_tensor,
+            padding_mask,
         )
 
     def _build_during_tensor(
         self, during_turns: List[DuringTurn], encoding_token_tensor: torch.Tensor
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Builds tensors for during turns.
 
@@ -764,11 +824,13 @@ class TransformerTensorProcessor:
                 - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
                 - filter_tensors: Tensor of shape (sum_N, 71)
                 - y: Tensor of target labels
+                - padding_mask: Boolean tensor of shape (sum_N, 150), True = valid position
         """
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
         y = []
+        encoding_indices = []
 
         for turn in during_turns:
             n_decisions = sum(map(len, turn.decisions))
@@ -789,6 +851,7 @@ class TransformerTensorProcessor:
             )  # Shape: (1, 150)
 
             X_embeddings.append(masked_encoding_token_tensor)
+            encoding_indices.append(encoding_idx)
 
             # Convert stateObj to tensors
             x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
@@ -874,16 +937,25 @@ class TransformerTensorProcessor:
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
+        # Generate padding mask from encoding_idx: True = valid position
+        if encoding_indices:
+            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long, device=device)  # (N,)
+            position_indices = torch.arange(150, device=device).unsqueeze(0)  # (1, 150)
+            padding_mask = position_indices < encoding_idx_tensor.unsqueeze(1)  # (N, 150) boolean
+        else:
+            padding_mask = torch.empty(0, 150, dtype=torch.bool, device=device)
+
         return (
             encoding_tokens_batch,
             state_obj_tensor_batch,
             action_mask_batch,
             y_tensor,
+            padding_mask,
         )
 
     def _build_post_tensor(
         self, post_turns: List[PostTurn], encoding_token_tensor: torch.Tensor
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Builds tensors for post turns.
 
@@ -897,11 +969,13 @@ class TransformerTensorProcessor:
                 - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
                 - filter_tensors: Tensor of shape (sum_N, 154)
                 - y: Tensor of target labels
+                - padding_mask: Boolean tensor of shape (sum_N, 150), True = valid position
         """
         X_embeddings = []
         state_obj_tensors = []
         filter_tensors = []
         y = []
+        encoding_indices = []
         players = [0, 1, 2, 3]
 
         for turn in post_turns:
@@ -970,6 +1044,7 @@ class TransformerTensorProcessor:
                 state_obj_tensors.append((x1, x2, x3))
                 filter_tensors.append(decision_mask)
                 y.append(result)
+                encoding_indices.append(encoding_idx)
 
                 if contains_executed:
                     break
@@ -1017,11 +1092,20 @@ class TransformerTensorProcessor:
 
         y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
 
+        # Generate padding mask from encoding_idx: True = valid position
+        if encoding_indices:
+            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long, device=device)  # (N,)
+            position_indices = torch.arange(150, device=device).unsqueeze(0)  # (1, 150)
+            padding_mask = position_indices < encoding_idx_tensor.unsqueeze(1)  # (N, 150) boolean
+        else:
+            padding_mask = torch.empty(0, 150, dtype=torch.bool, device=device)
+
         return (
             encoding_tokens_batch,
             state_obj_tensor_batch,
             action_mask_batch,
             y_tensor,
+            padding_mask,
         )
 
     def _convert_state_obj_to_tensors(
