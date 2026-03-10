@@ -350,7 +350,7 @@ def process(file_path: str, verbose: bool = False):
                 for meld in melds[player]:
                     if meld.is_pon():
                         color, number, *_ = meld.pattern_pon()
-                        if hands[player, 9 * color + number] == 1.0:
+                        if hand_tensors[player][9 * color + number] == 1.0:
                             naki_decisions.append(
                                 NakiDecision(
                                     player,
@@ -396,8 +396,6 @@ def process(file_path: str, verbose: bool = False):
 
                 halfturns.append(halfturn)
                 curr_halfturn = halfturn  # carry over
-                if sum(ippatsu):
-                    ippatsu = [0] * 4
 
             elif eventtype[0] in ["D", "E", "F", "G"]:
                 assert acquired is not None

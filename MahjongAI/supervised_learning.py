@@ -18,7 +18,12 @@ from MahjongAI.utils.dataloader import DataLoader
 
 eval_interval = 1
 learning_rate = 1e-3
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+# elif torch.backends.mps.is_available():
+#     device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 
 # Create log file
 log_file = f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -62,7 +67,7 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
     # Initialize model
     if model_name == "transformer_conv":
         model = TransformerConvModel().to(device)
-        batch_size = 5
+        batch_size = 2
     else:
         raise NotImplementedError(f"Model {model_name} not implemented.")
 
@@ -79,15 +84,7 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
         lr_lambda=lambda step: (
             float(step) / float(max(1, warmup_steps))
             if step < warmup_steps
-            else 0.5
-            * (
-                1.0
-                + math.cos(
-                    math.pi
-                    * (step - warmup_steps)
-                    / float(max(1, total_steps - warmup_steps))
-                )
-            )
+            else 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / float(max(1, total_steps - warmup_steps))))
         ),
     )
 
@@ -100,22 +97,15 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
     if latest_checkpoint:
         # Load the model state
         model.load_state_dict(torch.load(latest_checkpoint, map_location=device))
-        log_message(
-            f"Loaded model from {latest_checkpoint}, starting from iter {latest_iter + 1}"
-        )
+        log_message(f"Loaded model from {latest_checkpoint}, starting from iter {latest_iter + 1}")
         start_iter = latest_iter + 1
     else:
         log_message("No checkpoint found. Starting training from iter 0.")
         start_iter = 0
 
     # Initialize dataloaders
-    train_dataloaders = [
-        DataLoader(f"data/processed/{yr}/", batch_size, log_message)
-        for yr in range(2021, 2022)
-    ]
-    val_dataloader = DataLoader(
-        "data/processed/2021/", batch_size
-    )  # Validation DataLoader
+    train_dataloaders = [DataLoader(f"data/processed/{yr}/", batch_size, log_message) for yr in range(2021, 2022)]
+    val_dataloader = DataLoader("data/processed/2021/", batch_size)  # Validation DataLoader
 
     for iter in range(start_iter, start_iter + max_iters):
         log_message(f"iter {iter}")
@@ -124,28 +114,30 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
         train_dataloader = train_dataloaders[iter % len(train_dataloaders)]
         log_message(f"iter {iter} | Loading {repr(train_dataloader)}")
 
-        for batch_count, (all_halfturns_list, all_encoding_tokens_list) in enumerate(
-            train_dataloader
-        ):
-            batch_losses = {}
-            for logits, loss, head in model(
-                all_halfturns_list, all_encoding_tokens_list, sample=True
-            ):
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+        for batch_count, (all_halfturns_list, all_encoding_tokens_list) in enumerate(train_dataloader):
+            results = model(all_halfturns_list, all_encoding_tokens_list, sample=True)
+            if not results:
+                continue
 
-                # Update the scheduler and step counter
-                scheduler.step()
-                current_step += 1
-                batch_losses[head] = loss.item()
+            total_loss = sum(loss for _, loss in results.values())
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
 
-                # Log learning rate every 100,000 steps
-                if current_step % 10000 == 0:
-                    current_lr = optimizer.param_groups[0]["lr"]
-                    log_message(f"Current learning rate: {current_lr}")
+            # Update the scheduler and step counter
+            scheduler.step()
+            current_step += 1
 
-            loss_str = " | ".join(f"{h} {batch_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in batch_losses)
+            batch_losses = {head: loss.item() for head, (_, loss) in results.items()}
+
+            # Log learning rate every 100,000 steps
+            if current_step % 10000 == 0:
+                current_lr = optimizer.param_groups[0]["lr"]
+                log_message(f"Current learning rate: {current_lr}")
+
+            loss_str = " | ".join(
+                f"{h} {batch_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in batch_losses
+            )
             log_message(f"iter {iter} | batch {batch_count} | {loss_str}")
 
             if max_batches is not None and batch_count + 1 >= max_batches:
@@ -154,16 +146,16 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
 
             if (batch_count * batch_size) % 1000 < batch_size:
                 val_losses = estimate_loss(val_dataloader, model, batch_size)
-                val_str = " | ".join(f"{h} {val_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in val_losses)
+                val_str = " | ".join(
+                    f"{h} {val_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in val_losses
+                )
                 log_message(f"iter {iter} | batch {batch_count} | val {val_str}")
 
         log_message(f"iter {iter} | Processed {repr(train_dataloader)}")
 
         if (iter + 1) % eval_interval == 0:
             # Save model checkpoint
-            model_path = os.path.join(
-                checkpoint_dir, f"model_{model_name}_checkpoint_iter_{iter}.pt"
-            )
+            model_path = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_iter_{iter}.pt")
             torch.save(model.state_dict(), model_path)
             log_message(f"Model saved at {model_path}")
 
@@ -179,7 +171,8 @@ def estimate_loss(val_dataloader: DataLoader, model, batch_size: int):
     head_counts = {}
 
     for batch_count, (all_halfturns, all_encoding_tokens) in enumerate(val_dataloader):
-        for logits, loss, head in model(all_halfturns, all_encoding_tokens, sample=False):
+        results = model(all_halfturns, all_encoding_tokens, sample=False)
+        for head, (_, loss) in results.items():
             head_totals[head] = head_totals.get(head, 0.0) + loss.item()
             head_counts[head] = head_counts.get(head, 0) + 1
 
@@ -202,10 +195,7 @@ def log_message(message: str):
 
 if __name__ == "__main__":
     valid_models = [
-        "transformer",
         "transformer_conv",
-        "transformer_conv_large",
-        "transformer_conv_ordered",
     ]
 
     parser = argparse.ArgumentParser(description="Train a MahjongAI model.")
