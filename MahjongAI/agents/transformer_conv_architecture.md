@@ -277,9 +277,9 @@ Each `EncoderBlock` consists of:
 
 **Encoder Output**: `(B, 150, 64)` - Contextualized embeddings for all game events
 
-## StateNet: Convolutional Component
+## StateNet: Suit-Aware Convolutional Component
 
-The `StateNet` is a **key distinguishing feature** of this hybrid architecture. It processes the current game state tensors using convolutional layers to capture spatial relationships between tiles, then combines this with other game metadata.
+The `StateNet` is a **key distinguishing feature** of this hybrid architecture. It processes the current game state tensors using **suit-aware** convolutional layers that respect Mahjong tile semantics, then combines this with other game metadata.
 
 ```mermaid
 graph TB
@@ -289,83 +289,121 @@ graph TB
         x3[x3: Global State<br/>B x 4]
     end
     
-    subgraph ConvPath [Convolutional Path]
-        Conv1[Conv2d Layer 1<br/>3→8 channels<br/>kernel 3x3 padding 1]
-        ReLU1[ReLU]
-        Conv2[Conv2d Layer 2<br/>8→8 channels<br/>kernel 3x3 padding 1]
-        ReLU2[ReLU]
-        Flatten1[Flatten<br/>8 x 37 x 4 = 1184]
+    subgraph SuitPath [Suit-Aware Conv Path]
+        SplitSuits[Split Suits<br/>indices 0-26]
+        ReshapeSuits[Reshape to<br/>B*3 x 12 x 9]
+        Conv1d1[Conv1d Layer 1<br/>12→16 channels<br/>kernel 3]
+        Conv1d2[Conv1d Layer 2<br/>16→16 channels<br/>kernel 3]
+        PoolRank[Global Pool Rank<br/>B*3 x 16]
+        AggregateSuits[Aggregate Suits<br/>B x 16]
         
-        Conv1 --> ReLU1 --> Conv2 --> ReLU2 --> Flatten1
+        SplitSuits --> ReshapeSuits --> Conv1d1 --> Conv1d2 --> PoolRank --> AggregateSuits
     end
     
-    subgraph RawPath [Raw Path]
+    subgraph HonorPath [Honor MLP Path]
+        ExtractHonors[Extract Honors<br/>indices 27-33]
+        FlattenHonors[Flatten<br/>B x 84]
+        HonorFC1[FC 84 → 32]
+        HonorFC2[FC 32 → 16]
+        
+        ExtractHonors --> FlattenHonors --> HonorFC1 --> HonorFC2
+    end
+    
+    subgraph RedPath [Red Fives Path]
+        ExtractReds[Extract Reds<br/>indices 34-36]
+        FlattenReds[Flatten<br/>B x 36]
+        RedFC[FC 36 → 8]
+        
+        ExtractReds --> FlattenReds --> RedFC
+    end
+    
+    subgraph RawPath [Raw Preservation Path]
         FlattenRaw[Flatten Raw x1<br/>3 x 37 x 4 = 444]
     end
     
     subgraph Combine [Combine All Features]
-        Concat1[Concatenate<br/>1184 + 444 = 1628]
-        FC1[Fully Connected<br/>1628 → 64]
-        ReLUFC1[ReLU]
+        Concat1[Concatenate<br/>16 + 16 + 8 + 444 = 484]
         FlattenX2[Flatten x2<br/>7 x 4 = 28]
-        Concat2[Concatenate<br/>64 + 28 + 4 = 96]
-        FC2[Fully Connected<br/>96 → 64]
-        ReLUFC2[ReLU]
-        FC3[Fully Connected<br/>64 → 64]
-        ReLUFC3[ReLU]
+        Concat2[Concatenate<br/>484 + 28 + 4 = 516]
+        FC1[FC 516 → 64]
+        FC2[FC 64 → 64]
     end
     
-    x1 --> Conv1
+    x1 --> SplitSuits
+    x1 --> ExtractHonors
+    x1 --> ExtractReds
     x1 --> FlattenRaw
-    Flatten1 --> Concat1
-    FlattenRaw --> Concat1
-    Concat1 --> FC1 --> ReLUFC1
-    x2 --> FlattenX2
-    x3 --> Concat2
-    ReLUFC1 --> Concat2
-    FlattenX2 --> Concat2
-    Concat2 --> FC2 --> ReLUFC2 --> FC3 --> ReLUFC3
     
-    ReLUFC3 --> StateEmbedding[State Embedding<br/>B x 64]
+    AggregateSuits --> Concat1
+    HonorFC2 --> Concat1
+    RedFC --> Concat1
+    FlattenRaw --> Concat1
+    
+    Concat1 --> Concat2
+    x2 --> FlattenX2
+    FlattenX2 --> Concat2
+    x3 --> Concat2
+    
+    Concat2 --> FC1 --> FC2
+    
+    FC2 --> StateEmbedding[State Embedding<br/>B x 64]
 ```
 
-### Why Convolutional Layers?
+### Why Suit-Aware Convolutional Layers?
 
-**Spatial Tile Relationships**: Mahjong tiles have inherent spatial structure:
-- Sequential tiles (e.g., 3-4-5 of the same suit) form valid melds (chi)
-- Same tiles (e.g., three 5s) form valid melds (pon)
-- Tile proximity matters for calculating shanten (tiles needed to win)
+**Semantic Tile Relationships**: The suit-aware architecture respects Mahjong tile structure by processing tiles according to their semantic meaning:
 
-**Convolution Benefits**:
-- **Local patterns**: 3×3 kernels detect tile combinations
-- **Translation invariance**: Same patterns across different tile types
-- **Feature hierarchy**: Layer 1 detects basic patterns, Layer 2 combines them
+- **Suits (Man/Pin/Sou)**: Conv1d operates along the **rank axis (1-9)** within each suit, capturing sequential tile patterns like 3-4-5 melds (chi).
+- **Honors**: Processed separately via MLP, avoiding forcing them into a fake linear neighborhood.
+- **Red Fives**: Extracted as separate features, maintaining their special status.
+- **Count encoding**: The K=4 dimension (cumulative binary vector) is treated as feature channels, not a spatial axis.
+
+This design ensures that convolution captures true Mahjong patterns:
+- Adjacency in the convolution corresponds to rank adjacency (e.g., 4-man is adjacent to 5-man, not to 1-pin)
+- Suit boundaries are respected, preventing spurious cross-suit correlations
+- Translation invariance applies within suits (same rank pattern in Man/Pin/Sou)
 
 ### StateNet Processing Steps
 
-1. **Convolutional Feature Extraction**:
+1. **Suit-Aware Convolution**:
    ```
-   x1: (B, 3, 37, 4) → Conv2d → (B, 8, 37, 4) → Conv2d → (B, 8, 37, 4)
-   Flattened: (B, 1184)
+   Suits (indices 0-26):
+     Extract 3 suits × 9 ranks → (B, S=3, C*K=12, R=9)
+     Merge suits into batch → (B*3, 12, 9)
+     Conv1d(in=12, out=16, kernel=3) over rank → (B*3, 16, 9)
+     Conv1d(in=16, out=16, kernel=3) over rank → (B*3, 16, 9)
+     Global pool over rank → (B*3, 16)
+     Aggregate suits (mean) → (B, 16)
    ```
 
-2. **Raw Feature Preservation**:
+2. **Honor Processing**:
+   ```
+   Honors (indices 27-33):
+     Flatten → (B, C*H*K=84)
+     FC(84 → 32) → ReLU → FC(32 → 16) → (B, 16)
+   ```
+
+3. **Red Fives Processing**:
+   ```
+   Reds (indices 34-36):
+     Flatten → (B, C*S*K=36)
+     FC(36 → 8) → (B, 8)
+   ```
+
+4. **Raw Feature Preservation**:
    ```
    x1 raw: (B, 3, 37, 4) → Flatten → (B, 444)
    ```
    Preserves exact tile counts alongside learned features
 
-3. **Feature Fusion**:
+5. **Feature Fusion**:
    ```
-   Concat(conv_features, raw_features): (B, 1628) → FC → (B, 64)
-   ```
-
-4. **Metadata Integration**:
-   ```
-   Concat(processed_x1, x2_flat, x3): (B, 96) → FC → FC → (B, 64)
+   Concat(suits_16, honors_16, reds_8, raw_444): (B, 484)
+   Concat(x1_combined, x2_flat_28, x3_4): (B, 516)
+   FC(516 → 64) → FC(64 → 64) → (B, 64)
    ```
 
-**StateNet Output**: `(B, 64)` - Rich state representation combining CNN features and game metadata
+**StateNet Output**: `(B, 64)` - Rich state representation combining semantically-aware CNN features and game metadata
 
 ## Decoder Architecture
 
@@ -803,13 +841,16 @@ DROPOUT_RATIO = 0.2            # Dropout probability
 | | target | (B,) | Target action index |
 | **Encoder** | embeddings | (B, 150, 64) | After embedding sum |
 | | enc_out | (B, 150, 64) | After transformer blocks |
-| **StateNet** | conv1_out | (B, 8, 37, 4) | After 1st conv layer |
-| | conv2_out | (B, 8, 37, 4) | After 2nd conv layer |
-| | conv_flat | (B, 1184) | Flattened conv features |
+| **StateNet** | suits_reshaped | (B*3, 12, 9) | Suits tensor for Conv1d |
+| | suits_conv1 | (B*3, 16, 9) | After 1st suit conv |
+| | suits_conv2 | (B*3, 16, 9) | After 2nd suit conv |
+| | suits_pooled | (B*3, 16) | After global pool |
+| | suits_feat | (B, 16) | After suit aggregation |
+| | honors_feat | (B, 16) | After honor MLP |
+| | reds_feat | (B, 8) | After red FC |
 | | raw_flat | (B, 444) | Flattened raw x1 |
-| | x1_combined | (B, 1628) | Concatenated conv + raw |
-| | x1_processed | (B, 64) | After FC layer |
-| | combined | (B, 96) | All features concatenated |
+| | x1_combined | (B, 484) | All x1 features concatenated |
+| | combined | (B, 516) | All features concatenated |
 | | state_emb | (B, 64) | Final state embedding |
 | **Decoder** | dec_out | (B, 64) | After decoder blocks |
 | | dec_norm | (B, 64) | After final layer norm |
@@ -830,10 +871,12 @@ Encoder:
   - transformer_blocks:   ~150K (QKV projections, FFN)
   
 StateNet:
-  - conv2d_x1_1:          3 × 8 × 3 × 3 = 216 (+ 8 bias)
-  - conv2d_x1_2:          8 × 8 × 3 × 3 = 576 (+ 8 bias)
-  - fc_x1:                1628 × 64 = 104,192 (+ 64 bias)
-  - fc_main_1:            96 × 64 = 6,144 (+ 64 bias)
+  - suit_conv1d_1:        12 × 16 × 3 = 576 (+ 16 bias)
+  - suit_conv1d_2:        16 × 16 × 3 = 768 (+ 16 bias)
+  - honors_fc1:           84 × 32 = 2,688 (+ 32 bias)
+  - honors_fc2:           32 × 16 = 512 (+ 16 bias)
+  - reds_fc:              36 × 8 = 288 (+ 8 bias)
+  - fc_main_1:            516 × 64 = 33,024 (+ 64 bias)
   - fc_main_2:            64 × 64 = 4,096 (+ 64 bias)
   
 Decoder:
@@ -876,22 +919,103 @@ with torch.no_grad():
     pass
 ```
 
+## Architecture Update: Suit-Aware Design
+
+**Important**: The current implementation uses a **suit-aware architecture** that was designed to fix a fundamental issue in earlier versions.
+
+### The Problem (Previous Architecture)
+
+The original architecture applied Conv2d with 3×3 kernels to the flat tile-index tensor (0-36), which created spurious adjacencies:
+- 9-man (index 8) treated as adjacent to 1-pin (index 9)
+- 9-pin (index 17) treated as adjacent to 1-sou (index 18)
+- 9-sou (index 26) treated as adjacent to East wind (index 27)
+
+This meant the CNN learned arbitrary patterns over an artificial ordering rather than true Mahjong semantics.
+
+### The Solution (Current Architecture)
+
+The suit-aware architecture respects tile semantics:
+- **Suits**: Conv1d operates along rank (1-9) within each suit separately
+- **Honors**: Processed via MLP (no fake spatial structure)
+- **Red fives**: Separate feature path
+- **Convolution captures real patterns**: 3-4-5 sequences, rank distributions
+
+### Retraining Requirement
+
+**This is a breaking architectural change.** Models trained with the old flat Conv2d architecture are **not compatible** with this suit-aware version.
+
+To use this architecture:
+1. Train a new model from scratch using the updated `transformer_conv.py`
+2. Compare performance against baseline on held-out test data
+3. Expected improvements: Better generalization on chi/sequence detection
+
+### Retraining Guide
+
+```bash
+# Backup old model if exists
+mv path/to/trained_model.pth path/to/trained_model_old_architecture.pth
+
+# Train new suit-aware model
+python MahjongAI/supervised_learning.py \
+    --model transformer_conv \
+    --epochs 100 \
+    --batch_size 256 \
+    --learning_rate 0.001 \
+    --save_path models/transformer_conv_suit_aware.pth
+
+# To prepare a baseline: checkout the commit before the suit-aware change, train, restore
+git checkout <commit_before_suit_aware> -- MahjongAI/agents/transformer_conv.py
+python MahjongAI/supervised_learning.py --model transformer_conv --save_path models/transformer_conv_baseline.pth
+git checkout HEAD -- MahjongAI/agents/transformer_conv.py
+```
+
+**Key metrics to compare** (evaluate both on the same held-out test set):
+- Overall accuracy: Discard / during / post decision accuracy
+- Chi detection accuracy: Specifically test sequential meld decisions (expected improvement)
+- Cross-entropy loss: Lower is better
+
+**Breaking changes summary:**
+- Model checkpoint incompatibility: old trained models cannot be loaded
+- StateNet interface is unchanged (same x1/x2/x3 input/output shapes), so the data pipeline needs no changes
+- Total parameter count remains similar (~0.7M)
+- Training hyperparameters can remain the same
+
+### Implementation Notes
+
+**Conv1d Kernel Size (kernel=3, padding=1)**
+- Kernel size 3 captures 3-tile patterns (e.g., 3-4-5 chi sequences)
+- `padding=1` preserves rank length: 9 ranks → 9 ranks after convolution
+- Can be increased to 5 or 7 for a wider receptive field if needed
+
+**Pooling Choice (global mean pooling over ranks)**
+- Translation invariant: rank pattern 5-6-7 treated same as 1-2-3
+- Could use max pooling or attention pooling for different inductive bias
+
+**Suit Aggregation (mean across 3 suits)**
+- Assumes suit symmetry (Man/Pin/Sou are equivalent), reasonable for Mahjong
+- Could concatenate instead of mean-pool for suit-specific features (48 features instead of 16)
+
+**Count Encoding (cumulative 4-bit, treated as channels)**
+- `[1,1,0,0]` = 2 tiles; K=4 bits treated as feature channels (C*K=12), not a spatial axis
+- Could convert to scalar counts 0–4 for a simpler representation
+
 ## Comparison with Other Variants
 
 This repository contains multiple model variants:
 
 | Model | File | Key Differences |
 |-------|------|-----------------|
-| **TransformerConv** | `transformer_conv.py` | Base hybrid model (this document) |
+| **TransformerConv** | `transformer_conv.py` | Suit-aware hybrid model (this document) |
 | Transformer | `transformer.py` | No CNN - direct state tensor processing |
 | TransformerConvLarge | `transformer_conv_large.py` | Larger embedding dimensions and more layers |
 | TransformerConvOrdered | `transformer_conv_ordered.py` | Ordered player encoding, different masking |
 
 The **TransformerConv** model balances:
-- Architectural complexity (hybrid CNN+Transformer)
+- Architectural complexity (suit-aware CNN+Transformer)
 - Model size (~0.7M params)
 - Training efficiency (single layer)
 - Generalization (relative player encoding)
+- **Semantic alignment** (convolution respects Mahjong tile structure)
 
 ## References and Further Reading
 

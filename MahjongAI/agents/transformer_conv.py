@@ -104,7 +104,7 @@ class TransformerConvModel(nn.Module):
             logits, loss = self.decoder(
                 enc_out, state_obj_tensor_batch, action_mask_batch, y_tensor, head, padding_mask_batch
             )
-            yield logits, loss
+            yield logits, loss, head
 
 
 class Encoder(nn.Module):
@@ -201,7 +201,7 @@ class Encoder(nn.Module):
         type_emb = self.type_embedding(
             adjusted_embedding_type
         )  # Shape: (B, T, EMBD_SIZE)
-        mask = event_type == EventStateTypes.EMPTY
+        mask = event_type != EventStateTypes.EMPTY
         type_emb = type_emb * mask.unsqueeze(-1).float()
 
         # retrieve tile embeddings if event_type is DISCARD or NEW_DORA
@@ -210,8 +210,8 @@ class Encoder(nn.Module):
         tile_emb = self.tile_embedding(
             adjusted_tile_encoding
         )  # Shape: (B, T, EMBD_SIZE)
-        mask = (event_type != EventStateTypes.DISCARD) & (
-            event_type != EventStateTypes.NEW_DORA
+        mask = (event_type == EventStateTypes.DISCARD) | (
+            event_type == EventStateTypes.NEW_DORA
         )
         tile_emb = tile_emb * mask.unsqueeze(-1).float()
 
@@ -219,9 +219,9 @@ class Encoder(nn.Module):
         player_idx = player_idx.to(self.player_coding_table.device)
         player_emb = self.player_coding_table[player_idx]  # Shape: (B, T, EMBD_SIZE)
         mask = (
-            (event_type != EventStateTypes.DISCARD)
-            & (event_type != EventStateTypes.DURING)
-            & (event_type != EventStateTypes.POST)
+            (event_type == EventStateTypes.DISCARD)
+            | (event_type == EventStateTypes.DURING)
+            | (event_type == EventStateTypes.POST)
         ).to(player_emb.device)
         player_emb = player_emb * mask.unsqueeze(-1).float()
         player_emb = player_emb.to(device)
@@ -230,7 +230,7 @@ class Encoder(nn.Module):
         tsumogiri_emb = self.tsumogiri_embedding(
             torch.tensor([0], device=device)
         )  # Shape: (B, T, EMBD_SIZE)
-        mask = (event_type != EventStateTypes.DISCARD) | (tsumogiri == 0)
+        mask = (event_type == EventStateTypes.DISCARD) & (tsumogiri == 1)
         tsumogiri_emb = tsumogiri_emb * mask.unsqueeze(-1).float()
 
         # Retrieve position encodings (shape: (150, EMBD_SIZE)) if embedding type is not EMPTY
@@ -246,7 +246,7 @@ class Encoder(nn.Module):
         during_naki_emb = self.during_naki_embedding(
             adjusted_during_naki_idx
         )  # Shape: (B, T, EMBD_SIZE)
-        mask = (event_type != EventStateTypes.DURING) | (naki_idx < 3)
+        mask = (event_type == EventStateTypes.DURING) & (naki_idx >= 3)
         during_naki_emb = during_naki_emb * mask.unsqueeze(-1).float()
 
         # retrieve post naki encodings if event_type is POST and naki_idx is >= 2
@@ -254,7 +254,7 @@ class Encoder(nn.Module):
         post_naki_emb = self.post_naki_embedding(
             adjusted_post_naki_idx
         )  # Shape: (B, T, EMBD_SIZE)
-        mask = (event_type != EventStateTypes.POST) | (naki_idx < 2)
+        mask = (event_type == EventStateTypes.POST) & (naki_idx >= 2)
         post_naki_emb = post_naki_emb * mask.unsqueeze(-1).float()
 
         x = (
@@ -419,74 +419,120 @@ class StateNet(nn.Module):
     def __init__(self):
         super(StateNet, self).__init__()
 
-        # --- Preprocessing x1 with Conv2d ---
-        # conv2d gets input of shape (batch_size, 3, 37, 4)
-        self.conv2d_x1_1 = nn.Conv2d(
-            in_channels=3, out_channels=8, kernel_size=(3, 3), padding=(1, 1)
-        )  # Output shape: (batch_size, 8, 37, 4)
-        self.conv2d_x1_2 = nn.Conv2d(
-            in_channels=8, out_channels=8, kernel_size=(3, 3), padding=(1, 1)
-        )  # Output shape: (batch_size, 16, 37, 4)
-
+        # Suit-aware convolutions
+        # Input per suit: C*K = 3*4 = 12 channels, R = 9 ranks
+        self.suit_conv1d_1 = nn.Conv1d(
+            in_channels=12, out_channels=16, kernel_size=3, padding=1
+        )
+        self.suit_conv1d_2 = nn.Conv1d(
+            in_channels=16, out_channels=16, kernel_size=3, padding=1
+        )
+        
+        # Honors MLP
+        # Input: C*H*K = 3*7*4 = 84
+        self.honors_fc1 = nn.Linear(84, 32)
+        self.honors_fc2 = nn.Linear(32, 16)
+        
+        # Red fives features
+        # Input: C*S*K = 3*3*4 = 36
+        self.reds_fc = nn.Linear(36, 8)
+        
         self.relu = nn.ReLU()
 
-        # Calculate the actual input size for fc_x1
-        conv_x1_output_size = 8 * 37 * 4  # After second Conv2d
-        raw_x1_output_size = 3 * 37 * 4  # Raw x1 flattened
-        fc_x1_input_size = conv_x1_output_size + raw_x1_output_size
-
-        # Linear layer to process concatenated Conv2d output with raw x1
-        self.fc_x1 = nn.Linear(fc_x1_input_size, 64)
-        self.relu_fc_x1 = nn.ReLU()
-
+        # Calculate combined feature size
+        # Suits: 16 features (after pooling and aggregating S=3)
+        # Honors: 16 features
+        # Reds: 8 features
+        # Raw x1: 3*37*4 = 444
+        suits_features = 16
+        honors_features = 16
+        reds_features = 8
+        raw_x1_features = 3 * 37 * 4
+        
+        combined_features = suits_features + honors_features + reds_features + raw_x1_features
+        
         # Main network to combine with x2 and x3
-        self.fc_main_1 = nn.Linear(64 + 7 * 4 + 4, EMBD_SIZE)  # 64 + 28 + 4 = 96
+        self.fc_main_1 = nn.Linear(combined_features + 7 * 4 + 4, EMBD_SIZE)
         self.fc_main_2 = nn.Linear(EMBD_SIZE, EMBD_SIZE)
         self.relu_fc_main = nn.ReLU()
 
     def forward(self, state_obj):
         x1, x2, x3 = state_obj  # Unpack the tuple
-
-        # --- Conv2d processing of x1 ---
-        # Initial x1 shape: [batch_size, 3, 37, 4]
-        conv_x1 = self.conv2d_x1_1(x1)  # Output shape: [batch_size, 8, 37, 4]
-        conv_x1 = self.relu(conv_x1)
-        conv_x1 = self.conv2d_x1_2(conv_x1)  # Output shape: [batch_size, 16, 37, 4]
-        conv_x1 = self.relu(conv_x1)
-
-        # Flatten Conv2d output
-        conv_x1_flat = conv_x1.view(
-            conv_x1.size(0), -1
-        )  # Shape: [batch_size, 16 * 37 * 4]
-
-        # Flatten raw x1
-        raw_x1_flat = x1.view(x1.size(0), -1)  # Shape: [batch_size, 3 * 37 * 4]
-
-        # Concatenate Conv2d features with raw x1 features
-        x1_combined = torch.cat(
-            [conv_x1_flat, raw_x1_flat], dim=1
-        )  # Shape: [batch_size, conv_x1_output_size + raw_x1_output_size]
-
-        # Pass through Linear layer
-        x1_processed = self.fc_x1(x1_combined)  # Shape: [batch_size, 64]
-        x1_processed = self.relu_fc_x1(x1_processed)  # Apply ReLU activation
-
+        batch_size = x1.size(0)
+        
+        # Initial x1 shape: [batch_size, C=3, T=37, K=4]
+        
+        # --- 1. Process Suits (indices 0-26) ---
+        # Extract Man (0-8), Pin (9-17), Sou (18-26)
+        x1_suits = torch.stack([
+            x1[:, :, 0:9, :],   # Man
+            x1[:, :, 9:18, :],  # Pin
+            x1[:, :, 18:27, :]  # Sou
+        ], dim=1)  # Shape: [B, S=3, C=3, R=9, K=4]
+        
+        # Reshape to [B, S, C*K, R]
+        x1_suits = x1_suits.permute(0, 1, 2, 4, 3).contiguous()  # [B, S, C, K, R]
+        x1_suits = x1_suits.view(batch_size, 3, 12, 9)  # [B, S=3, C*K=12, R=9]
+        
+        # Merge suits into batch for Conv1d: [B*S, C*K, R]
+        x1_suits = x1_suits.view(batch_size * 3, 12, 9)  # [B*3, 12, 9]
+        
+        # Apply Conv1d over rank
+        suits_feat = self.suit_conv1d_1(x1_suits)  # [B*3, 16, 9]
+        suits_feat = self.relu(suits_feat)
+        suits_feat = self.suit_conv1d_2(suits_feat)  # [B*3, 16, 9]
+        suits_feat = self.relu(suits_feat)
+        
+        # Global pooling over rank dimension
+        suits_feat = torch.mean(suits_feat, dim=2)  # [B*3, 16]
+        
+        # Reshape back and aggregate over suits
+        suits_feat = suits_feat.view(batch_size, 3, 16)  # [B, S=3, 16]
+        suits_feat = torch.mean(suits_feat, dim=1)  # [B, 16]
+        
+        # --- 2. Process Honors (indices 27-33) ---
+        x1_honors = x1[:, :, 27:34, :]  # Shape: [B, C=3, H=7, K=4]
+        x1_honors = x1_honors.reshape(batch_size, -1)  # [B, C*H*K=84]
+        
+        honors_feat = self.honors_fc1(x1_honors)  # [B, 32]
+        honors_feat = self.relu(honors_feat)
+        honors_feat = self.honors_fc2(honors_feat)  # [B, 16]
+        honors_feat = self.relu(honors_feat)
+        
+        # --- 3. Process Red Fives (indices 34-36) ---
+        x1_reds = x1[:, :, 34:37, :]  # Shape: [B, C=3, S=3, K=4]
+        x1_reds = x1_reds.reshape(batch_size, -1)  # [B, C*S*K=36]
+        
+        reds_feat = self.reds_fc(x1_reds)  # [B, 8]
+        reds_feat = self.relu(reds_feat)
+        
+        # --- 4. Preserve raw x1 ---
+        raw_x1_flat = x1.view(batch_size, -1)  # [B, 3*37*4=444]
+        
+        # --- 5. Combine all features ---
+        x1_combined = torch.cat([
+            suits_feat,     # [B, 16]
+            honors_feat,    # [B, 16]
+            reds_feat,      # [B, 8]
+            raw_x1_flat     # [B, 444]
+        ], dim=1)  # [B, 484]
+        
         # Flatten x2
         x2_flat = x2.view(x2.size(0), -1)  # Shape: [batch_size, 28]
-
+        
         # x3 remains as [batch_size, 4]
-
+        
         # Concatenate all processed features
         combined = torch.cat(
-            [x1_processed, x2_flat, x3], dim=1
-        )  # Shape: [batch_size, 96]
-
+            [x1_combined, x2_flat, x3], dim=1
+        )  # Shape: [batch_size, 484 + 28 + 4 = 516]
+        
         # Pass through main Linear layer
         x = self.fc_main_1(combined)  # Shape: [batch_size, EMBD_SIZE]
         x = self.relu_fc_main(x)  # Apply ReLU activation
         x = self.fc_main_2(x)
         x = self.relu_fc_main(x)
-
+        
         return x
 
 
@@ -550,6 +596,7 @@ class Head(nn.Module):
         wei = wei.masked_fill(~attn_mask, float('-inf'))
 
         wei = F.softmax(wei, dim=-1)  # [B, Q, T]
+        wei = torch.nan_to_num(wei, nan=0.0)  # Guard: if all positions masked, softmax(-inf,...) = NaN → replace with 0
         wei = self.dropout(wei)  # [B, Q, T]
 
         # Weighted sum of values
@@ -861,23 +908,21 @@ class TransformerTensorProcessor:
             filter_tensor = torch.zeros(71, dtype=torch.float32, device=device)
             filter_tensor[0] = 1.0  # pass
 
-            decision_idx = 0
+            target = 0  # default to pass
 
             for decision_idx, decision_type in enumerate(turn.decisions):
                 if not decision_type:
                     continue
 
-                filter_tensor[0] = 1.0  # pass
-
                 if decision_idx == DECISION_AGARI_IDX:
                     filter_tensor[1] = 1.0
                     if decision_type[0].executed:
-                        decision_idx = 1
+                        target = 1
 
                 elif decision_idx == DECISION_REACH_IDX:
                     filter_tensor[2] = 1.0
                     if decision_type[0].executed:
-                        decision_idx = 2
+                        target = 2
 
                 elif decision_idx == DECISION_NAKI_IDX:
                     for decision in decision_type:
@@ -886,12 +931,12 @@ class TransformerTensorProcessor:
                         idx = meld.get_during_turn_filter_idx()
                         filter_tensor[idx] = 1.0
                         if decision.executed:
-                            decision_idx = idx
+                            target = idx
 
                 else:
                     raise ValueError(f"Invalid decision_idx: {decision_idx}")
 
-            y.append(decision_idx)
+            y.append(target)
             filter_tensors.append(filter_tensor)  # Shape: (71,)
 
         encoding_tokens_batch = (
