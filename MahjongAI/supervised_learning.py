@@ -16,7 +16,7 @@ sys.path.append("..")
 from MahjongAI.agents.transformer_conv import TransformerConvModel
 from MahjongAI.utils.dataloader import DataLoader
 
-eval_interval = 1
+SAVE_EVERY_STEPS = 2000
 learning_rate = 1e-3
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -37,13 +37,13 @@ def find_latest_checkpoint(model_name: str, checkpoint_dir: str) -> Tuple[int, s
     Returns a tuple of (latest_iter, checkpoint_path).
     If no checkpoint is found, returns (0, None).
     """
-    pattern = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_iter_*.pt")
+    pattern = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_step_*.pt")
     checkpoint_files = glob.glob(pattern)
     max_iter = -1
     latest_checkpoint = None
 
     # Updated regex to include model_name
-    regex = rf"model_{re.escape(model_name)}_checkpoint_iter_(\d+)\.pt"
+    regex = rf"model_{re.escape(model_name)}_checkpoint_step_(\d+)\.pt"
 
     for file in checkpoint_files:
         match = re.search(regex, file)
@@ -95,12 +95,20 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
     latest_iter, latest_checkpoint = find_latest_checkpoint(model_name, checkpoint_dir)
 
     if latest_checkpoint:
-        # Load the model state
-        model.load_state_dict(torch.load(latest_checkpoint, map_location=device))
-        log_message(f"Loaded model from {latest_checkpoint}, starting from iter {latest_iter + 1}")
+        checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            current_step = checkpoint.get('current_step', 0)
+            log_message(f"Loaded checkpoint from {latest_checkpoint} — resuming at step {current_step}")
+        else:
+            # Old format: bare model state dict, no optimizer/scheduler state
+            model.load_state_dict(checkpoint)
+            log_message(f"Loaded model (old format) from {latest_checkpoint} — optimizer/scheduler not restored")
         start_iter = latest_iter + 1
     else:
-        log_message("No checkpoint found. Starting training from iter 0.")
+        log_message("No checkpoint found. Starting from scratch.")
         start_iter = 0
 
     # Initialize dataloaders
@@ -120,13 +128,31 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
                 continue
 
             total_loss = sum(loss for _, loss in results.values())
+
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                per_head = {h: f"{loss.item():.4f}" for h, (_, loss) in results.items()}
+                raise RuntimeError(
+                    f"NaN or Inf in total_loss at step {current_step} (per-head: {per_head})"
+                )
+
             optimizer.zero_grad()
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             # Update the scheduler and step counter
             scheduler.step()
             current_step += 1
+
+            if current_step % SAVE_EVERY_STEPS == 0:
+                model_path = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_step_{current_step}.pt")
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'current_step': current_step,
+                }, model_path)
+                log_message(f"Model saved at {model_path}")
 
             batch_losses = {head: loss.item() for head, (_, loss) in results.items()}
 
@@ -152,12 +178,6 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
                 log_message(f"iter {iter} | batch {batch_count} | val {val_str}")
 
         log_message(f"iter {iter} | Processed {repr(train_dataloader)}")
-
-        if (iter + 1) % eval_interval == 0:
-            # Save model checkpoint
-            model_path = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_iter_{iter}.pt")
-            torch.save(model.state_dict(), model_path)
-            log_message(f"Model saved at {model_path}")
 
         train_dataloader.reset()
 
