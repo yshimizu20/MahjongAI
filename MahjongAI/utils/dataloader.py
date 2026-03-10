@@ -8,7 +8,12 @@ from MahjongAI.process_xml import process, InvalidGameException
 class DataLoader:
     def __init__(self, path: str, batch_size: int = 1, log_func: callable = print):
         self.path = path
-        self.file_list = os.listdir(self.path)
+        self.file_list = [
+            os.path.join(dirpath, fname)
+            for dirpath, _, fnames in os.walk(self.path)
+            for fname in fnames
+            if fname.endswith(".log")
+        ]
         self.current_index = 0
         self.batch_size = batch_size
         self.batch_count = 0
@@ -31,9 +36,7 @@ class DataLoader:
             self.current_index += 1
 
             try:
-                all_halfturns, all_encoding_tokens = process(
-                    os.path.join(self.path, filename)
-                )
+                all_halfturns, all_encoding_tokens = process(filename)
             except InvalidGameException as e:
                 # print(f"Invalid game detected: {e.msg}")
                 continue  # Skip to the next file
@@ -48,7 +51,7 @@ class DataLoader:
             all_halfturns_list.append(all_halfturns)
             all_encoding_tokens_list.append(all_encoding_tokens)
 
-        self.log_func(f"{self.__repr__()} - Batch {self.batch_count}")
+        # self.log_func(f"{self.__repr__()} - Batch {self.batch_count}")
 
         return all_halfturns_list, all_encoding_tokens_list
 

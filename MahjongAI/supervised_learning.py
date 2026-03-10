@@ -4,6 +4,10 @@ import sys
 import re
 import glob
 import math
+import cProfile
+import pstats
+import io
+import argparse
 from datetime import datetime
 from typing import Tuple
 
@@ -53,7 +57,7 @@ def find_latest_checkpoint(model_name: str, checkpoint_dir: str) -> Tuple[int, s
         return 0, None
 
 
-def train(model_name: str, max_iters: int, verbose: bool = True):
+def train(model_name: str, max_iters: int, max_batches: int = None, verbose: bool = True):
     # Ensure 'saved_models/' directory exists
     checkpoint_dir = "saved_models"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -134,7 +138,7 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
     # Initialize dataloaders
     train_dataloaders = [
         DataLoader(f"data/processed/{yr}/", batch_size, log_message)
-        for yr in range(2012, 2020)
+        for yr in range(2021, 2022)
     ]
     val_dataloader = DataLoader(
         "data/processed/2021/", batch_size
@@ -150,7 +154,8 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
         for batch_count, (all_halfturns_list, all_encoding_tokens_list) in enumerate(
             train_dataloader
         ):
-            for logits, loss in model(
+            batch_losses = {}
+            for logits, loss, head in model(
                 all_halfturns_list, all_encoding_tokens_list, sample=True
             ):
                 optimizer.zero_grad()
@@ -160,16 +165,24 @@ def train(model_name: str, max_iters: int, verbose: bool = True):
                 # Update the scheduler and step counter
                 scheduler.step()
                 current_step += 1
+                batch_losses[head] = loss.item()
 
                 # Log learning rate every 100,000 steps
                 if current_step % 10000 == 0:
                     current_lr = optimizer.param_groups[0]["lr"]
                     log_message(f"Current learning rate: {current_lr}")
 
+            loss_str = " | ".join(f"{h} {batch_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in batch_losses)
+            log_message(f"iter {iter} | batch {batch_count} | {loss_str}")
+
+            if max_batches is not None and batch_count + 1 >= max_batches:
+                log_message(f"iter {iter} | Stopping after {max_batches} batches.")
+                break
+
             if (batch_count * batch_size) % 1000 < batch_size:
                 val_loss = estimate_loss(val_dataloader, model, batch_size)
                 log_message(
-                    f"iter {iter} | batch {batch_count} | val loss {val_loss} | loss {loss.item()}"
+                    f"iter {iter} | batch {batch_count} | val loss {val_loss:.4f} | {loss_str}"
                 )
 
         log_message(f"iter {iter} | Processed {repr(train_dataloader)}")
@@ -194,7 +207,7 @@ def estimate_loss(val_dataloader: DataLoader, model, batch_size: int):
     num_batches = 0
 
     for batch_count, (all_halfturns, all_encoding_tokens) in enumerate(val_dataloader):
-        for logits, loss in model(all_halfturns, all_encoding_tokens, sample=False):
+        for logits, loss, head in model(all_halfturns, all_encoding_tokens, sample=False):
             total_loss += loss.item()
             num_batches += 1
 
@@ -216,14 +229,7 @@ def log_message(message: str):
 
 
 if __name__ == "__main__":
-    # Check if two arguments are provided: model_name (string) and max_iters (integer)
-    if len(sys.argv) != 3:
-        raise ValueError(
-            "Usage: `python3 supervised_learning.py <model_name> <max_iters>`"
-        )
-
-    model_name = sys.argv[1]
-    assert model_name in [
+    valid_models = [
         "transformer",
         "transformer_conv",
         "transformer_conv_large",
@@ -233,13 +239,58 @@ if __name__ == "__main__":
         "transformer_conv_ordered_large_3",
         "transformer_conv_ordered_large_4",
         "transformer_conv_ordered_large_5",
-    ], f"Model {model_name} not implemented."
+    ]
 
-    try:
-        max_iters = int(sys.argv[2])
-    except ValueError:
-        raise ValueError("Please provide the number of iterations as an integer.")
+    parser = argparse.ArgumentParser(description="Train a MahjongAI model.")
+    parser.add_argument("model_name", choices=valid_models, help="Model to train.")
+    parser.add_argument("max_iters", type=int, help="Number of dataset iterations.")
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Stop each iter after N batches (useful for profiling/debugging).",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Run under cProfile and print the top-50 slowest calls on exit.",
+    )
+    parser.add_argument(
+        "--profile-out",
+        default=None,
+        metavar="FILE",
+        help="Save raw cProfile stats to FILE (e.g. profile.out) for later analysis with snakeviz.",
+    )
+    args = parser.parse_args()
 
-    log_message(f"Training {model_name} for {max_iters} iterations")
+    log_message(
+        f"Training {args.model_name} for {args.max_iters} iters"
+        + (f", max {args.max_batches} batches/iter" if args.max_batches else "")
+        + (" [profiling on]" if args.profile else "")
+    )
 
-    train(model_name, max_iters)
+    def _run():
+        train(args.model_name, args.max_iters, max_batches=args.max_batches)
+
+    if args.profile:
+        pr = cProfile.Profile()
+        pr.enable()
+        _run()
+        pr.disable()
+
+        # Print top-50 functions by cumulative time
+        buf = io.StringIO()
+        ps = pstats.Stats(pr, stream=buf).sort_stats("cumulative")
+        ps.print_stats(50)
+        profile_report = buf.getvalue()
+        print(profile_report)
+        with open(log_file, "a") as f:
+            f.write("\n=== cProfile report ===\n")
+            f.write(profile_report)
+
+        if args.profile_out:
+            pr.dump_stats(args.profile_out)
+            log_message(f"cProfile stats saved to {args.profile_out}")
+    else:
+        _run()

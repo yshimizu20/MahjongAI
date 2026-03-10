@@ -52,9 +52,7 @@ def process(file_path: str, verbose: bool = False):
         parent = kyoku_init_state["attr"]["oya"]
         parent_tensor = np.zeros(4, dtype=np.float32)
         parent_tensor[int(parent)] = 1.0
-        curr_round, honba, kyotaku, _, _, dora = list(
-            map(int, kyoku_init_state["attr"]["seed"].split(","))
-        )
+        curr_round, honba, kyotaku, _, _, dora = list(map(int, kyoku_init_state["attr"]["seed"].split(",")))
         doras = [dora]
         rounds_remaining = gameinfo.n_rounds() - int(curr_round)
         parent_rounds_remaining = [(rounds_remaining + i) // 4 for i in range(4)]
@@ -62,8 +60,7 @@ def process(file_path: str, verbose: bool = False):
 
         # create state object tensors
         hand_indices = [
-            list(map(int, kyoku_init_state["attr"][f"hai{player}"].split(",")))
-            for player in range(4)
+            list(map(int, kyoku_init_state["attr"][f"hai{player}"].split(","))) for player in range(4)
         ]  # 0 - 135
         remaining_tiles = REMAINING_TILES.copy()
         remaining_tiles_pov = [REMAINING_TILES.copy() for _ in range(4)]
@@ -82,9 +79,7 @@ def process(file_path: str, verbose: bool = False):
         for pov in remaining_tiles_pov:
             pov[TILE2IDX[int(dora)]] -= 1
 
-        hand_tensors_full = copy.deepcopy(
-            hand_tensors
-        )  # hand info including all melded tiles
+        hand_tensors_full = copy.deepcopy(hand_tensors)  # hand info including all melded tiles
 
         hands = np.zeros((4, 136), dtype=np.float32)
         player_indices = np.arange(4)[:, np.newaxis]
@@ -178,10 +173,7 @@ def process(file_path: str, verbose: bool = False):
 
                     for decision in curr_halfturn.decisions[DECISION_NAKI_IDX]:
                         assert isinstance(decision, NakiDecision)
-                        if (
-                            decision.naki.convenient_naki_code
-                            == naki.convenient_naki_code
-                        ):
+                        if decision.naki.convenient_naki_code == naki.convenient_naki_code:
                             decision.executed = True
                             break
 
@@ -192,10 +184,7 @@ def process(file_path: str, verbose: bool = False):
                         for decision in lst[DECISION_NAKI_IDX]:
                             assert isinstance(decision, NakiDecision)
                             # TODO: check if this is correct
-                            if (
-                                decision.naki.convenient_naki_code
-                                == naki.convenient_naki_code
-                            ):
+                            if decision.naki.convenient_naki_code == naki.convenient_naki_code:
                                 decision.executed = True
                                 break
 
@@ -222,11 +211,11 @@ def process(file_path: str, verbose: bool = False):
 
                 stateObj = StateObject(
                     remaining_turns=remaining_tsumo,
-                    hand_tensor=hand_tensors[player],
+                    hand_tensor=hand_tensors[player].copy(),
                     remaining_tiles=remaining_tiles,
                     remaining_tiles_pov=remaining_tiles_pov[player][:],
                     sutehai_tensors=np.copy(sutehai_tensors),
-                    is_menzen=is_menzen,
+                    is_menzen=is_menzen[:],
                     double_reaches=double_reaches,
                     reaches=reaches,  # share same reach list
                     ippatsu=ippatsu,  # share same ippatsu list
@@ -281,9 +270,7 @@ def process(file_path: str, verbose: bool = False):
 
                     for decision in decisions:
                         if decision is not None:
-                            new_post_decisions[decision.player][
-                                DECISION_AGARI_IDX
-                            ].append(decision)
+                            new_post_decisions[decision.player][DECISION_AGARI_IDX].append(decision)
 
                     curr_halfturn = PostTurn(
                         player=player,
@@ -349,9 +336,7 @@ def process(file_path: str, verbose: bool = False):
                 # check if reach is possible
                 reach_decisions = []
                 if not reaches[player] and is_menzen[player]:
-                    shanten = shanten_solver.calculate_shanten(
-                        hand_tensors[player][:34]
-                    )
+                    shanten = shanten_solver.calculate_shanten(hand_tensors[player][:34])
                     if shanten <= 0:
                         reach_decisions.append(ReachDecision(player, executed=False))
 
@@ -359,9 +344,7 @@ def process(file_path: str, verbose: bool = False):
                 naki_decisions = []
                 # check if ankan is possible
                 for i in np.where(hand_tensors[player] == 4.0)[0]:
-                    naki_decisions.append(
-                        NakiDecision(player, Naki.from_ankan_info(i), executed=False)
-                    )
+                    naki_decisions.append(NakiDecision(player, Naki.from_ankan_info(i), executed=False))
 
                 # check if kakan is possible
                 for meld in melds[player]:
@@ -371,9 +354,7 @@ def process(file_path: str, verbose: bool = False):
                             naki_decisions.append(
                                 NakiDecision(
                                     player,
-                                    Naki.from_kakan_info(
-                                        9 * color + number, 0
-                                    ),  # TODO get accurate "which" value
+                                    Naki.from_kakan_info(9 * color + number, 0),  # TODO get accurate "which" value
                                     executed=False,
                                 )
                             )
@@ -386,11 +367,11 @@ def process(file_path: str, verbose: bool = False):
 
                 stateObj = StateObject(
                     remaining_turns=remaining_tsumo,
-                    hand_tensor=hand_tensors[player],
+                    hand_tensor=hand_tensors[player].copy(),
                     remaining_tiles=remaining_tiles,
                     remaining_tiles_pov=remaining_tiles_pov[player][:],
                     sutehai_tensors=np.copy(sutehai_tensors),
-                    is_menzen=is_menzen,
+                    is_menzen=is_menzen[:],
                     double_reaches=double_reaches,
                     reaches=reaches,  # share same reach list
                     ippatsu=ippatsu,  # share same ippatsu list
@@ -443,9 +424,7 @@ def process(file_path: str, verbose: bool = False):
                 hands[player, tile] = 0.0
                 hand_tensors[player][tile_idx] -= 1.0
                 hand_tensors_full[player][tile_idx] -= 1.0
-                assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[
-                    player
-                ].sum()
+                assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[player].sum()
                 sutehai_tensors[player, tile_idx] = 1.0
 
                 for pov in remaining_tiles_pov:
@@ -467,10 +446,7 @@ def process(file_path: str, verbose: bool = False):
                     is_chankan=False,
                     is_haitei=(remaining_tsumo == 0),
                     double_reaches=double_reaches,
-                    is_renhou=[
-                        (cycles <= 3 and player >= cycles and min(is_menzen))
-                        for _ in range(4)
-                    ],
+                    is_renhou=[(cycles <= 3 and player >= cycles and min(is_menzen)) for _ in range(4)],
                     player_wind=roundinfo.player_wind,
                     round_wind=roundinfo.round_wind,
                     kyotaku=kyotaku,
@@ -481,9 +457,7 @@ def process(file_path: str, verbose: bool = False):
                     if ron is not None:
                         post_decisions[ron.player][DECISION_AGARI_IDX].append(ron)
 
-                naki_decisions = decision_mask(
-                    player, hand_tensors, tile_idx[0], len(tile_idx) == 2
-                )
+                naki_decisions = decision_mask(player, hand_tensors, tile_idx[0], len(tile_idx) == 2)
 
                 for p, decision_lst in enumerate(naki_decisions):
                     if p == player:
@@ -500,9 +474,7 @@ def process(file_path: str, verbose: bool = False):
                 halfturns.append(half_turn)
                 curr_halfturn = half_turn  # carry over
 
-                encoding_tokens.append(
-                    discard2idx(player, tile_idx[0], tile == acquired)
-                )
+                encoding_tokens.append(discard2idx(player, tile_idx[0], tile == acquired))
                 acquired = None
 
             elif eventtype == "AGARI" or eventtype == "RYUUKYOKU":
@@ -519,15 +491,11 @@ def process(file_path: str, verbose: bool = False):
             assert event["event"] in ["AGARI", "RYUUKYOKU"]
 
             if event["event"] == "AGARI":
-                result.append(
-                    AgariResult(list(map(int, event["attr"]["sc"].split(","))))
-                )
+                result.append(AgariResult(list(map(int, event["attr"]["sc"].split(",")))))
                 # TODO: make decision executed = True
 
             elif event["event"] == "RYUUKYOKU":
-                result.append(
-                    RyukyokuResult(list(map(int, event["attr"]["sc"].split(","))))
-                )
+                result.append(RyukyokuResult(list(map(int, event["attr"]["sc"].split(",")))))
 
         if verbose:
             print(f"len(turns): {len(turns)}")
@@ -593,13 +561,7 @@ def _get_rounds(file_path: str):
 
 def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):
     assert 0 <= tile_idx < 37
-    return (
-        EventStateTypes.DISCARD << 13
-        | EventTypes.DISCARD << 10
-        | who << 8
-        | int(is_tsumogiri) << 7
-        | tile_idx
-    )
+    return EventStateTypes.DISCARD << 13 | EventTypes.DISCARD << 10 | who << 8 | int(is_tsumogiri) << 7 | tile_idx
 
 
 def naki2idx(who: int, naki: Naki):
@@ -608,44 +570,19 @@ def naki2idx(who: int, naki: Naki):
 
     if naki.is_chi():
         post_turn_filter_idx = naki.get_post_turn_filter_idx()
-        embd_token = (
-            EventStateTypes.POST << 13
-            | EventTypes.NAKI << 10
-            | who << 8
-            | post_turn_filter_idx
-        )
+        embd_token = EventStateTypes.POST << 13 | EventTypes.NAKI << 10 | who << 8 | post_turn_filter_idx
     elif naki.is_pon():
         post_turn_filter_idx = naki.get_post_turn_filter_idx()
-        embd_token = (
-            EventStateTypes.POST << 13
-            | EventTypes.NAKI << 10
-            | who << 8
-            | post_turn_filter_idx
-        )
+        embd_token = EventStateTypes.POST << 13 | EventTypes.NAKI << 10 | who << 8 | post_turn_filter_idx
     elif naki.is_kakan():
         during_turn_filter_idx = naki.get_during_turn_filter_idx()
-        embd_token = (
-            EventStateTypes.DURING << 13
-            | EventTypes.NAKI << 10
-            | who << 8
-            | during_turn_filter_idx
-        )
+        embd_token = EventStateTypes.DURING << 13 | EventTypes.NAKI << 10 | who << 8 | during_turn_filter_idx
     elif naki.is_minkan():
         post_turn_filter_idx = naki.get_post_turn_filter_idx()
-        embd_token = (
-            EventStateTypes.POST << 13
-            | EventTypes.NAKI << 10
-            | who << 8
-            | post_turn_filter_idx
-        )
+        embd_token = EventStateTypes.POST << 13 | EventTypes.NAKI << 10 | who << 8 | post_turn_filter_idx
     elif naki.is_ankan():
         during_turn_filter_idx = naki.get_during_turn_filter_idx()
-        embd_token = (
-            EventStateTypes.DURING << 13
-            | EventTypes.NAKI << 10
-            | who << 8
-            | during_turn_filter_idx
-        )
+        embd_token = EventStateTypes.DURING << 13 | EventTypes.NAKI << 10 | who << 8 | during_turn_filter_idx
     else:
         raise ValueError("Invalid naki code")
 
