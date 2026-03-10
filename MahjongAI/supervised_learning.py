@@ -13,10 +13,7 @@ from typing import Tuple
 
 sys.path.append("..")
 
-from MahjongAI.agents.archive.transformer import TransformerModel
 from MahjongAI.agents.transformer_conv import TransformerConvModel
-from MahjongAI.agents.transformer_conv_large import TransformerConvLargeModel
-from MahjongAI.agents.transformer_conv_ordered import TransformerConvOrderedModel
 from MahjongAI.utils.dataloader import DataLoader
 
 eval_interval = 1
@@ -63,33 +60,9 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Initialize model
-    if model_name == "transformer":
-        model = TransformerModel().to(device)
-        batch_size = 5
-    elif model_name == "transformer_conv":
+    if model_name == "transformer_conv":
         model = TransformerConvModel().to(device)
         batch_size = 5
-    elif model_name == "transformer_conv_large":
-        model = TransformerConvLargeModel(2).to(device)
-        batch_size = 2
-    elif model_name == "transformer_conv_large_3":
-        model = TransformerConvLargeModel(3).to(device)
-        batch_size = 2
-    elif model_name == "transformer_conv_ordered":
-        model = TransformerConvOrderedModel(1).to(device)
-        batch_size = 4
-    elif model_name == "transformer_conv_ordered_large_2":
-        model = TransformerConvOrderedModel(2).to(device)
-        batch_size = 2
-    elif model_name == "transformer_conv_ordered_large_3":
-        model = TransformerConvOrderedModel(3).to(device)
-        batch_size = 2
-    elif model_name == "transformer_conv_ordered_large_4":
-        model = TransformerConvOrderedModel(4).to(device)
-        batch_size = 1
-    elif model_name == "transformer_conv_ordered_large_5":
-        model = TransformerConvOrderedModel(5).to(device)
-        batch_size = 1
     else:
         raise NotImplementedError(f"Model {model_name} not implemented.")
 
@@ -180,10 +153,9 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
                 break
 
             if (batch_count * batch_size) % 1000 < batch_size:
-                val_loss = estimate_loss(val_dataloader, model, batch_size)
-                log_message(
-                    f"iter {iter} | batch {batch_count} | val loss {val_loss:.4f} | {loss_str}"
-                )
+                val_losses = estimate_loss(val_dataloader, model, batch_size)
+                val_str = " | ".join(f"{h} {val_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in val_losses)
+                log_message(f"iter {iter} | batch {batch_count} | val {val_str}")
 
         log_message(f"iter {iter} | Processed {repr(train_dataloader)}")
 
@@ -203,13 +175,13 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
 @torch.no_grad()
 def estimate_loss(val_dataloader: DataLoader, model, batch_size: int):
     model.eval()  # Set model to evaluation mode
-    total_loss = 0
-    num_batches = 0
+    head_totals = {}
+    head_counts = {}
 
     for batch_count, (all_halfturns, all_encoding_tokens) in enumerate(val_dataloader):
         for logits, loss, head in model(all_halfturns, all_encoding_tokens, sample=False):
-            total_loss += loss.item()
-            num_batches += 1
+            head_totals[head] = head_totals.get(head, 0.0) + loss.item()
+            head_counts[head] = head_counts.get(head, 0) + 1
 
         if batch_count * batch_size >= 20:
             break
@@ -217,7 +189,7 @@ def estimate_loss(val_dataloader: DataLoader, model, batch_size: int):
     val_dataloader.reset()
 
     model.train()  # Return model to training mode
-    return total_loss / num_batches  # Average validation loss
+    return {h: head_totals[h] / head_counts[h] for h in head_totals}
 
 
 def log_message(message: str):
