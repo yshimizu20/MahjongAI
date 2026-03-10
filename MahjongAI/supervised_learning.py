@@ -13,7 +13,7 @@ from typing import Tuple
 
 sys.path.append("..")
 
-from MahjongAI.agents.transformer import TransformerModel
+from MahjongAI.agents.archive.transformer import TransformerModel
 from MahjongAI.agents.transformer_conv import TransformerConvModel
 from MahjongAI.agents.transformer_conv_large import TransformerConvLargeModel
 from MahjongAI.agents.transformer_conv_ordered import TransformerConvOrderedModel
