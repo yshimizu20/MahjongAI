@@ -61,3 +61,41 @@ class DataLoader:
 
     def __repr__(self):
         return f"DataLoader(path={self.path}, batch_size={self.batch_size})"
+
+
+class DataLoaderCluster:
+    """Cycles through a list of DataLoaders indefinitely.
+
+    When a DataLoader is exhausted, it is reset and the cluster advances
+    to the next one. When all DataLoaders are exhausted, it wraps back
+    to the first, so __next__ never raises StopIteration — unless every
+    single DataLoader is empty, in which case a RuntimeError is raised
+    immediately to avoid an infinite spin.
+    """
+
+    def __init__(self, dataloaders: list):
+        self.dataloaders = dataloaders
+        self.idx = 0
+        # Warn early if any loader found no files.
+        for dl in dataloaders:
+            if not dl.file_list:
+                print(f"WARNING: DataLoader for path '{dl.path}' found no .log files.")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # Allow at most one full cycle through all loaders without returning data.
+        # If every loader raises StopIteration on the first call, all are empty.
+        attempts = 0
+        while attempts < len(self.dataloaders):
+            try:
+                return next(self.dataloaders[self.idx])
+            except StopIteration:
+                self.dataloaders[self.idx].reset()
+                self.idx = (self.idx + 1) % len(self.dataloaders)
+                attempts += 1
+        raise RuntimeError(
+            "DataLoaderCluster: all dataloaders are empty. "
+            "Check that your data paths exist and contain .log files."
+        )

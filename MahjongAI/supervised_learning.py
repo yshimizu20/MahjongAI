@@ -8,15 +8,21 @@ import cProfile
 import pstats
 import io
 import argparse
+import pathlib
 from datetime import datetime
 from typing import Tuple
+
+# Root of the MahjongAI package — so paths resolve correctly regardless of
+# which directory the script is invoked from.
+_PACKAGE_DIR = pathlib.Path(__file__).parent
 
 sys.path.append("..")
 
 from MahjongAI.agents.transformer_conv import TransformerConvModel
-from MahjongAI.utils.dataloader import DataLoader
+from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster
 
 SAVE_EVERY_STEPS = 2000
+EVAL_EVERY_STEPS = 100
 learning_rate = 1e-3
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -34,32 +40,31 @@ with open(log_file, "w") as f:
 def find_latest_checkpoint(model_name: str, checkpoint_dir: str) -> Tuple[int, str]:
     """
     Finds the latest checkpoint in the given directory.
-    Returns a tuple of (latest_iter, checkpoint_path).
+    Returns a tuple of (latest_step, checkpoint_path).
     If no checkpoint is found, returns (0, None).
     """
     pattern = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_step_*.pt")
     checkpoint_files = glob.glob(pattern)
-    max_iter = -1
+    max_step = -1
     latest_checkpoint = None
 
-    # Updated regex to include model_name
     regex = rf"model_{re.escape(model_name)}_checkpoint_step_(\d+)\.pt"
 
     for file in checkpoint_files:
         match = re.search(regex, file)
         if match:
-            iter_num = int(match.group(1))
-            if iter_num > max_iter:
-                max_iter = iter_num
+            step_num = int(match.group(1))
+            if step_num > max_step:
+                max_step = step_num
                 latest_checkpoint = file
 
     if latest_checkpoint:
-        return max_iter, latest_checkpoint
+        return max_step, latest_checkpoint
     else:
         return 0, None
 
 
-def train(model_name: str, max_iters: int, max_batches: int = None, verbose: bool = True):
+def train(model_name: str, total_steps: int):
     # Ensure 'saved_models/' directory exists
     checkpoint_dir = "saved_models"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -75,8 +80,8 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
     # Define learning rate scheduler parameters
-    warmup_steps = 1000  # 0.1% of 1,000,000
-    total_steps = 1000000  # Total training steps
+    warmup_steps = 1000
+    lr_total_steps = 1000000
 
     # Initialize the scheduler with a linear warmup and cosine decay
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -84,7 +89,7 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
         lr_lambda=lambda step: (
             float(step) / float(max(1, warmup_steps))
             if step < warmup_steps
-            else 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / float(max(1, total_steps - warmup_steps))))
+            else 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / float(max(1, lr_total_steps - warmup_steps))))
         ),
     )
 
@@ -92,7 +97,7 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
     current_step = 0
 
     # Find latest checkpoint
-    latest_iter, latest_checkpoint = find_latest_checkpoint(model_name, checkpoint_dir)
+    latest_step, latest_checkpoint = find_latest_checkpoint(model_name, checkpoint_dir)
 
     if latest_checkpoint:
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=True)
@@ -106,80 +111,67 @@ def train(model_name: str, max_iters: int, max_batches: int = None, verbose: boo
             # Old format: bare model state dict, no optimizer/scheduler state
             model.load_state_dict(checkpoint)
             log_message(f"Loaded model (old format) from {latest_checkpoint} — optimizer/scheduler not restored")
-        start_iter = latest_iter + 1
     else:
         log_message("No checkpoint found. Starting from scratch.")
-        start_iter = 0
 
-    # Initialize dataloaders
-    train_dataloaders = [DataLoader(f"data/processed/{yr}/", batch_size, log_message) for yr in range(2021, 2022)]
-    val_dataloader = DataLoader("data/processed/2021/", batch_size)  # Validation DataLoader
+    # Initialize dataloaders — paths are anchored to the package directory so
+    # the script works correctly from any working directory.
+    dataloaders = [
+        DataLoader(str(_PACKAGE_DIR / "data" / "processed" / str(yr)), batch_size, log_message)
+        for yr in range(2021, 2022)
+    ]
+    cluster = DataLoaderCluster(dataloaders)
+    val_dataloader = DataLoader(str(_PACKAGE_DIR / "data" / "processed" / "2021"), batch_size)
 
-    for iter in range(start_iter, start_iter + max_iters):
-        log_message(f"iter {iter}")
+    for step in range(current_step, total_steps):
+        games, tokens = next(cluster)
+        results = model(games, tokens, sample=True)
+        if not results:
+            continue
 
-        # Select dataloader in a round-robin fashion
-        train_dataloader = train_dataloaders[iter % len(train_dataloaders)]
-        log_message(f"iter {iter} | Loading {repr(train_dataloader)}")
+        total_loss = sum(loss for _, loss in results.values())
 
-        for batch_count, (all_halfturns_list, all_encoding_tokens_list) in enumerate(train_dataloader):
-            results = model(all_halfturns_list, all_encoding_tokens_list, sample=True)
-            if not results:
-                continue
-
-            total_loss = sum(loss for _, loss in results.values())
-
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
-                per_head = {h: f"{loss.item():.4f}" for h, (_, loss) in results.items()}
-                raise RuntimeError(
-                    f"NaN or Inf in total_loss at step {current_step} (per-head: {per_head})"
-                )
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            # Update the scheduler and step counter
-            scheduler.step()
-            current_step += 1
-
-            if current_step % SAVE_EVERY_STEPS == 0:
-                model_path = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_step_{current_step}.pt")
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'current_step': current_step,
-                }, model_path)
-                log_message(f"Model saved at {model_path}")
-
-            batch_losses = {head: loss.item() for head, (_, loss) in results.items()}
-
-            # Log learning rate every 100,000 steps
-            if current_step % 10000 == 0:
-                current_lr = optimizer.param_groups[0]["lr"]
-                log_message(f"Current learning rate: {current_lr}")
-
-            loss_str = " | ".join(
-                f"{h} {batch_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in batch_losses
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            per_head = {h: f"{loss.item():.4f}" for h, (_, loss) in results.items()}
+            raise RuntimeError(
+                f"NaN or Inf in total_loss at step {step} (per-head: {per_head})"
             )
-            log_message(f"iter {iter} | batch {batch_count} | {loss_str}")
 
-            if max_batches is not None and batch_count + 1 >= max_batches:
-                log_message(f"iter {iter} | Stopping after {max_batches} batches.")
-                break
+        optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
-            if (batch_count * batch_size) % 1000 < batch_size:
-                val_losses = estimate_loss(val_dataloader, model, batch_size)
-                val_str = " | ".join(
-                    f"{h} {val_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in val_losses
-                )
-                log_message(f"iter {iter} | batch {batch_count} | val {val_str}")
+        scheduler.step()
+        current_step += 1
 
-        log_message(f"iter {iter} | Processed {repr(train_dataloader)}")
+        if current_step % SAVE_EVERY_STEPS == 0:
+            model_path = os.path.join(checkpoint_dir, f"model_{model_name}_checkpoint_step_{current_step}.pt")
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'current_step': current_step,
+            }, model_path)
+            log_message(f"Model saved at {model_path}")
 
-        train_dataloader.reset()
+        batch_losses = {head: loss.item() for head, (_, loss) in results.items()}
+
+        if current_step % 10000 == 0:
+            current_lr = optimizer.param_groups[0]["lr"]
+            log_message(f"Current learning rate: {current_lr}")
+
+        loss_str = " | ".join(
+            f"{h} {batch_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in batch_losses
+        )
+        log_message(f"step {step} | {loss_str}")
+
+        if step % EVAL_EVERY_STEPS == 0:
+            val_losses = estimate_loss(val_dataloader, model, batch_size)
+            val_str = " | ".join(
+                f"{h} {val_losses[h]:.4f}" for h in ["during", "discard", "post"] if h in val_losses
+            )
+            log_message(f"step {step} | val {val_str}")
 
     log_message("Training completed.")
 
@@ -220,14 +212,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train a MahjongAI model.")
     parser.add_argument("model_name", choices=valid_models, help="Model to train.")
-    parser.add_argument("max_iters", type=int, help="Number of dataset iterations.")
-    parser.add_argument(
-        "--max-batches",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Stop each iter after N batches (useful for profiling/debugging).",
-    )
+    parser.add_argument("max_steps", type=int, help="Total number of training steps.")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -242,13 +227,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     log_message(
-        f"Training {args.model_name} for {args.max_iters} iters"
-        + (f", max {args.max_batches} batches/iter" if args.max_batches else "")
+        f"Training {args.model_name} for {args.max_steps} steps"
         + (" [profiling on]" if args.profile else "")
     )
 
     def _run():
-        train(args.model_name, args.max_iters, max_batches=args.max_batches)
+        train(args.model_name, args.max_steps)
 
     if args.profile:
         pr = cProfile.Profile()
