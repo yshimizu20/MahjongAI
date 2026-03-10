@@ -539,9 +539,15 @@ class StateNet(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, EMBD_SIZE)
+        self.num_heads = num_heads
+        self.head_size = head_size
+        # Fused projections for all heads at once
+        self.key_proj = nn.Linear(EMBD_SIZE, num_heads * head_size, bias=True)
+        self.query_proj = nn.Linear(EMBD_SIZE, num_heads * head_size, bias=True)
+        self.value_proj = nn.Linear(EMBD_SIZE, num_heads * head_size, bias=True)
+        self.proj = nn.Linear(num_heads * head_size, EMBD_SIZE)
         self.dropout = nn.Dropout(DROPOUT_RATIO)
+        self.attn_dropout_p = DROPOUT_RATIO
 
     def forward(self, k, v, q, attn_mask):
         """
@@ -549,60 +555,34 @@ class MultiHeadAttention(nn.Module):
             k: Key tensor of shape [B, T, EMBD_SIZE]
             v: Value tensor of shape [B, T, EMBD_SIZE]
             q: Query tensor of shape [B, Q, EMBD_SIZE]
-            attn_mask: Optional boolean tensor of shape [B, 1, T] or broadcastable.
+            attn_mask: Optional boolean tensor of shape [B, 1, T].
                        True = keep (valid position), False = mask out (padded position)
         """
-        head_outputs = [head(k, v, q, attn_mask) for head in self.heads]  # Each [B, Q, head_size]
-        out = torch.cat(head_outputs, dim=-1)  # [B, Q, head_size * num_heads]
-        out = self.proj(out)  # [B, Q, EMBD_SIZE]
-        out = self.dropout(out)  # [B, Q, EMBD_SIZE]
+        B, T, _ = k.shape
+        Q = q.shape[1]
+        H, HS = self.num_heads, self.head_size
+
+        # Project all heads in one matmul, then split into heads
+        k = self.key_proj(k).view(B, T, H, HS).transpose(1, 2)    # [B, H, T, HS]
+        v = self.value_proj(v).view(B, T, H, HS).transpose(1, 2)  # [B, H, T, HS]
+        q = self.query_proj(q).view(B, Q, H, HS).transpose(1, 2)  # [B, H, Q, HS]
+
+        # Expand mask for heads: [B, 1, T] → [B, 1, 1, T] (broadcasts over H and Q)
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(1)  # [B, 1, 1, T]
+
+        dropout_p = self.attn_dropout_p if self.training else 0.0
+        # scaled_dot_product_attention: boolean mask True=attend matches our convention
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        # out: [B, H, Q, HS]
+
+        # Guard: fully-masked positions produce NaN (same as original nan_to_num guard)
+        out = torch.nan_to_num(out, nan=0.0)
+
+        out = out.transpose(1, 2).contiguous().view(B, Q, H * HS)  # [B, Q, H*HS]
+        out = self.proj(out)
+        out = self.dropout(out)
         return out  # [B, Q, EMBD_SIZE]
-
-
-class Head(nn.Module):
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(EMBD_SIZE, head_size, bias=True)
-        self.query = nn.Linear(EMBD_SIZE, head_size, bias=True)
-        self.value = nn.Linear(EMBD_SIZE, head_size, bias=True)
-        self.dropout = nn.Dropout(DROPOUT_RATIO)
-
-    def forward(self, k, v, q, attn_mask):
-        """
-        Args:
-            k: Key tensor of shape [B, T, EMBD_SIZE]
-            v: Value tensor of shape [B, T, EMBD_SIZE]
-            q: Query tensor of shape [B, Q, EMBD_SIZE]
-               - Q can be 1 (for cross-attention) or T (for self-attention)
-            attn_mask: Optional boolean tensor of shape [B, 1, T] or broadcastable.
-                       True = keep (valid position), False = mask out (padded position)
-
-        Returns:
-            out: Tensor of shape [B, Q, head_size]
-        """
-        k = self.key(k)  # [B, T, head_size]
-        q = self.query(q)  # [B, Q, head_size]
-        v = self.value(v)  # [B, T, head_size]
-
-        # Transpose k for batched matrix multiplication
-        k_transposed = k.transpose(1, 2)  # [B, head_size, T]
-
-        # Compute attention scores
-        wei = torch.bmm(q, k_transposed)  # [B, Q, T]
-        wei = wei / (k.size(-1) ** 0.5)  # Scaling
-
-        # Apply attention mask: mask out padded positions with -inf
-        # attn_mask is boolean with True = keep, False = mask
-        wei = wei.masked_fill(~attn_mask, float('-inf'))
-
-        wei = F.softmax(wei, dim=-1)  # [B, Q, T]
-        wei = torch.nan_to_num(wei, nan=0.0)  # Guard: if all positions masked, softmax(-inf,...) = NaN → replace with 0
-        wei = self.dropout(wei)  # [B, Q, T]
-
-        # Weighted sum of values
-        out = torch.bmm(wei, v)  # [B, Q, head_size]
-
-        return out  # [B, Q, head_size]
 
 
 class FeedForward(nn.Module):
