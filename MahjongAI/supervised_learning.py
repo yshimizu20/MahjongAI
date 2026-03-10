@@ -233,12 +233,7 @@ if __name__ == "__main__":
         "transformer",
         "transformer_conv",
         "transformer_conv_large",
-        "transformer_conv_large_3",
         "transformer_conv_ordered",
-        "transformer_conv_ordered_large_2",
-        "transformer_conv_ordered_large_3",
-        "transformer_conv_ordered_large_4",
-        "transformer_conv_ordered_large_5",
     ]
 
     parser = argparse.ArgumentParser(description="Train a MahjongAI model.")
