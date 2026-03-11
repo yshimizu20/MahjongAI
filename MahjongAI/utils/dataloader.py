@@ -8,12 +8,12 @@ from MahjongAI.process_xml import process, InvalidGameException
 class DataLoader:
     def __init__(self, path: str, batch_size: int = 1, log_func: callable = print):
         self.path = path
-        self.file_list = [
+        self.file_list = sorted(
             os.path.join(dirpath, fname)
             for dirpath, _, fnames in os.walk(self.path)
             for fname in fnames
             if fname.endswith(".log")
-        ]
+        )
         self.current_index = 0
         self.batch_size = batch_size
         self.batch_count = 0

@@ -39,7 +39,8 @@ else:
 class EncoderConvModel(nn.Module):
     def __init__(self, n_layers=N_LAYERS, verbose=True):
         super().__init__()
-        self.encoder = Encoder(n_layers=n_layers)
+        self.token_embedder = TokenEmbedder()
+        self.blocks = nn.Sequential(*[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)])
         self.state_net = StateNet()
         self.ln_f = nn.LayerNorm(EMBD_SIZE)
         self.discard_head = nn.Linear(EMBD_SIZE, DISCARD_ACTION_DIM)
@@ -61,31 +62,35 @@ class EncoderConvModel(nn.Module):
         def count(module):
             return sum(p.numel() for p in module.parameters())
 
-        enc = self.encoder
+        te = self.token_embedder
         sn = self.state_net
 
         print("\n" + "=" * 70)
         print("ENCODER-ONLY (EARLY FUSION) MODEL CONFIGURATION")
         print("=" * 70)
-        n_layers = len(enc.blocks)
+        n_layers = len(self.blocks)
         print(f"  EMBD_SIZE={EMBD_SIZE}, N_HEADS={N_HEADS}, N_LAYERS={n_layers}")
         print(f"  Discard actions={DISCARD_ACTION_DIM}, During actions={DURING_TURN_ACTION_DIM}, Post actions={POST_TURN_ACTION_DIM}")
         print("=" * 70)
 
-        print("\nENCODER")
+        print("\nTOKEN EMBEDDER")
         print("-" * 70)
-        print(f"  {'Embedding: type (4→64):':<45}{count(enc.type_embedding):>10,}")
-        print(f"  {'Embedding: tile (37→64):':<45}{count(enc.tile_embedding):>10,}")
-        print(f"  {'Embedding: tsumogiri (1→64):':<45}{count(enc.tsumogiri_embedding):>10,}")
-        print(f"  {'Embedding: during_naki (71→64):':<45}{count(enc.during_naki_embedding):>10,}")
-        print(f"  {'Embedding: post_naki (154→64):':<45}{count(enc.post_naki_embedding):>10,}")
+        print(f"  {'Embedding: type (4→64):':<45}{count(te.type_embedding):>10,}")
+        print(f"  {'Embedding: tile (37→64):':<45}{count(te.tile_embedding):>10,}")
+        print(f"  {'Embedding: tsumogiri (1→64):':<45}{count(te.tsumogiri_embedding):>10,}")
+        print(f"  {'Embedding: during_naki (71→64):':<45}{count(te.during_naki_embedding):>10,}")
+        print(f"  {'Embedding: post_naki (154→64):':<45}{count(te.post_naki_embedding):>10,}")
         print(f"  {'Position/player coding (non-trainable):':<45}{'0':>10}")
-        enc_block = enc.blocks[0]
+        print(f"  {'TokenEmbedder subtotal:':<45}{count(te):>10,}")
+
+        print("\nENCODER BLOCKS")
+        print("-" * 70)
+        enc_block = self.blocks[0]
         print(f"  {f'EncoderBlock x{n_layers}:':<45}")
         print(f"    {'MultiHeadAttention:':<43}{count(enc_block.self_attention):>10,}")
         print(f"    {'FeedForward:':<43}{count(enc_block.ffwd):>10,}")
         print(f"    {'LayerNorm x2:':<43}{count(enc_block.ln1) + count(enc_block.ln2):>10,}")
-        print(f"  {'Encoder subtotal:':<45}{count(enc):>10,}")
+        print(f"  {'Blocks subtotal:':<45}{count(self.blocks):>10,}")
 
         print("\nSTATE NET")
         print("-" * 70)
@@ -178,7 +183,7 @@ class EncoderConvModel(nn.Module):
             assert torch.any(action_mask_batch, dim=1).all(), "Each sample must have at least one allowed action"
 
             # Step 1: Embed history tokens
-            history_emb = self.encoder(encoding_tokens_batch)  # (B, 150, EMBD_SIZE)
+            history_emb = self.token_embedder(encoding_tokens_batch)  # (B, 150, EMBD_SIZE)
 
             # Step 2: State embedding
             state_emb = self.state_net(state_obj_tensor_batch)  # (B, EMBD_SIZE)
@@ -195,7 +200,7 @@ class EncoderConvModel(nn.Module):
             # Step 5: Bidirectional self-attention (no causal mask)
             attn_mask = fused_mask.unsqueeze(1)  # (B, 1, 151)
             x = fused
-            for block in self.encoder.blocks:
+            for block in self.blocks:
                 x = block(x, attn_mask)
 
             # Zero out padded positions to prevent signal leakage
@@ -219,8 +224,10 @@ class EncoderConvModel(nn.Module):
         return results
 
 
-class Encoder(nn.Module):
-    def __init__(self, n_layers=N_LAYERS):
+class TokenEmbedder(nn.Module):
+    """Converts encoding tokens to summed embeddings (no attention blocks)."""
+
+    def __init__(self):
         super().__init__()
 
         self.register_buffer("empty_embedding", torch.zeros((1, 1, EMBD_SIZE)))
@@ -232,22 +239,6 @@ class Encoder(nn.Module):
 
         self.register_buffer("position_coding_table", self._get_position_encoding())
         self.register_buffer("player_coding_table", self._get_player_encoding())
-
-        self._init_embeddings()
-
-        self.blocks = nn.Sequential(*[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)])
-
-    def _init_embeddings(self):
-        nn.init.normal_(self.type_embedding.weight, std=0.02)
-        nn.init.normal_(self.tile_embedding.weight, std=0.02)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, std=0.02)
 
     @staticmethod
     def _get_position_encoding():
