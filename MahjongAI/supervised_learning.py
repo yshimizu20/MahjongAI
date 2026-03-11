@@ -19,6 +19,7 @@ _PACKAGE_DIR = pathlib.Path(__file__).parent
 sys.path.append("..")
 
 from MahjongAI.agents.transformer_conv import TransformerConvModel
+from MahjongAI.agents.encoder_conv import EncoderConvModel
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster
 
 SAVE_EVERY_STEPS = 2000
@@ -72,6 +73,9 @@ def train(model_name: str, total_steps: int):
     # Initialize model
     if model_name == "transformer_conv":
         model = TransformerConvModel().to(device)
+        batch_size = 2
+    elif model_name == "encoder_conv":
+        model = EncoderConvModel().to(device)
         batch_size = 2
     else:
         raise NotImplementedError(f"Model {model_name} not implemented.")
@@ -208,6 +212,7 @@ def log_message(message: str):
 if __name__ == "__main__":
     valid_models = [
         "transformer_conv",
+        "encoder_conv",
     ]
 
     parser = argparse.ArgumentParser(description="Train a MahjongAI model.")
