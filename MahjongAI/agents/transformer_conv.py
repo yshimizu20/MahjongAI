@@ -184,21 +184,19 @@ class Encoder(nn.Module):
     def __init__(self, n_layers=N_LAYERS):
         super().__init__()
 
-        self.empty_embedding = torch.zeros((1, 1, EMBD_SIZE), device=device, requires_grad=False)
+        self.register_buffer("empty_embedding", torch.zeros((1, 1, EMBD_SIZE)))
         self.type_embedding = nn.Embedding(4, EMBD_SIZE)  # embedding_type: 1-4
         self.tile_embedding = nn.Embedding(37, EMBD_SIZE)  # tile_encoding: 0-36
         self.tsumogiri_embedding = nn.Embedding(1, EMBD_SIZE)
         self.during_naki_embedding = nn.Embedding(DURING_TURN_ACTION_DIM, EMBD_SIZE)
         self.post_naki_embedding = nn.Embedding(POST_TURN_ACTION_DIM, EMBD_SIZE)
 
-        self.position_coding_table = self._get_position_encoding().to(device).detach()  # Non-trainable
-        self.player_coding_table = self._get_player_encoding().detach()  # Non-trainable
+        self.register_buffer("position_coding_table", self._get_position_encoding())
+        self.register_buffer("player_coding_table", self._get_player_encoding())
 
         self._init_embeddings()
 
         self.blocks = nn.Sequential(*[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)])
-
-        self.apply(self._init_weights)
 
     def _init_embeddings(self):
         nn.init.normal_(self.type_embedding.weight, std=0.02)
@@ -249,9 +247,6 @@ class Encoder(nn.Module):
         Returns:
             x: (B, 150, EMBD_SIZE) tensor of embeddings
         """
-        # TODO: instead of doing this makeshift adjustment, find the root cause
-        encoding_tokens_batch = encoding_tokens_batch.to(torch.int64)
-
         event_type = (encoding_tokens_batch >> 13) & 7
         embedding_type = (encoding_tokens_batch >> 10) & 7
         player_idx = (encoding_tokens_batch >> 8) & 3
@@ -281,10 +276,9 @@ class Encoder(nn.Module):
             | (event_type == EventStateTypes.POST)
         ).to(player_emb.device)
         player_emb = player_emb * mask.unsqueeze(-1).float()
-        player_emb = player_emb.to(device)
 
         # tsumogiri embedding only if event_type is DISCARD and tsumogiri is 1
-        tsumogiri_emb = self.tsumogiri_embedding(torch.tensor([0], device=device))  # Shape: (B, T, EMBD_SIZE)
+        tsumogiri_emb = self.tsumogiri_embedding(torch.tensor([0], device=self.type_embedding.weight.device))  # Shape: (B, T, EMBD_SIZE)
         mask = (event_type == EventStateTypes.DISCARD) & (tsumogiri == 1)
         tsumogiri_emb = tsumogiri_emb * mask.unsqueeze(-1).float()
 
@@ -345,16 +339,6 @@ class Decoder(nn.Module):
             "post": self.post_head,
         }
 
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, std=0.02)
-
     def forward(
         self,
         enc_out: torch.tensor,
@@ -388,6 +372,11 @@ class Decoder(nn.Module):
         assert (
             logits.shape == action_mask_batch.shape
         ), f"Logits shape {logits.shape} and mask shape {action_mask_batch.shape} do not match."
+
+        # Verify target actions are not masked out
+        assert torch.all(
+            action_mask_batch[torch.arange(y_tensor.size(0)), y_tensor] == 1
+        ), "Target action is masked out as invalid!"
 
         # mask out invalid actions
         logits = logits.masked_fill(action_mask_batch == 0, -1e9)
@@ -723,7 +712,7 @@ class TransformerTensorProcessor:
             else:
                 raise ValueError(f"Unknown turn type: {turn.type_}")
 
-        encoding_token_tensor = torch.tensor(encoding_tokens, dtype=torch.int64, device=device)
+        encoding_token_tensor = torch.tensor(encoding_tokens, dtype=torch.int64)
         encoding_token_tensor = torch.nn.functional.pad(encoding_token_tensor, (0, 150 - len(encoding_tokens)))
 
         # Build tensors for each turn type
@@ -765,7 +754,7 @@ class TransformerTensorProcessor:
             masked_encoding_token_tensor = torch.cat(
                 [
                     encoding_token_tensor[:encoding_idx],
-                    torch.zeros(150 - encoding_idx, device=device),
+                    torch.zeros(150 - encoding_idx, dtype=torch.int64),
                 ]
             ).unsqueeze(
                 0
@@ -776,7 +765,7 @@ class TransformerTensorProcessor:
 
             x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
 
-            hand_tensor = torch.tensor(turn.stateObj.hand_tensor, dtype=torch.float32, device=device)  # Shape: (37,)
+            hand_tensor = torch.tensor(turn.stateObj.hand_tensor, dtype=torch.float32)  # Shape: (37,)
             # Ensure maximum value is 1
             filter_tensor = torch.clamp(hand_tensor, max=1.0)  # Shape: (37,)
 
@@ -788,7 +777,7 @@ class TransformerTensorProcessor:
             y.append(discarded_tile_idx)
 
         # Concatenate lists into single tensors
-        encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, device=device)
+        encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, dtype=torch.int64)
 
         if state_obj_tensors:
             x1_list, x2_list, x3_list = zip(*state_obj_tensors)
@@ -796,14 +785,14 @@ class TransformerTensorProcessor:
             x1_list, x2_list, x3_list = [], [], []
 
         state_obj_tensor_batch = (
-            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4, device=device)),
-            (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4, device=device)),
-            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4, device=device),
+            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4)),
+            (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
         )
 
         filter_tensors_2d = [ft.unsqueeze(0) for ft in filter_tensors]  # List of (1, 37)
         action_mask_batch = (
-            torch.cat(filter_tensors_2d, dim=0) if filter_tensors_2d else torch.empty(0, 37, device=device)
+            torch.cat(filter_tensors_2d, dim=0) if filter_tensors_2d else torch.empty(0, 37)
         )
 
         assert len(action_mask_batch.shape) == 2
@@ -811,15 +800,15 @@ class TransformerTensorProcessor:
         if action_mask_batch.numel() > 0:
             assert torch.any(action_mask_batch, dim=1).all(), "Each sample must have at least one allowed action"
 
-        y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
+        y_tensor = torch.tensor(y, dtype=torch.long)  # Shape: (sum_N,)
 
         # Generate padding mask from encoding_idx: True = valid position
         if encoding_indices:
-            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long, device=device)  # (N,)
-            position_indices = torch.arange(150, device=device).unsqueeze(0)  # (1, 150)
+            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long)  # (N,)
+            position_indices = torch.arange(150).unsqueeze(0)  # (1, 150)
             padding_mask = position_indices < encoding_idx_tensor.unsqueeze(1)  # (N, 150) boolean
         else:
-            padding_mask = torch.empty(0, 150, dtype=torch.bool, device=device)
+            padding_mask = torch.empty(0, 150, dtype=torch.bool)
 
         return (
             encoding_tokens_batch,
@@ -865,7 +854,7 @@ class TransformerTensorProcessor:
             masked_encoding_token_tensor = torch.cat(
                 [
                     encoding_token_tensor[:encoding_idx],
-                    torch.zeros(150 - encoding_idx, device=device),
+                    torch.zeros(150 - encoding_idx, dtype=torch.int64),
                 ]
             ).unsqueeze(
                 0
@@ -879,7 +868,7 @@ class TransformerTensorProcessor:
             state_obj_tensors.append((x1, x2, x3))  # Each x1, x2, x3 is a tensor
 
             # Create filter_tensor
-            filter_tensor = torch.zeros(71, dtype=torch.float32, device=device)
+            filter_tensor = torch.zeros(71, dtype=torch.float32)
             filter_tensor[0] = 1.0  # pass
 
             target = 0  # default to pass
@@ -913,7 +902,7 @@ class TransformerTensorProcessor:
             y.append(target)
             filter_tensors.append(filter_tensor)  # Shape: (71,)
 
-        encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, device=device)
+        encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, dtype=torch.int64)
 
         if state_obj_tensors:
             x1_list, x2_list, x3_list = zip(*state_obj_tensors)
@@ -921,14 +910,14 @@ class TransformerTensorProcessor:
             x1_list, x2_list, x3_list = [], [], []
 
         state_obj_tensor_batch = (
-            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4, device=device)),
-            (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4, device=device)),
-            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4, device=device),
+            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4)),
+            (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
         )
 
         filter_tensors_2d = [ft.unsqueeze(0) for ft in filter_tensors]  # Each filter_tensor is now (1, 71)
         action_mask_batch = (
-            torch.cat(filter_tensors_2d, dim=0) if filter_tensors_2d else torch.empty(0, 71, device=device)
+            torch.cat(filter_tensors_2d, dim=0) if filter_tensors_2d else torch.empty(0, 71)
         )
 
         assert len(action_mask_batch.shape) == 2
@@ -936,15 +925,15 @@ class TransformerTensorProcessor:
         if action_mask_batch.numel() > 0:
             assert torch.sum(action_mask_batch, dim=1).min() >= 2, "Each sample must have at least two allowed actions"
 
-        y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
+        y_tensor = torch.tensor(y, dtype=torch.long)  # Shape: (sum_N,)
 
         # Generate padding mask from encoding_idx: True = valid position
         if encoding_indices:
-            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long, device=device)  # (N,)
-            position_indices = torch.arange(150, device=device).unsqueeze(0)  # (1, 150)
+            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long)  # (N,)
+            position_indices = torch.arange(150).unsqueeze(0)  # (1, 150)
             padding_mask = position_indices < encoding_idx_tensor.unsqueeze(1)  # (N, 150) boolean
         else:
-            padding_mask = torch.empty(0, 150, dtype=torch.bool, device=device)
+            padding_mask = torch.empty(0, 150, dtype=torch.bool)
 
         return (
             encoding_tokens_batch,
@@ -992,7 +981,7 @@ class TransformerTensorProcessor:
             masked_encoding_token_tensor = torch.cat(
                 [
                     encoding_token_tensor[:encoding_idx],
-                    torch.zeros(150 - encoding_idx, device=device),
+                    torch.zeros(150 - encoding_idx, dtype=torch.int64),
                 ]
             ).unsqueeze(
                 0
@@ -1009,7 +998,7 @@ class TransformerTensorProcessor:
 
                 contains_executed = False
                 result = 0
-                decision_mask = torch.zeros(154, dtype=torch.float32, device=device)
+                decision_mask = torch.zeros(154, dtype=torch.float32)
 
                 for decision_idx, decision_type in enumerate(decisions[player_idx]):
                     if len(decision_type) == 0:
@@ -1050,7 +1039,7 @@ class TransformerTensorProcessor:
                 if contains_executed:
                     break
 
-        encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, device=device)
+        encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, dtype=torch.int64)
 
         if state_obj_tensors:
             x1_list, x2_list, x3_list = zip(*state_obj_tensors)
@@ -1058,14 +1047,14 @@ class TransformerTensorProcessor:
             x1_list, x2_list, x3_list = [], [], []
 
         state_obj_tensor_batch = (
-            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4, device=device)),
-            (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4, device=device)),
-            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4, device=device),
+            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4)),
+            (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
         )
 
         filter_tensors_2d = [ft.unsqueeze(0) for ft in filter_tensors]  # Each filter_tensor is now (1, 154)
         action_mask_batch = (
-            torch.cat(filter_tensors_2d, dim=0) if filter_tensors_2d else torch.empty(0, 154, device=device)
+            torch.cat(filter_tensors_2d, dim=0) if filter_tensors_2d else torch.empty(0, 154)
         )
 
         assert len(action_mask_batch.shape) == 2
@@ -1073,15 +1062,15 @@ class TransformerTensorProcessor:
         if action_mask_batch.numel() > 0:
             assert torch.sum(action_mask_batch, dim=1).min() >= 2, "Each sample must have at least two allowed actions"
 
-        y_tensor = torch.tensor(y, dtype=torch.long, device=device)  # Shape: (sum_N,)
+        y_tensor = torch.tensor(y, dtype=torch.long)  # Shape: (sum_N,)
 
         # Generate padding mask from encoding_idx: True = valid position
         if encoding_indices:
-            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long, device=device)  # (N,)
-            position_indices = torch.arange(150, device=device).unsqueeze(0)  # (1, 150)
+            encoding_idx_tensor = torch.tensor(encoding_indices, dtype=torch.long)  # (N,)
+            position_indices = torch.arange(150).unsqueeze(0)  # (1, 150)
             padding_mask = position_indices < encoding_idx_tensor.unsqueeze(1)  # (N, 150) boolean
         else:
-            padding_mask = torch.empty(0, 150, dtype=torch.bool, device=device)
+            padding_mask = torch.empty(0, 150, dtype=torch.bool)
 
         return (
             encoding_tokens_batch,
@@ -1106,39 +1095,39 @@ class TransformerTensorProcessor:
         """
         # x1: Contains hand_tensor, remaining_tiles_pov, sutehai_tensor
         # Transform hand_tensor
-        hand_tensor = torch.tensor(stateObj.hand_tensor, dtype=torch.long, device=device)
-        range_tensor = torch.arange(4, device=device)
+        hand_tensor = torch.tensor(stateObj.hand_tensor, dtype=torch.long)
+        range_tensor = torch.arange(4)
         hand_tensor = (range_tensor < hand_tensor.unsqueeze(1)).float().unsqueeze(0)  # Shape: (1, 37, 4)
 
         # Transform remaining_tiles_pov
-        remaining_tiles_pov = torch.tensor(stateObj.remaining_tiles_pov, dtype=torch.long, device=device)
+        remaining_tiles_pov = torch.tensor(stateObj.remaining_tiles_pov, dtype=torch.long)
         remaining_tiles_pov = (
             (range_tensor < remaining_tiles_pov.unsqueeze(1)).float().unsqueeze(0)
         )  # Shape: (1, 37, 4)
 
         # Transform sutehai_tensor
-        sutehai_tensor = torch.tensor(stateObj.sutehai_tensors[stateObj.player], dtype=torch.long, device=device)
+        sutehai_tensor = torch.tensor(stateObj.sutehai_tensors[stateObj.player], dtype=torch.long)
         sutehai_tensor = (range_tensor < sutehai_tensor.unsqueeze(1)).float().unsqueeze(0)  # Shape: (1, 37, 4)
 
         # **Ensure 2D Tensor by Stacking Along New Dimension**
         x1 = torch.stack([hand_tensor, remaining_tiles_pov, sutehai_tensor], dim=1)  # Shape: (1, 3, 37, 4)
 
         # x2: Contains scores, parent_tensor, parent_rounds_remaining, double_reaches, reaches, ippatsu, is_menzen
-        scores = torch.tensor(stateObj.scores, dtype=torch.float32, device=device).unsqueeze(0)  # Shape: (1, 4)
-        parent_tensor = torch.tensor(stateObj.parent_tensor, dtype=torch.float32, device=device).unsqueeze(
+        scores = torch.tensor(stateObj.scores, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 4)
+        parent_tensor = torch.tensor(stateObj.parent_tensor, dtype=torch.float32).unsqueeze(
             0
         )  # Shape: (1, 4)
         parent_rounds_remaining = torch.tensor(
-            stateObj.parent_rounds_remaining, dtype=torch.float32, device=device
+            stateObj.parent_rounds_remaining, dtype=torch.float32
         ).unsqueeze(
             0
         )  # Shape: (1, 4)
-        double_reaches = torch.tensor(stateObj.double_reaches, dtype=torch.float32, device=device).unsqueeze(
+        double_reaches = torch.tensor(stateObj.double_reaches, dtype=torch.float32).unsqueeze(
             0
         )  # Shape: (1, 4)
-        reaches = torch.tensor(stateObj.reaches, dtype=torch.float32, device=device).unsqueeze(0)  # Shape: (1, 4)
-        ippatsu = torch.tensor(stateObj.ippatsu, dtype=torch.float32, device=device).unsqueeze(0)  # Shape: (1, 4)
-        is_menzen = torch.tensor(stateObj.is_menzen, dtype=torch.float32, device=device).unsqueeze(0)  # Shape: (1, 4)
+        reaches = torch.tensor(stateObj.reaches, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 4)
+        ippatsu = torch.tensor(stateObj.ippatsu, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 4)
+        is_menzen = torch.tensor(stateObj.is_menzen, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 4)
 
         x2 = torch.stack(
             [
@@ -1164,7 +1153,6 @@ class TransformerTensorProcessor:
                 ]
             ],
             dtype=torch.float32,
-            device=device,
         )  # Shape: (1, 4)
 
         return x1, x2, x3
