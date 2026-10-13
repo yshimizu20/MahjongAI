@@ -6,7 +6,8 @@ Run from the directory that contains MahjongAI/ (python -I would drop it from sy
 
 A clean run prints ONE line. A failing gate raises AssertionError with the offending counts.
 Gate groups (counted over every game, round, halfturn and built tensor):
-  WINS    executed tsumo / ron labels == <AGARI> events in the XML (who == fromWho is a tsumo)
+  WINS    executed tsumo / ron labels == <AGARI> events in the XML (who == fromWho is a tsumo), plus 3 rons
+          per triple-ron abort (<RYUUKYOKU type="ron3">)
   CALLS   executed chi / pon / minkan / ankan / kakan labels == <N> events by kind
   MASK    every label index is inside its action mask (during 71, discard 37, post 154); chi/pon indices injective
   POV     a PostTurn sample's state belongs to the responder; the answered discard / kakan token is the last
@@ -16,6 +17,10 @@ Gate groups (counted over every game, round, halfturn and built tensor):
   SCALE   remaining_tsumo in [0, 70] and == 0 at an exhaustive draw; |x2|, |x3| <= 5 (normalised inputs;
           the whole 100,000-point pool on one seat is exactly 4.0)
   PLANES  the safe-against-riichi planes equal the set rebuilt from the token history alone
+  IPPATSU a riichi declarer's next DuringTurn has ippatsu = 1 (0 if a call came between); his next discard
+          and his DuringTurn after that have 0
+  RED     every state's red-five slots 34-36 of remaining_tiles_pov == 1 - (that red visible to the player:
+          own hand, any discard, any meld, a dora indicator)
   TENSORS the BUILT tensors agree with the parser and the XML: win / call targets per head == XML events and
           every during / post target == the executed action of its sample (exact index, not only the kind);
           discard targets == TILE2IDX (red five -> slot 34-36) and the plain-five slot is enabled only
@@ -29,10 +34,12 @@ import glob
 import os
 import random
 import re
+from unittest import mock
 
 import numpy as np
 import torch
 
+from MahjongAI import process_xml
 from MahjongAI.process_xml import process, InvalidGameException
 from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.draw import Naki
@@ -42,6 +49,7 @@ from MahjongAI.agents.encoder_conv import TransformerTensorProcessor, N_X1_PLANE
 PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_ROOT = os.path.join(PACKAGE_DIR, "data", "processed")
 SAMPLE_LOG = os.path.join(PACKAGE_DIR, "data", "sample", "sample_haifu.xml")
+RON3_LOG = "2021010521gm-00a9-0000-e76b4550.log"  # 2021-01-05, round 5 is a triple-ron abort
 DEFAULT_DAYS = ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
                 "20210709", "20210815", "20210921", "20211030", "20211112", "20211225"]
 KINDS = ["chi", "pon", "minkan", "ankan", "kakan"]
@@ -56,6 +64,7 @@ ZERO_GATES = [
     "tensor_skipped", "discard_label_mismatch", "discard_mask_red_rule", "hand_plane_mismatch",
     "post_sample_count_mismatch", "post_history_last_token",
     "during_sample_count_mismatch", "during_target_mismatch", "post_target_mismatch",
+    "ippatsu_window_wrong", "red_pov_mismatch",
 ]
 RED_TO_PLAIN = {34: 4, 35: 13, 36: 22}
 
@@ -71,6 +80,7 @@ def _tile(tok): return tok & 0x7F
 def _is_discard(tok): return _event(tok) == EventStateTypes.DISCARD
 def _is_reach(tok): return _event(tok) == EventStateTypes.DURING and _etype(tok) == EventTypes.RIICHI
 def _has_seat(tok): return _event(tok) in (EventStateTypes.DISCARD, EventStateTypes.DURING, EventStateTypes.POST)
+def _is_call(tok): return _event(tok) in (EventStateTypes.DURING, EventStateTypes.POST) and _etype(tok) == EventTypes.NAKI
 
 
 def safe_from_history(tokens, q):
@@ -81,6 +91,46 @@ def safe_from_history(tokens, q):
     safe = {_tile(t) for t in tokens if _is_discard(t) and _who(t) == q}
     safe |= {_tile(t) for i, t in enumerate(tokens) if i > reach_pos and _is_discard(t)}
     return {RED_TO_PLAIN.get(t, t) for t in safe}  # a red-five discard token carries slot 34-36
+
+
+def ippatsu_windows(halfturns, tokens):
+    """Per riichi declaration discard: (declarer, called, first, disc, nxt). first = the declarer's next
+    DuringTurn, called = a call token sits between the declaration discard and first, disc = the declarer's
+    next DiscardTurn after first, nxt = his DuringTurn after first; None when the round ends before."""
+    for i, d in enumerate(halfturns):
+        if not (isinstance(d, DiscardTurn) and d.is_riichi_declaration):
+            continue
+        p = d.player
+        mine = [t for t in halfturns[i + 1:] if t.player == p and isinstance(t, (DuringTurn, DiscardTurn))]
+        first = next((t for t in mine if isinstance(t, DuringTurn)), None)
+        if first is None:
+            continue
+        rest = mine[mine.index(first) + 1:]
+        called = any(_is_call(tok) for tok in tokens[d.encoding_idx:first.encoding_idx])
+        disc = next((t for t in rest if isinstance(t, DiscardTurn)), None)
+        nxt = next((t for t in rest if isinstance(t, DuringTurn)), None)
+        yield p, called, first, disc, nxt
+
+
+def red_visible(so, s) -> bool:
+    """True iff red five s (tile 16 + 36 s) is visible to so.player: own hand, any discard, any meld, a dora indicator."""
+    red, kind = 16 + 36 * s, 4 + 9 * s
+    if so.hand_tensor[34 + s] > 0 or (so.sutehai_tensors[:, 34 + s] > 0).any() or red in so.dora:
+        return True
+    for meld in (m for ms in so.melds for m in ms):
+        exposed, acquired = meld.get_exposed()
+        if meld.is_chi() or meld.is_pon():
+            if red in exposed + [acquired]:
+                return True
+        elif exposed[0] // 4 == kind:  # a kan of fives holds all four copies (a kakan meld lists only the added one)
+            return True
+    return False
+
+
+def check_red_pov(so, C):
+    for s in range(3):
+        if so.remaining_tiles_pov[34 + s] != 1 - int(red_visible(so, s)):
+            C["red_pov_mismatch"] += 1
 
 
 def thermometer(counts) -> torch.Tensor:
@@ -155,6 +205,7 @@ def count_game(path, H, T, C, tp):
     ag = re.findall(r'<AGARI [^>]*?who="(\d)"[^>]*?fromWho="(\d)"', raw)
     C["xml_tsumo"] += sum(1 for w, fw in ag if w == fw)
     C["xml_ron"] += sum(1 for w, fw in ag if w != fw)
+    C["xml_ron"] += 3 * len(re.findall(r'<RYUUKYOKU [^>]*type="ron3"', raw))  # triple ron: three rons, no AGARI
     for m in re.findall(r'<N who="\d" m="(\d+)"', raw):
         C["xml_" + kind_of(Naki(int(m)))] += 1
     ends = xml_round_ends(raw)
@@ -190,6 +241,7 @@ def count_game(path, H, T, C, tp):
                 C["tsumo_over_70"] += 1
             if so.remaining_tiles_pov[:34].sum() + so.hand_tensor[:34].sum() > 135:
                 C["pov_sum_too_big"] += 1
+            check_red_pov(so, C)
 
             if isinstance(t, DuringTurn):
                 if sum(map(len, t.decisions)):
@@ -235,8 +287,16 @@ def count_game(path, H, T, C, tp):
                         if d.executed:
                             C["lab_" + kind_of(d.naki)] += 1
                     check_state(rs, tokens[: t.encoding_idx], C, tp)
+                    check_red_pov(rs, C)
                 for p, target in expected_responders(t):
                     exp_post.append((t.encoding_idx, p, t.player, t.responder_states[p].hand_tensor, target))
+
+        for p, called, first, disc, nxt in ippatsu_windows(halfturns, tokens):
+            C["ippatsu_windows"] += 1
+            if first.stateObj.ippatsu[p] != (0 if called else 1):
+                C["ippatsu_window_wrong"] += 1
+            if any(t is not None and t.stateObj.ippatsu[p] != 0 for t in (disc, nxt)):
+                C["ippatsu_window_wrong"] += 1
 
         try:
             td, tdisc, tpost = tp.build_tensors(halfturns, tokens)
@@ -383,12 +443,25 @@ def _game_with(pred, limit=60):
     raise RuntimeError("no game found for the self-test predicate")
 
 
+def _ron3_game():
+    """A known triple-ron game (round 5 ends in <RYUUKYOKU type="ron3">): the 2021-01-01 self-test pool and the
+    default --games 150 sample hold none, so the self-test names one explicitly."""
+    found = glob.glob(os.path.join(DATA_ROOT, "2021", "20210105", "*", RON3_LOG))
+    assert found, f"self-test needs the triple-ron game {RON3_LOG} under {DATA_ROOT}/2021/20210105"
+    raw = open(found[0], "rb").read().decode("utf-8", "ignore")
+    assert re.search(r'<RYUUKYOKU [^>]*type="ron3"', raw), f"{found[0]} holds no ron3"
+    return found[0]
+
+
 def self_test():
-    """Clean game passes; seven corruptions each raise: un-labelled win, wrong responder POV, stale safe plane
-    (parser level); zeroed win targets, shifted hand plane, pre-empted responder kept, chi target moved to
-    another allowed chi (tensor level). Also: a one-loader cluster rolls over at the epoch boundary."""
+    """Clean games (one with a triple ron) pass; ten corruptions each raise: un-labelled win, wrong responder POV,
+    stale safe plane, triple ron left unlabelled, ippatsu cleared before the first draw after riichi, red dora
+    indicator left in the red slot (parser level); zeroed win targets, shifted hand plane, pre-empted responder
+    kept, chi target moved to another allowed chi (tensor level). Also: a one-loader cluster rolls over at the
+    epoch boundary."""
     f = _first_valid_game()
-    check(run([f], TransformerTensorProcessor()))
+    ron3 = _ron3_game()
+    check(run([f, ron3], TransformerTensorProcessor()))
 
     def expect_failure(name, corrupt, game=f):
         tp = TransformerTensorProcessor()
@@ -495,9 +568,40 @@ def self_test():
             for halfturns in H for t in halfturns if isinstance(t, PostTurn)
         )
 
+    def skip_ron3_marking(H, T, tp):  # re-parse with the triple-ron labelling switched off
+        with mock.patch.object(process_xml, "_mark_ron3_executed", lambda halfturns: None):
+            H[:], T[:] = process(ron3)
+
+    def early_ippatsu_clear(H, T, tp):  # the old order: the first draw after riichi cleared ippatsu before its snapshot
+        for halfturns, tokens in zip(H, T):
+            for p, called, first, _, _ in ippatsu_windows(halfturns, tokens):
+                if not called:
+                    first.stateObj.ippatsu = [0 if q == p else v for q, v in enumerate(first.stateObj.ippatsu)]
+                    return
+        raise SystemExit("self-test needs a riichi followed by the declarer's draw")
+
+    def has_ippatsu_window(H, T):
+        return any(not called for halfturns, tokens in zip(H, T) for _, called, *_ in ippatsu_windows(halfturns, tokens))
+
+    def red_indicator_kept(H, T, tp):  # the old DORA bug: a red indicator decremented the kind slot only
+        for halfturns in H:
+            for t in halfturns:
+                for s in range(3):
+                    if 16 + 36 * s in t.stateObj.dora:
+                        t.stateObj.remaining_tiles_pov = t.stateObj.remaining_tiles_pov.copy()
+                        t.stateObj.remaining_tiles_pov[34 + s] += 1
+                        return
+        raise SystemExit("self-test needs a red-five dora indicator")
+
+    def has_red_indicator(H, T):
+        return any(16 + 36 * s in t.stateObj.dora for halfturns in H for t in halfturns for s in range(3))
+
     expect_failure("un-labelled win", unlabel_win)
     expect_failure("wrong responder POV", wrong_pov)
     expect_failure("stale safe plane", stale_safe_plane)
+    expect_failure("triple ron left unlabelled", skip_ron3_marking, game=ron3)
+    expect_failure("ippatsu cleared before the first draw after riichi", early_ippatsu_clear, game=_game_with(has_ippatsu_window))
+    expect_failure("red dora indicator left in the red slot", red_indicator_kept, game=_game_with(has_red_indicator))
     expect_failure("zeroed win targets", zero_win_targets)
     expect_failure("shifted hand plane", shifted_hand_plane)
     expect_failure("pre-empted responder kept", keep_preempted, game=_game_with(has_preempted))
