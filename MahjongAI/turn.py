@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 
 from MahjongAI.state import StateObject
 from MahjongAI.decision import Decision
@@ -64,9 +64,16 @@ class PostTurn(HalfTurn):
         stateObj: StateObject,
         decisions: List[List[List[Decision]]],
         encoding_idx: int,
+        responder_states: Dict[int, StateObject],
     ):
+        """
+        player: the discarder (or the kakan player for chankan). stateObj: the DISCARDER's state, kept
+        for debugging only. responder_states[p]: the state as responder p sees it; the model must use this.
+        encoding_idx: history length INCLUDING the discard/kakan token being answered.
+        """
         super().__init__(player, HalfTurn.POST, stateObj, encoding_idx)
         self.decisions = decisions
+        self.responder_states = responder_states
 
     def __repr__(self):
         return "PostTurn Object | Player: {} | Decisions: {}".format(

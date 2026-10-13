@@ -2,6 +2,13 @@ class Draw:
     pass
 
 
+# Chi that uses the caller's OWN red five: (number, which) -> slot 0..5 within the colour.
+# number = lowest rank of the chi (0-based), which = position of the acquired tile.
+# number + which == 4 means the acquired tile is the five itself, which is not a choice of
+# the caller and therefore uses the plain chi index instead.
+RED_CHI_VARIANT = {(2, 0): 0, (2, 1): 1, (3, 0): 2, (3, 2): 3, (4, 1): 4, (4, 2): 5}
+
+
 class Naki(Draw):
     @staticmethod
     def from_chi_info(color: int, number: int, which: int, has_red: bool):
@@ -244,9 +251,8 @@ class Naki(Draw):
         if self.is_chi():
             color, number, which, has_red, _, _ = self.pattern_chi()
             if has_red and number + which != 4:
-                return (
-                    CHI_START + 63 + 6 * color + number * 2 + (number + which - 3) // 2
-                )
+                # caller used its own red five -> 18 dedicated slots 65..82, injective by table
+                return CHI_START + 63 + 6 * color + RED_CHI_VARIANT[(number, which)]
             else:
                 return CHI_START + color * 21 + number * 3 + which
 
@@ -254,7 +260,8 @@ class Naki(Draw):
             color, number, which, has_red, _, acquired = self.pattern_pon()
             if color == 3:
                 return PON_START + 30 + number
-            elif has_red and acquired % 4 == 3:
+            elif has_red and acquired % 4 != 0:
+                # red five is in the meld and is not the acquired tile -> caller used its own red
                 return PON_START + 27 + color
             else:
                 return PON_START + 9 * color + number

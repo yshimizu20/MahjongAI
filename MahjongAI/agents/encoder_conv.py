@@ -868,6 +868,30 @@ class TransformerTensorProcessor:
             padding_mask,
         )
 
+    @staticmethod
+    def _post_turn_responders(turn: PostTurn) -> List[int]:
+        """Responders of a PostTurn that become training samples, in turn order after the discarder.
+
+        A responder that executed an action is always a sample (both winners of a double ron).
+        A responder that executed nothing is a "pass" sample only when that pass was observed:
+        priority is ron (3) > pon / daiminkan (2) > chi (1), and when another responder executed
+        an action of HIGHER priority than ANY action this responder was offered, this responder
+        may have chosen that weaker action and lost the race; the XML does not say, so the sample
+        is dropped (~2% of responders). A responder offered only a ron while another ron'd, or
+        offered only a ron while another pon'd, did pass (double ron is allowed; ron beats pon).
+        """
+        lowest, done = {}, {}
+        for p in range(4):
+            offered = [(3, d.executed) for d in turn.decisions[p][DECISION_AGARI_IDX]]
+            offered += [(1 if d.naki.is_chi() else 2, d.executed) for d in turn.decisions[p][DECISION_NAKI_IDX]]
+            if not offered:
+                continue
+            lowest[p] = min(prio for prio, _ in offered)
+            done[p] = max((prio for prio, executed in offered if executed), default=0)
+        top = max(done.values(), default=0)
+        order = [(turn.player + k) % 4 for k in (1, 2, 3)]
+        return [p for p in order if p in lowest and (done[p] > 0 or top <= lowest[p])]
+
     def _build_post_tensor(
         self, post_turns: List[PostTurn], encoding_token_tensor: torch.Tensor
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -891,7 +915,6 @@ class TransformerTensorProcessor:
         filter_tensors = []
         y = []
         encoding_indices = []
-        players = [0, 1, 2, 3]
 
         for turn in post_turns:
             decisions = turn.decisions  # type: List[List[List[Decision]]]
@@ -912,16 +935,10 @@ class TransformerTensorProcessor:
                 0
             )  # Shape: (1, 150)
 
-            # Create state object tensor
-            x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
+            for player_idx in self._post_turn_responders(turn):
+                # the RESPONDER's hand / discards / tile counts, not the discarder's
+                x1, x2, x3 = self._convert_state_obj_to_tensors(turn.responder_states[player_idx])
 
-            # TODO: instead of going player by player, go decision type by decision type
-            action_player = turn.player
-            for player_idx in players[action_player + 1 :] + players[:action_player]:
-                if sum(map(len, decisions[player_idx])) == 0:
-                    continue
-
-                contains_executed = False
                 result = 0
                 decision_mask = torch.zeros(154, dtype=torch.float32)
 
@@ -935,13 +952,11 @@ class TransformerTensorProcessor:
                         decision_mask[1] = 1.0
                         if decision_type[0].executed:
                             result = 1
-                            contains_executed = True
 
                     elif decision_idx == DECISION_REACH_IDX:
                         decision_mask[2] = 1.0
                         if decision_type[0].executed:
                             result = 2
-                            contains_executed = True
 
                     elif decision_idx == DECISION_NAKI_IDX:
                         for meld_decision in decision_type:
@@ -950,7 +965,6 @@ class TransformerTensorProcessor:
 
                             if meld_decision.executed:
                                 result = idx
-                                contains_executed = True
 
                     else:
                         raise ValueError(f"Invalid decision_idx: {decision_idx}")
@@ -960,9 +974,6 @@ class TransformerTensorProcessor:
                 filter_tensors.append(decision_mask)
                 y.append(result)
                 encoding_indices.append(encoding_idx)
-
-                if contains_executed:
-                    break
 
         encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, dtype=torch.int64)
 

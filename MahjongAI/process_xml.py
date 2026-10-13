@@ -104,6 +104,36 @@ def process(file_path: str, verbose: bool = False):
         acquired = None
         result_idx = None
 
+        def make_state(p: int) -> StateObject:
+            """Snapshot of the round as player p sees it right now.
+
+            Every per-player array is COPIED (hand, remaining_tiles_pov, sutehai, melds): the round loop
+            mutates these buffers in place, and tensors are built only after the whole round is parsed,
+            so a view would show end-of-round values to every sample. Lists that the loop rebinds on
+            change (reaches, ippatsu, double_reaches, scores, doras) are safe to share.
+            """
+            return StateObject(
+                remaining_turns=remaining_tsumo,
+                hand_tensor=hand_tensors[p].copy(),
+                remaining_tiles=remaining_tiles.copy(),
+                remaining_tiles_pov=remaining_tiles_pov[p].copy(),
+                sutehai_tensors=np.copy(sutehai_tensors),
+                is_menzen=is_menzen[:],
+                double_reaches=double_reaches,
+                reaches=reaches,
+                ippatsu=ippatsu,
+                melds=[m[:] for m in melds],
+                scores=scores,
+                kyotaku=kyotaku,
+                honba=honba,
+                dora=doras,
+                parent_tensor=parent_tensor,
+                rounds_remaining=rounds_remaining,
+                parent_rounds_remaining=parent_rounds_remaining,
+                remaining_tsumo=remaining_tsumo,
+                player=p,
+            )
+
         if verbose:
             print(f"Scores: {scores}")
             print(f"Parent: {parent}")
@@ -167,26 +197,26 @@ def process(file_path: str, verbose: bool = False):
 
                 encoding_tokens.append(naki2idx(player, naki))
 
-                # change executed to True
+                # Label the executed call. Match on the ACTION INDEX the model predicts, never on the
+                # raw Tenhou meld code: its `which`/unused-copy bits depend on tile ids the mask cannot know.
                 if naki.is_ankan() or naki.is_kakan():
-                    assert isinstance(curr_halfturn, DuringTurn)
-
-                    for decision in curr_halfturn.decisions[DECISION_NAKI_IDX]:
-                        assert isinstance(decision, NakiDecision)
-                        if decision.naki.convenient_naki_code == naki.convenient_naki_code:
-                            decision.executed = True
-                            break
-
+                    assert isinstance(curr_halfturn, DuringTurn) and curr_halfturn.player == player
+                    target_idx = naki.get_during_turn_filter_idx()
+                    offered = [
+                        d for d in curr_halfturn.decisions[DECISION_NAKI_IDX]
+                        if d.naki.get_during_turn_filter_idx() == target_idx
+                    ]
                 else:
                     assert isinstance(curr_halfturn, PostTurn)
-                    # TODO: exclude decision that would not have been picked up anyways
-                    for lst in curr_halfturn.decisions:
-                        for decision in lst[DECISION_NAKI_IDX]:
-                            assert isinstance(decision, NakiDecision)
-                            # TODO: check if this is correct
-                            if decision.naki.convenient_naki_code == naki.convenient_naki_code:
-                                decision.executed = True
-                                break
+                    target_idx = naki.get_post_turn_filter_idx()
+                    offered = [
+                        d for d in curr_halfturn.decisions[player][DECISION_NAKI_IDX]
+                        if d.naki.get_post_turn_filter_idx() == target_idx
+                    ]
+                assert len(offered) == 1, (
+                    f"call {naki!r} (idx {target_idx}) by player {player} matched {len(offered)} offered decisions"
+                )
+                offered[0].executed = True
 
                 if not naki.is_chi() and not naki.is_pon():
                     remaining_tsumo -= 1
@@ -209,32 +239,14 @@ def process(file_path: str, verbose: bool = False):
                 if acquired is not None:
                     hand_tensors_full[player][TILE2IDX[acquired]] += 1.0
 
-                stateObj = StateObject(
-                    remaining_turns=remaining_tsumo,
-                    hand_tensor=hand_tensors[player].copy(),
-                    remaining_tiles=remaining_tiles,
-                    remaining_tiles_pov=remaining_tiles_pov[player][:],
-                    sutehai_tensors=np.copy(sutehai_tensors),
-                    is_menzen=is_menzen[:],
-                    double_reaches=double_reaches,
-                    reaches=reaches,  # share same reach list
-                    ippatsu=ippatsu,  # share same ippatsu list
-                    melds=melds,
-                    scores=scores,
-                    kyotaku=kyotaku,
-                    honba=honba,
-                    dora=doras,  # share same dora list
-                    parent_tensor=parent_tensor,
-                    rounds_remaining=rounds_remaining,
-                    parent_rounds_remaining=parent_rounds_remaining,
-                    remaining_tsumo=remaining_tsumo,
-                    player=player,
-                )
-
+                # update open-hand / ippatsu flags BEFORE the snapshot so the discard that follows
+                # this call sees is_menzen[player] = 0 and ippatsu cleared
                 if naki.from_who() != 0:
                     is_menzen[player] = 0
                 if sum(ippatsu):
                     ippatsu = [0] * 4
+
+                stateObj = make_state(player)
 
                 # in case of Kakan, create new post turn to train on chankan ron decision
                 if naki.is_kakan():
@@ -277,6 +289,7 @@ def process(file_path: str, verbose: bool = False):
                         stateObj=stateObj,
                         decisions=new_post_decisions,
                         encoding_idx=len(encoding_tokens),
+                        responder_states={p: make_state(p) for p in range(4) if p != player},
                     )
 
                     halfturns.append(curr_halfturn)
@@ -365,27 +378,7 @@ def process(file_path: str, verbose: bool = False):
                     naki_decisions,
                 ]
 
-                stateObj = StateObject(
-                    remaining_turns=remaining_tsumo,
-                    hand_tensor=hand_tensors[player].copy(),
-                    remaining_tiles=remaining_tiles,
-                    remaining_tiles_pov=remaining_tiles_pov[player][:],
-                    sutehai_tensors=np.copy(sutehai_tensors),
-                    is_menzen=is_menzen[:],
-                    double_reaches=double_reaches,
-                    reaches=reaches,  # share same reach list
-                    ippatsu=ippatsu,  # share same ippatsu list
-                    melds=melds,
-                    scores=scores,
-                    kyotaku=kyotaku,
-                    honba=honba,
-                    dora=doras,  # share same dora list
-                    parent_tensor=parent_tensor,
-                    rounds_remaining=rounds_remaining,
-                    parent_rounds_remaining=parent_rounds_remaining,
-                    remaining_tsumo=remaining_tsumo,
-                    player=player,
-                )
+                stateObj = make_state(player)
 
                 halfturn = DuringTurn(
                     player=player,
@@ -429,6 +422,9 @@ def process(file_path: str, verbose: bool = False):
                     pov[tile_idx] -= 1.0
                 remaining_tiles_pov[player][tile_idx] += 1.0
 
+                # the discard is now public: responders must see it in their history
+                encoding_tokens.append(discard2idx(player, tile_idx[0], tile == acquired))
+
                 # post_decisions will contain three lists of different decisions: ron, pon/kan, chi
                 post_decisions = [[[] for _ in range(3)] for _ in range(4)]
 
@@ -467,12 +463,12 @@ def process(file_path: str, verbose: bool = False):
                     player=player,
                     stateObj=stateObj,
                     decisions=post_decisions,
-                    encoding_idx=len(encoding_tokens),
+                    encoding_idx=len(encoding_tokens),  # includes the discard token appended above
+                    responder_states={p: make_state(p) for p in range(4) if p != player},
                 )
                 halfturns.append(half_turn)
                 curr_halfturn = half_turn  # carry over
 
-                encoding_tokens.append(discard2idx(player, tile_idx[0], tile == acquired))
                 acquired = None
 
             elif eventtype == "AGARI" or eventtype == "RYUUKYOKU":
@@ -490,7 +486,7 @@ def process(file_path: str, verbose: bool = False):
 
             if event["event"] == "AGARI":
                 result.append(AgariResult(list(map(int, event["attr"]["sc"].split(",")))))
-                # TODO: make decision executed = True
+                _mark_agari_executed(halfturns, int(event["attr"]["who"]), int(event["attr"]["fromWho"]))
 
             elif event["event"] == "RYUUKYOKU":
                 result.append(RyukyokuResult(list(map(int, event["attr"]["sc"].split(",")))))
@@ -508,6 +504,25 @@ def process(file_path: str, verbose: bool = False):
         all_encoding_tokens.append(encoding_tokens)
 
     return all_halfturns, all_encoding_tokens
+
+
+def _mark_agari_executed(halfturns: list, who: int, from_who: int) -> None:
+    """Label the win that an AGARI event records.
+
+    Tsumo (who == fromWho): the last halfturn is the winner's DuringTurn (also after a rinshan draw).
+    Ron (who != fromWho): the last halfturn is a PostTurn whose player is the loser; this covers
+    chankan (the PostTurn built in the kakan branch) and double ron (two AGARI events, same PostTurn).
+    """
+    assert halfturns, "AGARI event with no halfturns"
+    last = halfturns[-1]
+    if who == from_who:
+        assert isinstance(last, DuringTurn) and last.player == who, f"tsumo by {who}, last halfturn: {last!r}"
+        agari = last.decisions[DECISION_AGARI_IDX]
+    else:
+        assert isinstance(last, PostTurn) and last.player == from_who, f"ron by {who} from {from_who}, last halfturn: {last!r}"
+        agari = last.decisions[who][DECISION_AGARI_IDX]
+    assert len(agari) == 1, f"win by player {who} was not offered by evaluate_ron/evaluate_tsumo: {last!r}"
+    agari[0].executed = True
 
 
 def _get_rounds(file_path: str):
