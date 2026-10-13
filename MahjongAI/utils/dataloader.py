@@ -1,12 +1,21 @@
 import os
-import sys
-import torch
+import random
+from collections import Counter
 
 from MahjongAI.process_xml import process, InvalidGameException
 
 
 class DataLoader:
-    def __init__(self, path: str, batch_size: int = 1, log_func: callable = print):
+    """Yields batches of parsed games from every `*.log` under `path`.
+
+    Layout assumed: <path>/<day>/<day>_<nn>/<game>.log, so a game's day is its second parent directory.
+    days / exclude_days: keep only, or drop, the games of those day directories (the train/val split).
+    seed: shuffle the file list once with this seed (None keeps the sorted, date-ordered list).
+    Games that fail to parse are counted in `skipped` and reported through `log_func`; they never stop a run.
+    """
+
+    def __init__(self, path: str, batch_size: int = 1, log_func: callable = print,
+                 days=None, exclude_days=None, seed=None):
         self.path = path
         self.file_list = sorted(
             os.path.join(dirpath, fname)
@@ -14,10 +23,24 @@ class DataLoader:
             for fname in fnames
             if fname.endswith(".log")
         )
+        if days is not None:
+            keep = set(days)
+            self.file_list = [f for f in self.file_list if self.day_of(f) in keep]
+        if exclude_days is not None:
+            drop = set(exclude_days)
+            self.file_list = [f for f in self.file_list if self.day_of(f) not in drop]
+        if seed is not None:
+            random.Random(seed).shuffle(self.file_list)
+        self.seed = seed
         self.current_index = 0
         self.batch_size = batch_size
         self.batch_count = 0
         self.log_func = log_func
+        self.skipped = Counter()
+
+    @staticmethod
+    def day_of(file_path: str) -> str:
+        return os.path.basename(os.path.dirname(os.path.dirname(file_path)))
 
     def __iter__(self):
         return self
@@ -32,26 +55,20 @@ class DataLoader:
 
         while self.current_index < len(self.file_list) and len(all_halfturns_list) < self.batch_size:
             filename = self.file_list[self.current_index]
-            # print(f"\nProcessing file: {filename}")
             self.current_index += 1
 
             try:
                 all_halfturns, all_encoding_tokens = process(filename)
             except InvalidGameException as e:
-                # print(f"Invalid game detected: {e.msg}")
-                continue  # Skip to the next file
-            except AssertionError as e:
-                print(f"Assertion error: {e} happened in {filename}")
-                sys.exit(1) # TODO: remove this line
-            except Exception as e:
-                print(f"Unexpected error: {e} happened in {filename}")
+                self.skipped["invalid:" + e.msg] += 1
+                continue
+            except Exception as e:  # a parser bug on one game: report it, keep going
+                self.skipped[type(e).__name__] += 1
+                self.log_func(f"skipped {filename}: {type(e).__name__}: {str(e)[:200]}")
                 continue
 
-            # return all_halfturns, all_encoding_tokens
             all_halfturns_list.append(all_halfturns)
             all_encoding_tokens_list.append(all_encoding_tokens)
-
-        # self.log_func(f"{self.__repr__()} - Batch {self.batch_count}")
 
         return all_halfturns_list, all_encoding_tokens_list
 
@@ -59,8 +76,17 @@ class DataLoader:
         """Resets the dataloader's current index for re-iteration."""
         self.current_index = 0
 
+    def state_dict(self) -> dict:
+        return {"current_index": self.current_index, "seed": self.seed, "n_files": len(self.file_list)}
+
+    def load_state_dict(self, state: dict):
+        assert state["seed"] == self.seed and state["n_files"] == len(self.file_list), (
+            f"checkpoint loader state {state} does not match this loader (seed={self.seed}, n_files={len(self.file_list)})"
+        )
+        self.current_index = state["current_index"]
+
     def __repr__(self):
-        return f"DataLoader(path={self.path}, batch_size={self.batch_size})"
+        return f"DataLoader(path={self.path}, batch_size={self.batch_size}, n_files={len(self.file_list)}, seed={self.seed})"
 
 
 class DataLoaderCluster:
@@ -84,11 +110,23 @@ class DataLoaderCluster:
     def __iter__(self):
         return self
 
+    def state_dict(self) -> dict:
+        return {"idx": self.idx, "loaders": [dl.state_dict() for dl in self.dataloaders]}
+
+    def load_state_dict(self, state: dict):
+        self.idx = state["idx"]
+        for dl, s in zip(self.dataloaders, state["loaders"]):
+            dl.load_state_dict(s)
+
+    def skipped(self) -> Counter:
+        return sum((dl.skipped for dl in self.dataloaders), Counter())
+
     def __next__(self):
-        # Allow at most one full cycle through all loaders without returning data.
-        # If every loader raises StopIteration on the first call, all are empty.
+        # An exhausted loader is reset and the NEXT loader is tried; with one loader that is the same
+        # loader again, so allow len + 1 attempts. The cluster is empty only if every loader raises
+        # StopIteration on a fresh pass.
         attempts = 0
-        while attempts < len(self.dataloaders):
+        while attempts <= len(self.dataloaders):
             try:
                 return next(self.dataloaders[self.idx])
             except StopIteration:

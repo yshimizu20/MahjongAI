@@ -4,8 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple
 import numpy as np
+from collections import Counter, namedtuple
 
 sys.path.append("../..")
+
+# per-head model output: masked logits (B, A), mean cross-entropy, and the targets (B,)
+HeadOutput = namedtuple("HeadOutput", ["logits", "loss", "y"])
 
 from MahjongAI.turn import HalfTurn, DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.decision import Decision, NakiDecision
@@ -23,6 +27,12 @@ DISCARD_ACTION_DIM = 37
 DURING_TURN_ACTION_DIM = 71  # pass, agari (tsumo), riichi, ankan, kakan
 POST_TURN_ACTION_DIM = 154  # pass, agari (ron), naki
 MAX_ACTION_LEN = 150
+# x1 planes, all from the ACTOR's point of view, opponents in relative seat order
+# (1 = shimocha / next to play, 2 = toimen, 3 = kamicha / the seat a chi is called from):
+#   0 own hand, 1 unseen tile counts, 2 own discards, 3 drawn tile,
+#   4-6 opponents' discards, 7-9 tiles safe against each opponent's riichi (zero while not in riichi)
+N_X1_PLANES = 10
+RED_FIVE_SLOTS = ((4, 34), (13, 35), (22, 36))  # (plain slot, red slot) of 5m, 5p, 5s in the 37-index
 EMBD_SIZE = 64
 N_HEADS = 8
 N_LAYERS = 1
@@ -94,12 +104,12 @@ class EncoderConvModel(nn.Module):
 
         print("\nSTATE NET")
         print("-" * 70)
-        print(f"  {'Conv1d suit_conv1d_1 (12→16, k=3):':<45}{count(sn.suit_conv1d_1):>10,}")
+        print(f"  {f'Conv1d suit_conv1d_1 ({N_X1_PLANES * 4}→16, k=3):':<45}{count(sn.suit_conv1d_1):>10,}")
         print(f"  {'Conv1d suit_conv1d_2 (16→16, k=3):':<45}{count(sn.suit_conv1d_2):>10,}")
-        print(f"  {'Linear honors_fc1 (84→32):':<45}{count(sn.honors_fc1):>10,}")
+        print(f"  {f'Linear honors_fc1 ({N_X1_PLANES * 28}→32):':<45}{count(sn.honors_fc1):>10,}")
         print(f"  {'Linear honors_fc2 (32→16):':<45}{count(sn.honors_fc2):>10,}")
-        print(f"  {'Linear reds_fc (36→8):':<45}{count(sn.reds_fc):>10,}")
-        print(f"  {'Linear fc_main_1 (516→64):':<45}{count(sn.fc_main_1):>10,}")
+        print(f"  {f'Linear reds_fc ({N_X1_PLANES * 12}→8):':<45}{count(sn.reds_fc):>10,}")
+        print(f"  {f'Linear fc_main_1 ({sn.fc_main_1.in_features}→64):':<45}{count(sn.fc_main_1):>10,}")
         print(f"  {'Linear fc_main_2 (64→64):':<45}{count(sn.fc_main_2):>10,}")
         print(f"  {'StateNet subtotal:':<45}{count(sn):>10,}")
 
@@ -224,7 +234,7 @@ class EncoderConvModel(nn.Module):
             logits = logits.masked_fill(action_mask_batch == 0, -1e9)
 
             loss = F.cross_entropy(logits, y_tensor, reduction="mean")
-            results[head] = (logits, loss)
+            results[head] = HeadOutput(logits, loss, y_tensor)
 
         return results
 
@@ -376,19 +386,21 @@ class StateNet(nn.Module):
     def __init__(self):
         super(StateNet, self).__init__()
 
+        C, K = N_X1_PLANES, 4
+
         # Suit-aware convolutions
-        # Input per suit: C*K = 3*4 = 12 channels, R = 9 ranks
-        self.suit_conv1d_1 = nn.Conv1d(in_channels=12, out_channels=16, kernel_size=3, padding=1)
+        # Input per suit: C*K channels, R = 9 ranks
+        self.suit_conv1d_1 = nn.Conv1d(in_channels=C * K, out_channels=16, kernel_size=3, padding=1)
         self.suit_conv1d_2 = nn.Conv1d(in_channels=16, out_channels=16, kernel_size=3, padding=1)
 
         # Honors MLP
-        # Input: C*H*K = 3*7*4 = 84
-        self.honors_fc1 = nn.Linear(84, 32)
+        # Input: C*H*K, H = 7
+        self.honors_fc1 = nn.Linear(C * 7 * K, 32)
         self.honors_fc2 = nn.Linear(32, 16)
 
         # Red fives features
-        # Input: C*S*K = 3*3*4 = 36
-        self.reds_fc = nn.Linear(36, 8)
+        # Input: C*S*K, S = 3
+        self.reds_fc = nn.Linear(C * 3 * K, 8)
 
         self.relu = nn.ReLU()
 
@@ -396,11 +408,11 @@ class StateNet(nn.Module):
         # Suits: 16 features (after pooling and aggregating S=3)
         # Honors: 16 features
         # Reds: 8 features
-        # Raw x1: 3*37*4 = 444
+        # Raw x1: C*37*K
         suits_features = 16
         honors_features = 16
         reds_features = 8
-        raw_x1_features = 3 * 37 * 4
+        raw_x1_features = C * 37 * K
 
         combined_features = suits_features + honors_features + reds_features + raw_x1_features
 
@@ -413,7 +425,8 @@ class StateNet(nn.Module):
         x1, x2, x3 = state_obj  # Unpack the tuple
         batch_size = x1.size(0)
 
-        # Initial x1 shape: [batch_size, C=3, T=37, K=4]
+        # Initial x1 shape: [batch_size, C=N_X1_PLANES, T=37, K=4]
+        C, K = N_X1_PLANES, 4
 
         # --- 1. Process Suits (indices 0-26) ---
         # Extract Man (0-8), Pin (9-17), Sou (18-26)
@@ -423,10 +436,10 @@ class StateNet(nn.Module):
 
         # Reshape to [B, S, C*K, R]
         x1_suits = x1_suits.permute(0, 1, 2, 4, 3).contiguous()  # [B, S, C, K, R]
-        x1_suits = x1_suits.view(batch_size, 3, 12, 9)  # [B, S=3, C*K=12, R=9]
+        x1_suits = x1_suits.view(batch_size, 3, C * K, 9)  # [B, S=3, C*K, R=9]
 
         # Merge suits into batch for Conv1d: [B*S, C*K, R]
-        x1_suits = x1_suits.view(batch_size * 3, 12, 9)  # [B*3, 12, 9]
+        x1_suits = x1_suits.view(batch_size * 3, C * K, 9)  # [B*3, C*K, 9]
 
         # Apply Conv1d over rank
         suits_feat = self.suit_conv1d_1(x1_suits)  # [B*3, 16, 9]
@@ -547,7 +560,23 @@ class FeedForward(nn.Module):
 
 class TransformerTensorProcessor:
     def __init__(self):
-        pass
+        self.skipped = Counter()  # samples dropped by a tensor-level sanity check; gates.py asserts it stays empty
+
+    @staticmethod
+    def _relative_seats(tokens: torch.Tensor, actor: int) -> torch.Tensor:
+        """Rewrite the `who` bits (8-9) of every seat-bearing token so that seat 0 is the actor.
+
+        The model then sees the same history whichever absolute seat the actor sits in:
+        0 = me, 1 = shimocha, 2 = toimen, 3 = kamicha. NEW_DORA and padding tokens carry no seat.
+        """
+        event_type = (tokens >> 13) & 7
+        has_seat = (
+            (event_type == EventStateTypes.DISCARD)
+            | (event_type == EventStateTypes.DURING)
+            | (event_type == EventStateTypes.POST)
+        )
+        relative = ((((tokens >> 8) & 3) - actor) % 4) << 8
+        return torch.where(has_seat, (tokens & ~(3 << 8)) | relative, tokens)
 
     def prepare_batches(
         self,
@@ -647,6 +676,15 @@ class TransformerTensorProcessor:
 
         return tensors_during, tensors_discard, tensors_post
 
+    @staticmethod
+    def _discard_mask(hand_tensor: np.ndarray) -> torch.Tensor:
+        """37-way discard mask. A red five is only ever slot 34/35/36; the plain slot needs a non-red copy."""
+        hand = torch.as_tensor(np.asarray(hand_tensor), dtype=torch.float32)
+        mask = (hand > 0).float()
+        for plain, red in RED_FIVE_SLOTS:
+            mask[plain] = float(hand[plain] - hand[red] > 0)
+        return mask
+
     def _build_discard_tensor(
         self, discard_turns: List[DiscardTurn], encoding_token_tensor: torch.Tensor
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -672,6 +710,14 @@ class TransformerTensorProcessor:
         encoding_indices = []
 
         for turn in discard_turns:
+            if turn.stateObj.reaches[turn.player] and not turn.is_riichi_declaration:
+                # a player in riichi must discard the drawn tile: nothing to learn, skip the sample
+                drawn = turn.stateObj.drawn_tile
+                if drawn is None or TILE2IDX[turn.discarded_tile][-1] != drawn[-1]:
+                    # a parser bug, not a model matter: count it (gates.py asserts 0) instead of killing the run
+                    self.skipped["riichi_discard_not_drawn"] += 1
+                continue
+
             encoding_idx = turn.encoding_idx
             assert encoding_idx < MAX_SEQUENCE_LENGTH
 
@@ -684,18 +730,17 @@ class TransformerTensorProcessor:
             ).unsqueeze(
                 0
             )  # Shape: (1, 150)
+            masked_encoding_token_tensor = self._relative_seats(masked_encoding_token_tensor, turn.player)
 
             X_embeddings.append(masked_encoding_token_tensor)
             encoding_indices.append(encoding_idx)
 
             x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
 
-            hand_tensor = torch.tensor(turn.stateObj.hand_tensor, dtype=torch.float32)  # Shape: (37,)
-            # Ensure maximum value is 1
-            filter_tensor = torch.clamp(hand_tensor, max=1.0)  # Shape: (37,)
+            filter_tensor = self._discard_mask(turn.stateObj.hand_tensor)  # Shape: (37,)
 
-            # Get the target label (discarded tile index)
-            discarded_tile_idx = TILE2IDX[turn.discarded_tile][0]
+            # target: slot 34/35/36 for a red five (TILE2IDX[tile] = [kind, red slot]), else the kind
+            discarded_tile_idx = TILE2IDX[turn.discarded_tile][-1]
 
             state_obj_tensors.append((x1, x2, x3))
             filter_tensors.append(filter_tensor)
@@ -710,7 +755,7 @@ class TransformerTensorProcessor:
             x1_list, x2_list, x3_list = [], [], []
 
         state_obj_tensor_batch = (
-            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4)),
+            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, N_X1_PLANES, 37, 4)),
             (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
             torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
         )
@@ -784,6 +829,7 @@ class TransformerTensorProcessor:
             ).unsqueeze(
                 0
             )  # Shape: (1, 150)
+            masked_encoding_token_tensor = self._relative_seats(masked_encoding_token_tensor, turn.player)
 
             X_embeddings.append(masked_encoding_token_tensor)
             encoding_indices.append(encoding_idx)
@@ -835,7 +881,7 @@ class TransformerTensorProcessor:
             x1_list, x2_list, x3_list = [], [], []
 
         state_obj_tensor_batch = (
-            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4)),
+            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, N_X1_PLANES, 37, 4)),
             (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
             torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
         )
@@ -868,6 +914,30 @@ class TransformerTensorProcessor:
             padding_mask,
         )
 
+    @staticmethod
+    def _post_turn_responders(turn: PostTurn) -> List[int]:
+        """Responders of a PostTurn that become training samples, in turn order after the discarder.
+
+        A responder that executed an action is always a sample (both winners of a double ron).
+        A responder that executed nothing is a "pass" sample only when that pass was observed:
+        priority is ron (3) > pon / daiminkan (2) > chi (1), and when another responder executed
+        an action of HIGHER priority than ANY action this responder was offered, this responder
+        may have chosen that weaker action and lost the race; the XML does not say, so the sample
+        is dropped (~2% of responders). A responder offered only a ron while another ron'd, or
+        offered only a ron while another pon'd, did pass (double ron is allowed; ron beats pon).
+        """
+        lowest, done = {}, {}
+        for p in range(4):
+            offered = [(3, d.executed) for d in turn.decisions[p][DECISION_AGARI_IDX]]
+            offered += [(1 if d.naki.is_chi() else 2, d.executed) for d in turn.decisions[p][DECISION_NAKI_IDX]]
+            if not offered:
+                continue
+            lowest[p] = min(prio for prio, _ in offered)
+            done[p] = max((prio for prio, executed in offered if executed), default=0)
+        top = max(done.values(), default=0)
+        order = [(turn.player + k) % 4 for k in (1, 2, 3)]
+        return [p for p in order if p in lowest and (done[p] > 0 or top <= lowest[p])]
+
     def _build_post_tensor(
         self, post_turns: List[PostTurn], encoding_token_tensor: torch.Tensor
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -891,7 +961,6 @@ class TransformerTensorProcessor:
         filter_tensors = []
         y = []
         encoding_indices = []
-        players = [0, 1, 2, 3]
 
         for turn in post_turns:
             decisions = turn.decisions  # type: List[List[List[Decision]]]
@@ -912,16 +981,11 @@ class TransformerTensorProcessor:
                 0
             )  # Shape: (1, 150)
 
-            # Create state object tensor
-            x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
+            for player_idx in self._post_turn_responders(turn):
+                # the RESPONDER's hand / discards / tile counts, not the discarder's
+                x1, x2, x3 = self._convert_state_obj_to_tensors(turn.responder_states[player_idx])
+                history = self._relative_seats(masked_encoding_token_tensor, player_idx)
 
-            # TODO: instead of going player by player, go decision type by decision type
-            action_player = turn.player
-            for player_idx in players[action_player + 1 :] + players[:action_player]:
-                if sum(map(len, decisions[player_idx])) == 0:
-                    continue
-
-                contains_executed = False
                 result = 0
                 decision_mask = torch.zeros(154, dtype=torch.float32)
 
@@ -935,13 +999,11 @@ class TransformerTensorProcessor:
                         decision_mask[1] = 1.0
                         if decision_type[0].executed:
                             result = 1
-                            contains_executed = True
 
                     elif decision_idx == DECISION_REACH_IDX:
                         decision_mask[2] = 1.0
                         if decision_type[0].executed:
                             result = 2
-                            contains_executed = True
 
                     elif decision_idx == DECISION_NAKI_IDX:
                         for meld_decision in decision_type:
@@ -950,19 +1012,15 @@ class TransformerTensorProcessor:
 
                             if meld_decision.executed:
                                 result = idx
-                                contains_executed = True
 
                     else:
                         raise ValueError(f"Invalid decision_idx: {decision_idx}")
 
-                X_embeddings.append(masked_encoding_token_tensor)
+                X_embeddings.append(history)
                 state_obj_tensors.append((x1, x2, x3))
                 filter_tensors.append(decision_mask)
                 y.append(result)
                 encoding_indices.append(encoding_idx)
-
-                if contains_executed:
-                    break
 
         encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, dtype=torch.int64)
 
@@ -972,7 +1030,7 @@ class TransformerTensorProcessor:
             x1_list, x2_list, x3_list = [], [], []
 
         state_obj_tensor_batch = (
-            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, 3, 37, 4)),
+            (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, N_X1_PLANES, 37, 4)),
             (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
             torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
         )
@@ -1007,78 +1065,63 @@ class TransformerTensorProcessor:
 
     def _convert_state_obj_to_tensors(self, stateObj) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Converts a StateObject instance into tensors.
-
-        Args:
-            stateObj (StateObject): The state object to convert.
+        Converts a StateObject into the three StateNet inputs, all from the point of view of
+        stateObj.player ("me"). Seat axes are RELATIVE: index 0 = me, 1 = shimocha, 2 = toimen, 3 = kamicha.
 
         Returns:
-            Tuple containing:
-                - x1: Tensor of shape (1, 3, 37, 4)
-                - x2: Tensor of shape (1, 7, 4)
-                - x3: Tensor of shape (1, 4)
+            x1: (1, N_X1_PLANES, 37, 4) thermometer planes (plane c, column j = 1 iff count > j)
+            x2: (1, 7, 4) per-seat rows: scores/250, parent, parent_rounds_remaining/2, double_reaches,
+                reaches, ippatsu, is_menzen
+            x3: (1, 4): remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8
+        Every input is O(1): fc_main_1 has no LayerNorm before its ReLU, and raw scores (~250) killed
+        14-53% of its units in the unnormalised model.
         """
-        # x1: Contains hand_tensor, remaining_tiles_pov, sutehai_tensor
-        # Transform hand_tensor
-        hand_tensor = torch.tensor(stateObj.hand_tensor, dtype=torch.long)
+        me = stateObj.player
+        seats = [(me + d) % 4 for d in range(4)]  # relative seat -> absolute seat
         range_tensor = torch.arange(4)
-        hand_tensor = (range_tensor < hand_tensor.unsqueeze(1)).float().unsqueeze(0)  # Shape: (1, 37, 4)
 
-        # Transform remaining_tiles_pov
-        remaining_tiles_pov = torch.tensor(stateObj.remaining_tiles_pov, dtype=torch.long)
-        remaining_tiles_pov = (
-            (range_tensor < remaining_tiles_pov.unsqueeze(1)).float().unsqueeze(0)
-        )  # Shape: (1, 37, 4)
+        def plane(counts) -> torch.Tensor:  # (37,) counts -> (1, 37, 4)
+            counts = torch.as_tensor(np.asarray(counts), dtype=torch.long)
+            return (range_tensor < counts.unsqueeze(1)).float().unsqueeze(0)
 
-        # Transform sutehai_tensor
-        sutehai_tensor = torch.tensor(stateObj.sutehai_tensors[stateObj.player], dtype=torch.long)
-        sutehai_tensor = (range_tensor < sutehai_tensor.unsqueeze(1)).float().unsqueeze(0)  # Shape: (1, 37, 4)
+        drawn = np.zeros(37, dtype=np.float32)
+        if stateObj.drawn_tile is not None:
+            drawn[stateObj.drawn_tile] = 1.0
+        safe = stateObj.safe_tiles if stateObj.safe_tiles is not None else np.zeros((4, 37), dtype=np.float32)
 
-        # **Ensure 2D Tensor by Stacking Along New Dimension**
-        x1 = torch.stack([hand_tensor, remaining_tiles_pov, sutehai_tensor], dim=1)  # Shape: (1, 3, 37, 4)
+        planes = (
+            [
+                plane(stateObj.hand_tensor),
+                plane(stateObj.remaining_tiles_pov),
+                plane(stateObj.sutehai_tensors[me]),
+                plane(drawn),
+            ]
+            + [plane(stateObj.sutehai_tensors[q]) for q in seats[1:]]
+            + [plane(safe[q]) for q in seats[1:]]
+        )
+        assert len(planes) == N_X1_PLANES
+        x1 = torch.stack(planes, dim=1)  # (1, N_X1_PLANES, 37, 4)
 
-        # x2: Contains scores, parent_tensor, parent_rounds_remaining, double_reaches, reaches, ippatsu, is_menzen
-        scores = torch.tensor(stateObj.scores, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 4)
-        parent_tensor = torch.tensor(stateObj.parent_tensor, dtype=torch.float32).unsqueeze(
-            0
-        )  # Shape: (1, 4)
-        parent_rounds_remaining = torch.tensor(
-            stateObj.parent_rounds_remaining, dtype=torch.float32
-        ).unsqueeze(
-            0
-        )  # Shape: (1, 4)
-        double_reaches = torch.tensor(stateObj.double_reaches, dtype=torch.float32).unsqueeze(
-            0
-        )  # Shape: (1, 4)
-        reaches = torch.tensor(stateObj.reaches, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 4)
-        ippatsu = torch.tensor(stateObj.ippatsu, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 4)
-        is_menzen = torch.tensor(stateObj.is_menzen, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 4)
+        def row(values, scale=1.0) -> torch.Tensor:  # absolute per-seat values -> (1, 4) relative, scaled
+            return torch.tensor([float(values[q]) / scale for q in seats], dtype=torch.float32).unsqueeze(0)
 
         x2 = torch.stack(
             [
-                scores,
-                parent_tensor,
-                parent_rounds_remaining,
-                double_reaches,
-                reaches,
-                ippatsu,
-                is_menzen,
+                row(stateObj.scores, 250.0),  # 25000 points -> 1.0
+                row(stateObj.parent_tensor),
+                row(stateObj.parent_rounds_remaining, 2.0),
+                row(stateObj.double_reaches),
+                row(stateObj.reaches),
+                row(stateObj.ippatsu),
+                row(stateObj.is_menzen),
             ],
             dim=1,
-        )  # Shape: (1, 7, 4)
+        )  # (1, 7, 4)
 
-        # x3: Contains remaining_tsumo, kyotaku, honba, rounds_remaining
         x3 = torch.tensor(
-            [
-                [
-                    stateObj.remaining_tsumo,
-                    stateObj.kyotaku,
-                    stateObj.honba,
-                    stateObj.rounds_remaining,
-                ]
-            ],
+            [[stateObj.remaining_tsumo / 70.0, stateObj.kyotaku / 4.0, stateObj.honba / 8.0, stateObj.rounds_remaining / 8.0]],
             dtype=torch.float32,
-        )  # Shape: (1, 4)
+        )  # (1, 4)
 
         return x1, x2, x3
 

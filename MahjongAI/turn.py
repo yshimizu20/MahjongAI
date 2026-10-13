@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 
 from MahjongAI.state import StateObject
 from MahjongAI.decision import Decision
@@ -47,9 +47,13 @@ class DiscardTurn(HalfTurn):
         stateObj: StateObject,
         discarded_tile: int,  # 0-135
         encoding_idx: int,
+        is_riichi_declaration: bool = False,
     ):
+        """is_riichi_declaration: the player chose this tile while declaring riichi (a free choice).
+        Every later discard by a player in riichi is forced: it must be the drawn tile."""
         super().__init__(player, HalfTurn.DISCARD, stateObj, encoding_idx)
         self.discarded_tile = discarded_tile
+        self.is_riichi_declaration = is_riichi_declaration
 
     def __repr__(self):
         return "DiscardTurn Object | Player: {} | Discarded Tile: {}".format(
@@ -64,9 +68,16 @@ class PostTurn(HalfTurn):
         stateObj: StateObject,
         decisions: List[List[List[Decision]]],
         encoding_idx: int,
+        responder_states: Dict[int, StateObject],
     ):
+        """
+        player: the discarder (or the kakan player for chankan). stateObj: the DISCARDER's state, kept
+        for debugging only. responder_states[p]: the state as responder p sees it; the model must use this.
+        encoding_idx: history length INCLUDING the discard/kakan token being answered.
+        """
         super().__init__(player, HalfTurn.POST, stateObj, encoding_idx)
         self.decisions = decisions
+        self.responder_states = responder_states
 
     def __repr__(self):
         return "PostTurn Object | Player: {} | Decisions: {}".format(

@@ -21,6 +21,22 @@ from MahjongAI.result import AgariResult, RyukyokuResult
 
 
 shanten_solver = Shanten()
+KIND_TO_RED = {4: 34, 13: 35, 22: 36}  # 5m, 5p, 5s -> their red slot in the 37-index
+
+
+def _mark_safe(row: np.ndarray, kind: int) -> None:
+    """Mark tile KIND `kind` (0-33) safe in a (37,) safe_tiles row. Safety is per kind: a five sets both its
+    plain slot and its red slot 34-36, whichever copy was discarded."""
+    row[kind] = 1.0
+    if kind in KIND_TO_RED:
+        row[KIND_TO_RED[kind]] = 1.0
+
+
+def _double_riichi(first_go_around_uninterrupted: bool, own_discards: int, cycles: int, is_menzen: list) -> bool:
+    """A riichi is a double riichi iff it is declared on the player's own first discard and nobody has called
+    anything yet (chi, pon, daiminkan, ankan or kakan). cycles / is_menzen are unused: they are the old test
+    (`cycles <= 4 and min(is_menzen)`, true after an early ankan), which the gates self-test reinstates."""
+    return first_go_around_uninterrupted and own_discards == 0
 
 
 class InvalidGameException(Exception):
@@ -90,7 +106,8 @@ def process(file_path: str, verbose: bool = False):
         assert sum(remaining_tiles[:34]) == 83
 
         halfturns = []
-        encoding_tokens = []
+        # the initial dora indicator is public from the first decision on (kan doras arrive as DORA events)
+        encoding_tokens = [new_dora2idx(TILE2IDX[int(dora)][0])]
 
         # more non-tensor state objects
         double_reaches = [0] * 4
@@ -103,6 +120,43 @@ def process(file_path: str, verbose: bool = False):
         cycles = 0
         acquired = None
         result_idx = None
+        last_draw = None  # (player, TILE2IDX[tile]) of the latest draw; None after a chi/pon/kan until the next draw
+        riichi_declaring = False  # True from REACH step 1 until the declaration discard
+        first_go_around_uninterrupted = True  # False after the first call of the round (any chi / pon / kan)
+        own_discards = [0] * 4
+        safe_tiles = np.zeros((4, 37), dtype=np.float32)  # safe_tiles[q]: tiles that cannot deal into q's riichi
+
+        def make_state(p: int) -> StateObject:
+            """Snapshot of the round as player p sees it right now.
+
+            Every per-player array is COPIED (hand, remaining_tiles_pov, sutehai, melds): the round loop
+            mutates these buffers in place, and tensors are built only after the whole round is parsed,
+            so a view would show end-of-round values to every sample. Lists that the loop rebinds on
+            change (reaches, ippatsu, double_reaches, scores, doras) are safe to share.
+            """
+            return StateObject(
+                remaining_turns=remaining_tsumo,
+                hand_tensor=hand_tensors[p].copy(),
+                remaining_tiles=remaining_tiles.copy(),
+                remaining_tiles_pov=remaining_tiles_pov[p].copy(),
+                sutehai_tensors=np.copy(sutehai_tensors),
+                is_menzen=is_menzen[:],
+                double_reaches=double_reaches,
+                reaches=reaches,
+                ippatsu=ippatsu,
+                melds=[m[:] for m in melds],
+                scores=scores,
+                kyotaku=kyotaku,
+                honba=honba,
+                dora=doras,
+                parent_tensor=parent_tensor,
+                rounds_remaining=rounds_remaining,
+                parent_rounds_remaining=parent_rounds_remaining,
+                remaining_tsumo=remaining_tsumo,
+                player=p,
+                drawn_tile=list(last_draw[1]) if last_draw is not None and last_draw[0] == p else None,
+                safe_tiles=safe_tiles.copy(),
+            )
 
         if verbose:
             print(f"Scores: {scores}")
@@ -119,20 +173,19 @@ def process(file_path: str, verbose: bool = False):
 
             if eventtype == "DORA":
                 tile = int(event["attr"]["hai"])
-                tile_idx = TILE2IDX[tile][0]
+                tile_idx = TILE2IDX[tile]  # a red five decrements its kind AND its red slot, as at INIT
                 doras = doras[:] + [tile]
                 remaining_tiles[tile_idx] -= 1
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1
-                remaining_tsumo -= 1
-                encoding_tokens.append(new_dora2idx(tile_idx))
+                encoding_tokens.append(new_dora2idx(tile_idx[0]))  # the token stays on the kind index
 
             elif eventtype == "REACH":
                 assert curr_halfturn is not None
                 player = int(event["attr"]["who"])
 
                 if event["attr"]["step"] == "1":
-                    assert isinstance(curr_halfturn, DuringTurn)
+                    assert isinstance(curr_halfturn, DuringTurn) and curr_halfturn.player == player
                     assert acquired is not None
 
                     for decision in curr_halfturn.decisions[DECISION_REACH_IDX]:
@@ -140,17 +193,23 @@ def process(file_path: str, verbose: bool = False):
                         decision.executed = True
                         break
 
-                else:  # event["attr"]["step"] == 2
-                    assert isinstance(curr_halfturn, PostTurn)
+                    # The declaration is public BEFORE the declaration discard: the player picks that
+                    # tile knowing it is in riichi, and every responder sees the riichi token.
                     reaches = reaches[:]
                     reaches[player] = 1
+                    if _double_riichi(first_go_around_uninterrupted, own_discards[player], cycles, is_menzen):
+                        double_reaches = double_reaches[:]  # set with the declaration, like reaches
+                        double_reaches[player] = 1
+                    for kind in np.flatnonzero(sutehai_tensors[player, :34]):  # his own discards: furiten
+                        _mark_safe(safe_tiles[player], kind)
+                    encoding_tokens.append(reach2idx(player))
+                    riichi_declaring = True
+
+                else:  # step 2: the riichi stands (the declaration discard was not ronned); pay the stick
+                    assert isinstance(curr_halfturn, PostTurn)
                     kyotaku += 1
                     scores = scores.copy()
                     scores[player] -= 10
-                    if cycles <= 4 and min(is_menzen):
-                        double_reaches = double_reaches[:]
-                        double_reaches[player] = 1
-                    encoding_tokens.append(reach2idx(player))
 
                 ippatsu = ippatsu[:]
                 ippatsu[player] = 1
@@ -158,38 +217,37 @@ def process(file_path: str, verbose: bool = False):
             elif eventtype == "N":
                 assert curr_halfturn is not None
                 acquired = None
+                last_draw = None
 
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
+                first_go_around_uninterrupted = False  # any call, an ankan included, ends double-riichi eligibility
                 from_who = naki.from_who()
                 cycles += (player - from_who) % 4
                 melds[player] = melds[player][:] + [naki]
 
                 encoding_tokens.append(naki2idx(player, naki))
 
-                # change executed to True
+                # Label the executed call. Match on the ACTION INDEX the model predicts, never on the
+                # raw Tenhou meld code: its `which`/unused-copy bits depend on tile ids the mask cannot know.
                 if naki.is_ankan() or naki.is_kakan():
-                    assert isinstance(curr_halfturn, DuringTurn)
-
-                    for decision in curr_halfturn.decisions[DECISION_NAKI_IDX]:
-                        assert isinstance(decision, NakiDecision)
-                        if decision.naki.convenient_naki_code == naki.convenient_naki_code:
-                            decision.executed = True
-                            break
-
+                    assert isinstance(curr_halfturn, DuringTurn) and curr_halfturn.player == player
+                    target_idx = naki.get_during_turn_filter_idx()
+                    offered = [
+                        d for d in curr_halfturn.decisions[DECISION_NAKI_IDX]
+                        if d.naki.get_during_turn_filter_idx() == target_idx
+                    ]
                 else:
                     assert isinstance(curr_halfturn, PostTurn)
-                    # TODO: exclude decision that would not have been picked up anyways
-                    for lst in curr_halfturn.decisions:
-                        for decision in lst[DECISION_NAKI_IDX]:
-                            assert isinstance(decision, NakiDecision)
-                            # TODO: check if this is correct
-                            if decision.naki.convenient_naki_code == naki.convenient_naki_code:
-                                decision.executed = True
-                                break
-
-                if not naki.is_chi() and not naki.is_pon():
-                    remaining_tsumo -= 1
+                    target_idx = naki.get_post_turn_filter_idx()
+                    offered = [
+                        d for d in curr_halfturn.decisions[player][DECISION_NAKI_IDX]
+                        if d.naki.get_post_turn_filter_idx() == target_idx
+                    ]
+                assert len(offered) == 1, (
+                    f"call {naki!r} (idx {target_idx}) by player {player} matched {len(offered)} offered decisions"
+                )
+                offered[0].executed = True
 
                 exposed, acquired = naki.get_exposed()
                 exposed_idx = TILE2IDX[exposed]
@@ -209,32 +267,15 @@ def process(file_path: str, verbose: bool = False):
                 if acquired is not None:
                     hand_tensors_full[player][TILE2IDX[acquired]] += 1.0
 
-                stateObj = StateObject(
-                    remaining_turns=remaining_tsumo,
-                    hand_tensor=hand_tensors[player].copy(),
-                    remaining_tiles=remaining_tiles,
-                    remaining_tiles_pov=remaining_tiles_pov[player][:],
-                    sutehai_tensors=np.copy(sutehai_tensors),
-                    is_menzen=is_menzen[:],
-                    double_reaches=double_reaches,
-                    reaches=reaches,  # share same reach list
-                    ippatsu=ippatsu,  # share same ippatsu list
-                    melds=melds,
-                    scores=scores,
-                    kyotaku=kyotaku,
-                    honba=honba,
-                    dora=doras,  # share same dora list
-                    parent_tensor=parent_tensor,
-                    rounds_remaining=rounds_remaining,
-                    parent_rounds_remaining=parent_rounds_remaining,
-                    remaining_tsumo=remaining_tsumo,
-                    player=player,
-                )
-
+                # update open-hand / ippatsu flags BEFORE the snapshot so the discard that follows
+                # this call sees is_menzen[player] = 0 and ippatsu cleared. A kakan clears ippatsu only
+                # AFTER its chankan PostTurn below: ippatsu still counts for a chankan ron.
                 if naki.from_who() != 0:
                     is_menzen[player] = 0
-                if sum(ippatsu):
+                if sum(ippatsu) and not naki.is_kakan():
                     ippatsu = [0] * 4
+
+                stateObj = make_state(player)
 
                 # in case of Kakan, create new post turn to train on chankan ron decision
                 if naki.is_kakan():
@@ -277,9 +318,13 @@ def process(file_path: str, verbose: bool = False):
                         stateObj=stateObj,
                         decisions=new_post_decisions,
                         encoding_idx=len(encoding_tokens),
+                        responder_states={p: make_state(p) for p in range(4) if p != player},
                     )
 
                     halfturns.append(curr_halfturn)
+
+                    if sum(ippatsu):  # the chankan window is closed: the kakan breaks every ippatsu
+                        ippatsu = [0] * 4
 
                 # TODO: add logic for ankan kokushi ron
                 if naki.is_ankan():
@@ -299,19 +344,17 @@ def process(file_path: str, verbose: bool = False):
                 cycles += 1
                 acquired = int(eventtype[1:])
                 tile_idx = TILE2IDX[acquired]
+                last_draw = (player, tile_idx)
                 remaining_tiles[tile_idx] -= 1
                 remaining_tiles_pov[player][tile_idx] -= 1
-                remaining_tsumo -= 1
+                remaining_tsumo -= 1  # the ONLY decrement: 70 draws per round, kans included (rinshan draw is a T event)
+                assert remaining_tsumo >= 0, remaining_tsumo
                 assert hands[player, acquired] == 0.0
 
                 hands[player, acquired] = 1.0
                 hand_tensors[player][tile_idx] += 1.0
                 hand_tensors_full[player][tile_idx] += 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 2
-
-                if ippatsu[player]:
-                    ippatsu = ippatsu[:]
-                    ippatsu[player] = 0
 
                 # check if tsumo is possible
                 agari_decisions = evaluate_tsumo(
@@ -365,27 +408,7 @@ def process(file_path: str, verbose: bool = False):
                     naki_decisions,
                 ]
 
-                stateObj = StateObject(
-                    remaining_turns=remaining_tsumo,
-                    hand_tensor=hand_tensors[player].copy(),
-                    remaining_tiles=remaining_tiles,
-                    remaining_tiles_pov=remaining_tiles_pov[player][:],
-                    sutehai_tensors=np.copy(sutehai_tensors),
-                    is_menzen=is_menzen[:],
-                    double_reaches=double_reaches,
-                    reaches=reaches,  # share same reach list
-                    ippatsu=ippatsu,  # share same ippatsu list
-                    melds=melds,
-                    scores=scores,
-                    kyotaku=kyotaku,
-                    honba=honba,
-                    dora=doras,  # share same dora list
-                    parent_tensor=parent_tensor,
-                    rounds_remaining=rounds_remaining,
-                    parent_rounds_remaining=parent_rounds_remaining,
-                    remaining_tsumo=remaining_tsumo,
-                    player=player,
-                )
+                stateObj = make_state(player)
 
                 halfturn = DuringTurn(
                     player=player,
@@ -396,6 +419,12 @@ def process(file_path: str, verbose: bool = False):
 
                 halfturns.append(halfturn)
                 curr_halfturn = halfturn  # carry over
+
+                # the first draw after riichi ends the ippatsu window AFTER its tsumo decision and snapshot:
+                # an ippatsu tsumo sees ippatsu = 1, the discard that follows sees 0
+                if ippatsu[player]:
+                    ippatsu = ippatsu[:]
+                    ippatsu[player] = 0
 
             elif eventtype[0] in ["D", "E", "F", "G"]:
                 assert acquired is not None
@@ -413,10 +442,12 @@ def process(file_path: str, verbose: bool = False):
 
                 half_turn = DiscardTurn(
                     player=player,
-                    stateObj=stateObj,
+                    stateObj=make_state(player),  # fresh: a DORA (after a kan) or REACH event can sit between the draw and this discard
                     discarded_tile=tile,
                     encoding_idx=len(encoding_tokens),
+                    is_riichi_declaration=riichi_declaring,
                 )
+                riichi_declaring = False
                 halfturns.append(half_turn)
 
                 hands[player, tile] = 0.0
@@ -424,10 +455,16 @@ def process(file_path: str, verbose: bool = False):
                 hand_tensors_full[player][tile_idx] -= 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[player].sum()
                 sutehai_tensors[player, tile_idx] = 1.0
+                own_discards[player] += 1
+                if reaches[player]:  # his own discard is safe against himself at once: he cannot ron it
+                    _mark_safe(safe_tiles[player], tile_idx[0])
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1.0
                 remaining_tiles_pov[player][tile_idx] += 1.0
+
+                # the discard is now public: responders must see it in their history
+                encoding_tokens.append(discard2idx(player, tile_idx[-1], tile == acquired))  # red five -> slot 34-36
 
                 # post_decisions will contain three lists of different decisions: ron, pon/kan, chi
                 post_decisions = [[[] for _ in range(3)] for _ in range(4)]
@@ -461,18 +498,27 @@ def process(file_path: str, verbose: bool = False):
                     if p == player:
                         assert len(decision_lst) == 0
                         continue
+                    if reaches[p]:  # a player in riichi cannot chi, pon or daiminkan
+                        continue
                     post_decisions[p][DECISION_NAKI_IDX] = decision_lst
 
                 half_turn = PostTurn(
                     player=player,
                     stateObj=stateObj,
                     decisions=post_decisions,
-                    encoding_idx=len(encoding_tokens),
+                    encoding_idx=len(encoding_tokens),  # includes the discard token appended above
+                    responder_states={p: make_state(p) for p in range(4) if p != player},
                 )
                 halfturns.append(half_turn)
                 curr_halfturn = half_turn  # carry over
 
-                encoding_tokens.append(discard2idx(player, tile_idx[0], tile == acquired))
+                # Only now, with the responder snapshots built, is the discard safe against the OTHER riichi
+                # players (riichi furiten): a responder asked to ron this tile must not see it marked safe.
+                # A responder who rons it ends the round, so marking every riichi player is exact.
+                for q in range(4):
+                    if reaches[q] and q != player:
+                        _mark_safe(safe_tiles[q], tile_idx[0])
+
                 acquired = None
 
             elif eventtype == "AGARI" or eventtype == "RYUUKYOKU":
@@ -490,10 +536,12 @@ def process(file_path: str, verbose: bool = False):
 
             if event["event"] == "AGARI":
                 result.append(AgariResult(list(map(int, event["attr"]["sc"].split(",")))))
-                # TODO: make decision executed = True
+                _mark_agari_executed(halfturns, int(event["attr"]["who"]), int(event["attr"]["fromWho"]))
 
             elif event["event"] == "RYUUKYOKU":
                 result.append(RyukyokuResult(list(map(int, event["attr"]["sc"].split(",")))))
+                if event["attr"].get("type") == "ron3":
+                    _mark_ron3_executed(halfturns)
 
         if verbose:
             print(f"len(turns): {len(turns)}")
@@ -508,6 +556,39 @@ def process(file_path: str, verbose: bool = False):
         all_encoding_tokens.append(encoding_tokens)
 
     return all_halfturns, all_encoding_tokens
+
+
+def _mark_agari_executed(halfturns: list, who: int, from_who: int) -> None:
+    """Label the win that an AGARI event records.
+
+    Tsumo (who == fromWho): the last halfturn is the winner's DuringTurn (also after a rinshan draw).
+    Ron (who != fromWho): the last halfturn is a PostTurn whose player is the loser; this covers
+    chankan (the PostTurn built in the kakan branch) and double ron (two AGARI events, same PostTurn).
+    """
+    assert halfturns, "AGARI event with no halfturns"
+    last = halfturns[-1]
+    if who == from_who:
+        assert isinstance(last, DuringTurn) and last.player == who, f"tsumo by {who}, last halfturn: {last!r}"
+        agari = last.decisions[DECISION_AGARI_IDX]
+    else:
+        assert isinstance(last, PostTurn) and last.player == from_who, f"ron by {who} from {from_who}, last halfturn: {last!r}"
+        agari = last.decisions[who][DECISION_AGARI_IDX]
+    assert len(agari) == 1, f"win by player {who} was not offered by evaluate_ron/evaluate_tsumo: {last!r}"
+    agari[0].executed = True
+
+
+def _mark_ron3_executed(halfturns: list) -> None:
+    """Label the three rons of a triple-ron abort (<RYUUKYOKU type="ron3">): no AGARI event follows, so
+    every responder offered a ron on the last PostTurn that holds an agari decision declared it."""
+    last = next((t for t in reversed(halfturns) if isinstance(t, PostTurn) and any(
+        t.decisions[p][DECISION_AGARI_IDX] for p in range(4) if p != t.player)), None)
+    assert last is not None, "ron3 with no PostTurn offering a ron"
+    marked = 0
+    for p in range(4):
+        if p != last.player and last.decisions[p][DECISION_AGARI_IDX]:
+            last.decisions[p][DECISION_AGARI_IDX][0].executed = True
+            marked += 1
+    assert marked == 3, f"ron3 marked {marked} rons on {last!r}"
 
 
 def _get_rounds(file_path: str):
