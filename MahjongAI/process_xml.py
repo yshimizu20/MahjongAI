@@ -90,7 +90,8 @@ def process(file_path: str, verbose: bool = False):
         assert sum(remaining_tiles[:34]) == 83
 
         halfturns = []
-        encoding_tokens = []
+        # the initial dora indicator is public from the first decision on (kan doras arrive as DORA events)
+        encoding_tokens = [new_dora2idx(TILE2IDX[int(dora)][0])]
 
         # more non-tensor state objects
         double_reaches = [0] * 4
@@ -103,6 +104,9 @@ def process(file_path: str, verbose: bool = False):
         cycles = 0
         acquired = None
         result_idx = None
+        last_draw = None  # (player, TILE2IDX[tile]) of the latest draw; None after a chi/pon/kan until the next draw
+        riichi_declaring = False  # True from REACH step 1 until the declaration discard
+        safe_tiles = np.zeros((4, 37), dtype=np.float32)  # safe_tiles[q]: tiles that cannot deal into q's riichi
 
         def make_state(p: int) -> StateObject:
             """Snapshot of the round as player p sees it right now.
@@ -132,6 +136,8 @@ def process(file_path: str, verbose: bool = False):
                 parent_rounds_remaining=parent_rounds_remaining,
                 remaining_tsumo=remaining_tsumo,
                 player=p,
+                drawn_tile=list(last_draw[1]) if last_draw is not None and last_draw[0] == p else None,
+                safe_tiles=safe_tiles.copy(),
             )
 
         if verbose:
@@ -154,7 +160,6 @@ def process(file_path: str, verbose: bool = False):
                 remaining_tiles[tile_idx] -= 1
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1
-                remaining_tsumo -= 1
                 encoding_tokens.append(new_dora2idx(tile_idx))
 
             elif eventtype == "REACH":
@@ -162,7 +167,7 @@ def process(file_path: str, verbose: bool = False):
                 player = int(event["attr"]["who"])
 
                 if event["attr"]["step"] == "1":
-                    assert isinstance(curr_halfturn, DuringTurn)
+                    assert isinstance(curr_halfturn, DuringTurn) and curr_halfturn.player == player
                     assert acquired is not None
 
                     for decision in curr_halfturn.decisions[DECISION_REACH_IDX]:
@@ -170,17 +175,22 @@ def process(file_path: str, verbose: bool = False):
                         decision.executed = True
                         break
 
-                else:  # event["attr"]["step"] == 2
-                    assert isinstance(curr_halfturn, PostTurn)
+                    # The declaration is public BEFORE the declaration discard: the player picks that
+                    # tile knowing it is in riichi, and every responder sees the riichi token.
                     reaches = reaches[:]
                     reaches[player] = 1
+                    safe_tiles[player] = np.maximum(safe_tiles[player], sutehai_tensors[player])
+                    encoding_tokens.append(reach2idx(player))
+                    riichi_declaring = True
+
+                else:  # step 2: the riichi stands (the declaration discard was not ronned); pay the stick
+                    assert isinstance(curr_halfturn, PostTurn)
                     kyotaku += 1
                     scores = scores.copy()
                     scores[player] -= 10
                     if cycles <= 4 and min(is_menzen):
                         double_reaches = double_reaches[:]
                         double_reaches[player] = 1
-                    encoding_tokens.append(reach2idx(player))
 
                 ippatsu = ippatsu[:]
                 ippatsu[player] = 1
@@ -188,6 +198,7 @@ def process(file_path: str, verbose: bool = False):
             elif eventtype == "N":
                 assert curr_halfturn is not None
                 acquired = None
+                last_draw = None
 
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
@@ -217,9 +228,6 @@ def process(file_path: str, verbose: bool = False):
                     f"call {naki!r} (idx {target_idx}) by player {player} matched {len(offered)} offered decisions"
                 )
                 offered[0].executed = True
-
-                if not naki.is_chi() and not naki.is_pon():
-                    remaining_tsumo -= 1
 
                 exposed, acquired = naki.get_exposed()
                 exposed_idx = TILE2IDX[exposed]
@@ -312,9 +320,11 @@ def process(file_path: str, verbose: bool = False):
                 cycles += 1
                 acquired = int(eventtype[1:])
                 tile_idx = TILE2IDX[acquired]
+                last_draw = (player, tile_idx)
                 remaining_tiles[tile_idx] -= 1
                 remaining_tiles_pov[player][tile_idx] -= 1
-                remaining_tsumo -= 1
+                remaining_tsumo -= 1  # the ONLY decrement: 70 draws per round, kans included (rinshan draw is a T event)
+                assert remaining_tsumo >= 0, remaining_tsumo
                 assert hands[player, acquired] == 0.0
 
                 hands[player, acquired] = 1.0
@@ -406,10 +416,12 @@ def process(file_path: str, verbose: bool = False):
 
                 half_turn = DiscardTurn(
                     player=player,
-                    stateObj=stateObj,
+                    stateObj=make_state(player),  # fresh: a DORA (after a kan) or REACH event can sit between the draw and this discard
                     discarded_tile=tile,
                     encoding_idx=len(encoding_tokens),
+                    is_riichi_declaration=riichi_declaring,
                 )
+                riichi_declaring = False
                 halfturns.append(half_turn)
 
                 hands[player, tile] = 0.0
@@ -417,13 +429,16 @@ def process(file_path: str, verbose: bool = False):
                 hand_tensors_full[player][tile_idx] -= 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[player].sum()
                 sutehai_tensors[player, tile_idx] = 1.0
+                for q in range(4):
+                    if reaches[q]:  # anything discarded after q's riichi is safe against q (riichi furiten)
+                        safe_tiles[q, tile_idx] = 1.0
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1.0
                 remaining_tiles_pov[player][tile_idx] += 1.0
 
                 # the discard is now public: responders must see it in their history
-                encoding_tokens.append(discard2idx(player, tile_idx[0], tile == acquired))
+                encoding_tokens.append(discard2idx(player, tile_idx[-1], tile == acquired))  # red five -> slot 34-36
 
                 # post_decisions will contain three lists of different decisions: ron, pon/kan, chi
                 post_decisions = [[[] for _ in range(3)] for _ in range(4)]
@@ -456,6 +471,8 @@ def process(file_path: str, verbose: bool = False):
                 for p, decision_lst in enumerate(naki_decisions):
                     if p == player:
                         assert len(decision_lst) == 0
+                        continue
+                    if reaches[p]:  # a player in riichi cannot chi, pon or daiminkan
                         continue
                     post_decisions[p][DECISION_NAKI_IDX] = decision_lst
 

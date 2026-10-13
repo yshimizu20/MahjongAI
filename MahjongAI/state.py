@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List
+from typing import List, Optional
 from MahjongAI.draw import Naki
 
 
@@ -25,7 +25,9 @@ class StateObject:
         rounds_remaining: int,
         parent_rounds_remaining: List[int],
         remaining_tsumo: int,
-        player: int
+        player: int,
+        drawn_tile: Optional[List[int]] = None,
+        safe_tiles: Optional[np.ndarray] = None,
     ):
         self.remaining_turns = remaining_turns
         self.hand_tensor = hand_tensor
@@ -46,3 +48,7 @@ class StateObject:
         self.parent_rounds_remaining = parent_rounds_remaining
         self.remaining_tsumo = remaining_tsumo
         self.player = player
+        # 37-index list of the tile `player` just drew (two entries for a red five); None after a call
+        self.drawn_tile = drawn_tile
+        # (4, 37): safe_tiles[q] = tiles that cannot deal into q; all zero until q declares riichi
+        self.safe_tiles = safe_tiles

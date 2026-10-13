@@ -47,9 +47,13 @@ class DiscardTurn(HalfTurn):
         stateObj: StateObject,
         discarded_tile: int,  # 0-135
         encoding_idx: int,
+        is_riichi_declaration: bool = False,
     ):
+        """is_riichi_declaration: the player chose this tile while declaring riichi (a free choice).
+        Every later discard by a player in riichi is forced: it must be the drawn tile."""
         super().__init__(player, HalfTurn.DISCARD, stateObj, encoding_idx)
         self.discarded_tile = discarded_tile
+        self.is_riichi_declaration = is_riichi_declaration
 
     def __repr__(self):
         return "DiscardTurn Object | Player: {} | Discarded Tile: {}".format(
