@@ -27,6 +27,7 @@ learning_rate = 1e-3
 VAL_DAYS = ("20211230", "20211231")  # held out from training; estimate_loss reads the first VAL_GAMES of them
 VAL_GAMES = 20
 DATA_SEED = 0  # training file order; stored in the checkpoint so a resume continues where it stopped
+MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)
 if torch.cuda.is_available():
     device = torch.device("cuda")
 # elif torch.backends.mps.is_available():
@@ -86,15 +87,12 @@ def train(model_name: str, total_steps: int):
     warmup_steps = min(1000, total_steps // 10)  # a 300-step smoke must leave warmup; a 1,100-step run must not collapse
     lr_total_steps = total_steps  # the cosine reaches ~0 at the end of THIS run's budget
 
-    # Initialize the scheduler with a linear warmup and cosine decay
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: (
-            float(step) / float(max(1, warmup_steps))
-            if step < warmup_steps
-            else 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / float(max(1, lr_total_steps - warmup_steps))))
-        ),
-    )
+    def lr_lambda(step: int) -> float:  # linear warmup, then cosine decay to ~0 at lr_total_steps
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / float(max(1, lr_total_steps - warmup_steps))))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # Initialize step counter
     current_step = 0
@@ -114,6 +112,11 @@ def train(model_name: str, total_steps: int):
                 ) from e
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            # The optimizer state restores the LR of the OLD run's schedule; recompute it on THIS run's
+            # horizon (total_steps may have changed) so the first resumed update already uses it.
+            for group, base_lr in zip(optimizer.param_groups, scheduler.base_lrs):
+                group["lr"] = base_lr * lr_lambda(scheduler.last_epoch)
+            scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
             current_step = checkpoint.get('current_step', 0)
             loader_state = checkpoint.get('loader_state')
             log_message(f"Loaded checkpoint from {latest_checkpoint} — resuming at step {current_step}")
@@ -157,13 +160,22 @@ def train(model_name: str, total_steps: int):
         log_message(f"Model saved at {model_path}; skipped games: {dict(cluster.skipped())}; "
                     f"skipped samples: {dict(model.tensor_processor.skipped)}")
 
-    for step in range(current_step, total_steps):
+    # total_steps counts optimizer UPDATES: a batch without samples does not consume the budget, so the
+    # cosine horizon (lr_total_steps) and the number of updates agree. A persistent data failure aborts.
+    batches_without_update = 0
+    while current_step < total_steps:
+        step = current_step  # index of the update this batch is about to make (log / eval cadence)
         games, tokens = next(cluster)
-        if not games:  # every game of this batch failed to parse; the loader already logged them
-            continue
-        results = model(games, tokens, sample=True)
+        results = model(games, tokens, sample=True) if games else None  # no games: every one failed to parse
         if not results:
+            batches_without_update += 1
+            if batches_without_update >= MAX_BATCHES_WITHOUT_UPDATE:
+                raise RuntimeError(
+                    f"{batches_without_update} consecutive batches gave no training sample at step {current_step} "
+                    f"(skipped games: {dict(cluster.skipped())}); check the data"
+                )
             continue
+        batches_without_update = 0
 
         total_loss = sum(out.loss for out in results.values())
 

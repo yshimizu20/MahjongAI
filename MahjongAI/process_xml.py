@@ -21,6 +21,22 @@ from MahjongAI.result import AgariResult, RyukyokuResult
 
 
 shanten_solver = Shanten()
+KIND_TO_RED = {4: 34, 13: 35, 22: 36}  # 5m, 5p, 5s -> their red slot in the 37-index
+
+
+def _mark_safe(row: np.ndarray, kind: int) -> None:
+    """Mark tile KIND `kind` (0-33) safe in a (37,) safe_tiles row. Safety is per kind: a five sets both its
+    plain slot and its red slot 34-36, whichever copy was discarded."""
+    row[kind] = 1.0
+    if kind in KIND_TO_RED:
+        row[KIND_TO_RED[kind]] = 1.0
+
+
+def _double_riichi(first_go_around_uninterrupted: bool, own_discards: int, cycles: int, is_menzen: list) -> bool:
+    """A riichi is a double riichi iff it is declared on the player's own first discard and nobody has called
+    anything yet (chi, pon, daiminkan, ankan or kakan). cycles / is_menzen are unused: they are the old test
+    (`cycles <= 4 and min(is_menzen)`, true after an early ankan), which the gates self-test reinstates."""
+    return first_go_around_uninterrupted and own_discards == 0
 
 
 class InvalidGameException(Exception):
@@ -106,6 +122,8 @@ def process(file_path: str, verbose: bool = False):
         result_idx = None
         last_draw = None  # (player, TILE2IDX[tile]) of the latest draw; None after a chi/pon/kan until the next draw
         riichi_declaring = False  # True from REACH step 1 until the declaration discard
+        first_go_around_uninterrupted = True  # False after the first call of the round (any chi / pon / kan)
+        own_discards = [0] * 4
         safe_tiles = np.zeros((4, 37), dtype=np.float32)  # safe_tiles[q]: tiles that cannot deal into q's riichi
 
         def make_state(p: int) -> StateObject:
@@ -179,10 +197,11 @@ def process(file_path: str, verbose: bool = False):
                     # tile knowing it is in riichi, and every responder sees the riichi token.
                     reaches = reaches[:]
                     reaches[player] = 1
-                    if cycles <= 4 and min(is_menzen):  # double riichi: set with the declaration, like reaches
-                        double_reaches = double_reaches[:]
+                    if _double_riichi(first_go_around_uninterrupted, own_discards[player], cycles, is_menzen):
+                        double_reaches = double_reaches[:]  # set with the declaration, like reaches
                         double_reaches[player] = 1
-                    safe_tiles[player] = np.maximum(safe_tiles[player], sutehai_tensors[player])
+                    for kind in np.flatnonzero(sutehai_tensors[player, :34]):  # his own discards: furiten
+                        _mark_safe(safe_tiles[player], kind)
                     encoding_tokens.append(reach2idx(player))
                     riichi_declaring = True
 
@@ -202,6 +221,7 @@ def process(file_path: str, verbose: bool = False):
 
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
+                first_go_around_uninterrupted = False  # any call, an ankan included, ends double-riichi eligibility
                 from_who = naki.from_who()
                 cycles += (player - from_who) % 4
                 melds[player] = melds[player][:] + [naki]
@@ -435,9 +455,9 @@ def process(file_path: str, verbose: bool = False):
                 hand_tensors_full[player][tile_idx] -= 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[player].sum()
                 sutehai_tensors[player, tile_idx] = 1.0
-                for q in range(4):
-                    if reaches[q]:  # anything discarded after q's riichi is safe against q (riichi furiten)
-                        safe_tiles[q, tile_idx] = 1.0
+                own_discards[player] += 1
+                if reaches[player]:  # his own discard is safe against himself at once: he cannot ron it
+                    _mark_safe(safe_tiles[player], tile_idx[0])
 
                 for pov in remaining_tiles_pov:
                     pov[tile_idx] -= 1.0
@@ -491,6 +511,13 @@ def process(file_path: str, verbose: bool = False):
                 )
                 halfturns.append(half_turn)
                 curr_halfturn = half_turn  # carry over
+
+                # Only now, with the responder snapshots built, is the discard safe against the OTHER riichi
+                # players (riichi furiten): a responder asked to ron this tile must not see it marked safe.
+                # A responder who rons it ends the round, so marking every riichi player is exact.
+                for q in range(4):
+                    if reaches[q] and q != player:
+                        _mark_safe(safe_tiles[q], tile_idx[0])
 
                 acquired = None
 
