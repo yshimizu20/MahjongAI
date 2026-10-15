@@ -31,9 +31,13 @@ class DuringTurn(HalfTurn):
         stateObj: StateObject,
         decisions: List[List[Decision]],
         encoding_idx: int,
+        tsumo_blocked: Optional[str] = None,
     ):
+        """tsumo_blocked (debug, read by the gates only): why a complete hand got no tsumo option (utils/agari.py
+        NO_YAKU), else None."""
         super().__init__(player, HalfTurn.DURING, stateObj, encoding_idx)
         self.decisions = decisions
+        self.tsumo_blocked = tsumo_blocked
 
     def __repr__(self):
         return "DuringTurn Object | Player: {} | Decisions: {}".format(
@@ -76,15 +80,19 @@ class PostTurn(HalfTurn):
         decisions: List[List[List[Decision]]],
         encoding_idx: int,
         responder_states: Dict[int, StateObject],
+        ron_blocked: Optional[Dict[int, str]] = None,
     ):
         """
         player: the discarder (or the kakan player for chankan). stateObj: the DISCARDER's state, kept
         for debugging only. responder_states[p]: the state as responder p sees it; the model must use this.
         encoding_idx: history length INCLUDING the discard/kakan token being answered.
+        ron_blocked (debug, read by the gates only): responder -> why the answered tile completes their hand but
+        gives no ron option (a furiten reason or NO_YAKU, utils/agari.py).
         """
         super().__init__(player, HalfTurn.POST, stateObj, encoding_idx)
         self.decisions = decisions
         self.responder_states = responder_states
+        self.ron_blocked = dict(ron_blocked or {})
 
     def __repr__(self):
         return "PostTurn Object | Player: {} | Decisions: {}".format(
