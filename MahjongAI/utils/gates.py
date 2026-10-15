@@ -38,6 +38,15 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           the padding mask; the post sample set follows the priority rule (executors always, pre-empted
           responders never); the last history token of a post sample is exactly the discard / kakan it
           answers; the tensor builder skipped nothing
+  LEGAL   the discard mask == held tiles (red-five split) minus the illegal kinds, both slots of a five, with
+          the context and the rules rebuilt WITHOUT utils/legal.py, DiscardTurn.after_call or
+          is_riichi_declaration (legal_oracles.py): a declaration (the seat's own reach token right before)
+          keeps only the kinds that leave tenpai by Agari wait enumeration on the full hand; a post-call
+          discard (the seat's own chi / pon token right before) loses the called kind and the suji kind, from
+          the latest discard token and the two tiles that left the hand; any other discard == plain presence.
+          The executed discard is always enabled, no unheld slot is, no mask is empty, and every riichi offer
+          has at least one tenpai-keeping discard. Coverage: declaration samples == riichi labels and post-call
+          samples == chi + pon labels; is_riichi_declaration == the token context, both ways
 """
 import argparse
 import collections
@@ -54,6 +63,8 @@ from MahjongAI import process_xml
 from MahjongAI.process_xml import process, InvalidGameException, discard2idx, naki2idx, reach2idx, new_dora2idx
 from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.draw import Naki
+from MahjongAI.decision import ReachDecision
+from MahjongAI.utils import legal, legal_oracles
 from MahjongAI.utils.constants import DECISION_AGARI_IDX, DECISION_NAKI_IDX, DECISION_REACH_IDX, EventStateTypes, EventTypes, TILE2IDX
 from MahjongAI.agents.encoder_conv import TransformerTensorProcessor, N_X1_PLANES
 
@@ -84,7 +95,13 @@ ZERO_GATES = [
     "post_sample_count_mismatch", "post_history_last_token",
     "during_sample_count_mismatch", "during_target_mismatch", "post_target_mismatch",
     "ippatsu_window_wrong", "red_pov_mismatch",
+    "discard_target_illegal", "discard_mask_unrestricted_mismatch", "discard_mask_superset", "discard_mask_empty",
+    "riichi_mask_mismatch", "kuikae_mask_mismatch", "riichi_offer_without_legal_discard",
 ]
+PON_IDX = range(83, 120)  # post-head pon indices; chi is 2-82 (the low 8 bits of a call token)
+CONTEXT_GATE = {"plain": "discard_mask_unrestricted_mismatch", "declaration": "riichi_mask_mismatch",
+                "chi": "kuikae_mask_mismatch", "pon": "kuikae_mask_mismatch"}
+Legality = collections.namedtuple("Legality", ["context", "legal", "forbidden", "called"])
 TARGET_GATE = {"during": "during_target_mismatch", "discard": "discard_label_mismatch", "post": "post_target_mismatch"}
 RED_TO_PLAIN = {34: 4, 35: 13, 36: 22}
 PLAIN_TO_RED = {plain: red for red, plain in RED_TO_PLAIN.items()}
@@ -347,6 +364,59 @@ def xml_rounds(raw: str):
     return rounds
 
 
+def held(so) -> set:
+    return set(np.flatnonzero(so.hand_tensor[:34] > 0).tolist())
+
+
+def presence_slots(hand) -> np.ndarray:
+    """37-slot presence restated: a slot is on iff the hand holds that tile; a five's plain slot needs a non-red copy."""
+    pres = (np.asarray(hand) > 0).astype(np.float32)
+    for red, plain in RED_TO_PLAIN.items():
+        pres[plain] = float(hand[plain] - hand[red] > 0)
+    return pres
+
+
+def expected_slots(pres, legal_kinds) -> np.ndarray:
+    """pres with every kind outside legal_kinds cleared, both slots of a five."""
+    exp = pres.copy()
+    for slot in range(37):
+        if RED_TO_PLAIN.get(slot, slot) not in legal_kinds:
+            exp[slot] = 0.0
+    return exp
+
+
+def discard_legality(halfturns, i, tokens) -> Legality:
+    """Legal kinds of DiscardTurn halfturns[i], rebuilt from tokens and states alone (legal_oracles):
+      declaration  the token right before is the seat's own reach: held kinds that keep tenpai (Agari oracle)
+      chi / pon    the token right before is the seat's own chi / pon: held kinds minus the forbidden ones, from the
+                   latest discard token before the call (the called kind) and the two kinds that left the hand
+                   between the answering PostTurn's responder state and this state
+      plain        anything else: every held kind
+      broken       a call context that cannot be rebuilt (counted as kuikae_mask_mismatch)"""
+    t = halfturns[i]
+    so, p, eidx = t.stateObj, t.player, t.encoding_idx
+    prev = tokens[eidx - 1] if eidx else 0
+    if _is_reach(prev) and _who(prev) == p:
+        return Legality("declaration", held(so) & legal_oracles.tenpai_kinds_by_agari(so.hand_tensor, so.melds[p]), None, None)
+    if not (_is_call(prev) and _event(prev) == EventStateTypes.POST and _who(prev) == p and (prev & 0xFF) < PON_IDX.stop):
+        return Legality("plain", held(so), None, None)
+    broken = Legality("broken", None, None, None)
+    disc = next((tokens[j] for j in range(eidx - 2, -1, -1) if _is_discard(tokens[j])), None)
+    before = halfturns[i - 1] if i else None
+    if disc is None or not isinstance(before, PostTurn) or p not in before.responder_states:
+        return broken
+    diff = (before.responder_states[p].hand_tensor[:34] - so.hand_tensor[:34]).astype(int)
+    if (diff < 0).any():
+        return broken
+    called = RED_TO_PLAIN.get(_tile(disc), _tile(disc))
+    used = np.repeat(np.arange(34), diff).tolist()
+    forbidden = legal_oracles.kuikae_forbidden_by_ranks(called, used)
+    context = "pon" if sorted(used) == [called, called] else "chi"
+    if forbidden is None or ((prev & 0xFF) in PON_IDX) != (context == "pon"):
+        return broken
+    return Legality(context, held(so) - forbidden, forbidden, called)
+
+
 def check_state(so, C, tp):
     """Built-tensor invariants of one StateObject: plane count, actor-first rows, input scale."""
     x1, x2, x3 = tp._convert_state_obj_to_tensors(so)
@@ -361,9 +431,10 @@ def check_state(so, C, tp):
 
 def check_samples(head, tt, expected, tokens, C):
     """EVERY input of every built sample of one head against the StateObject and the history it was built from.
-    expected: per sample, in build order, (target, state, history length, actor, answered token or None)."""
+    expected: per sample, in build order, (target, state, history length, actor, answered token or None,
+    Legality or None)."""
     enc, (x1, x2, x3), mask, y, pad = tt
-    for i, (target, so, eidx, actor, answer) in enumerate(expected):
+    for i, (target, so, eidx, actor, answer, lg) in enumerate(expected):
         if y[i].item() != target:
             C[TARGET_GATE[head]] += 1
         w1, w2, w3 = expected_inputs(so)
@@ -380,11 +451,22 @@ def check_samples(head, tt, expected, tokens, C):
             C["history_prefix_mismatch"] += 1
         if pad[i].tolist() != [j < eidx for j in range(len(hist))]:
             C["padding_mask_mismatch"] += 1
-        if head == "discard":
-            hand = so.hand_tensor
+        if head == "discard" and lg.context != "broken":
+            m = mask[i].numpy()
+            pres = presence_slots(so.hand_tensor)
+            want = expected_slots(pres, lg.legal)
+            if m[target] != 1:
+                C["discard_target_illegal"] += 1
+            if (m > pres).any():
+                C["discard_mask_superset"] += 1
+            if not np.array_equal(m, want):
+                C[CONTEXT_GATE[lg.context]] += 1
             for red, plain in RED_TO_PLAIN.items():
-                if mask[i, plain].item() != float(hand[plain] - hand[red] > 0) or mask[i, red].item() != float(hand[red] > 0):
+                if m[plain] != want[plain] or m[red] != want[red]:
                     C["discard_mask_red_rule"] += 1
+            if lg.context != "plain":  # diagnostics, not gates
+                C[f"legal_{lg.context}_samples"] += 1
+                C[f"legal_{'declaration' if lg.context == 'declaration' else 'kuikae'}_slots_removed"] += int(pres.sum() - m.sum())
         if head == "post" and (answer is None or eidx == 0 or hist[eidx - 1] != rotate([answer], actor)[0]):
             C["post_history_last_token"] += 1
 
@@ -436,7 +518,11 @@ def count_game(path, H, T, C, tp):
             so = t.stateObj
             if isinstance(t, DuringTurn):
                 if sum(map(len, t.decisions)):
-                    exp["during"].append((expected_during_target(t), so, t.encoding_idx, t.player, None))
+                    exp["during"].append((expected_during_target(t), so, t.encoding_idx, t.player, None, None))
+                if t.decisions[DECISION_REACH_IDX]:
+                    C["riichi_offers"] += 1
+                    if not legal_oracles.tenpai_kinds_by_agari(so.hand_tensor, so.melds[t.player]):
+                        C["riichi_offer_without_legal_discard"] += 1
                 if t.decisions[DECISION_AGARI_IDX] and t.decisions[DECISION_AGARI_IDX][0].executed:
                     C["lab_tsumo"] += 1
                 for d in t.decisions[DECISION_NAKI_IDX]:
@@ -445,13 +531,18 @@ def count_game(path, H, T, C, tp):
                 check_state(so, C, tp)
 
             elif isinstance(t, DiscardTurn):
-                if not (so.reaches[t.player] and not t.is_riichi_declaration):
-                    exp["discard"].append((TILE2IDX[t.discarded_tile][-1], so, t.encoding_idx, t.player, None))
-                if t.is_riichi_declaration:
-                    prev = tokens[t.encoding_idx - 1]
-                    if not (so.reaches[t.player] == 1 and _is_reach(prev) and _who(prev) == t.player):
-                        C["riichi_declaration_unflagged"] += 1
-                elif so.reaches[t.player]:
+                # a declaration discard is a sample, a later riichi discard is not: decided from the tokens (the
+                # seat's own reach right before), never from is_riichi_declaration, which is checked against it
+                prev = tokens[t.encoding_idx - 1] if t.encoding_idx else 0
+                declared = _is_reach(prev) and _who(prev) == t.player
+                if not (so.reaches[t.player] and not declared):
+                    lg = discard_legality(halfturns, i, tokens)
+                    if lg.context == "broken":
+                        C["kuikae_mask_mismatch"] += 1
+                    exp["discard"].append((TILE2IDX[t.discarded_tile][-1], so, t.encoding_idx, t.player, None, lg))
+                if t.is_riichi_declaration != declared or (declared and so.reaches[t.player] != 1):
+                    C["riichi_declaration_unflagged"] += 1  # the flag disagrees with the tokens, either way
+                elif so.reaches[t.player] and not declared:
                     tok = tokens[t.encoding_idx]  # the discard token itself
                     drawn = so.drawn_tile
                     if not (_is_discard(tok) and _who(tok) == t.player and (tok >> 7) & 1 == 1
@@ -483,7 +574,7 @@ def count_game(path, H, T, C, tp):
                             C["lab_" + kind_of(d.naki)] += 1
                     check_state(rs, C, tp)
                 for p, target in expected_responders(t):
-                    exp["post"].append((target, t.responder_states[p], t.encoding_idx, p, answer))
+                    exp["post"].append((target, t.responder_states[p], t.encoding_idx, p, answer, None))
 
         for p, called, first, disc, nxt in ippatsu_windows(halfturns, tokens):
             C["ippatsu_windows"] += 1
@@ -499,6 +590,7 @@ def count_game(path, H, T, C, tp):
             print(f"tensor build error in {path}: {type(e).__name__}: {str(e)[:200]}")
             continue
         C["tensor_skipped"] = sum(tp.skipped.values())
+        C["discard_mask_empty"] = tp.skipped["discard_mask_empty"]
         for name, tt in zip(HEADS, (td, tdisc, tpost)):
             if len(tt[3]):
                 C[f"{name}_label_outside_mask"] += int((tt[2][np.arange(len(tt[3])), tt[3]] != 1).sum().item())
@@ -579,6 +671,12 @@ def failed_gates(C) -> dict:
         if C[f"{h}_label_outside_mask"]:
             bad[f"{h}_label_outside_mask"] = C[f"{h}_label_outside_mask"]
     bad.update({k: C[k] for k in ZERO_GATES if C[k] != 0})
+    # every riichi declaration and every chi / pon has its discard sample, and the oracle found its context
+    if C["legal_declaration_samples"] != C["lab_riichi"]:
+        bad["legal_declaration_coverage"] = f"{C['legal_declaration_samples']} != lab_riichi={C['lab_riichi']}"
+    if C["legal_chi_samples"] + C["legal_pon_samples"] != C["lab_chi"] + C["lab_pon"]:
+        bad["legal_call_coverage"] = (f"{C['legal_chi_samples']} + {C['legal_pon_samples']} != "
+                                      f"lab_chi + lab_pon={C['lab_chi'] + C['lab_pon']}")
     return bad
 
 
@@ -591,7 +689,10 @@ def check(C):
         f"wins tsumo {C['lab_tsumo']}/{C['xml_tsumo']} ron {C['lab_ron']}/{C['xml_ron']} | "
         f"riichi {C['lab_riichi']}/{C['xml_riichi']} | "
         f"calls " + " ".join(f"{k} {C['lab_' + k]}/{C['xml_' + k]}" for k in KINDS) + " | "
-        f"samples " + " ".join(f"{h} {C[h + '_samples']}" for h in HEADS) + " | tensors == parser == xml"
+        f"samples " + " ".join(f"{h} {C[h + '_samples']}" for h in HEADS) + " | tensors == parser == xml | "
+        f"legal mask: declarations {C['legal_declaration_samples']} (-{C['legal_declaration_slots_removed']} slots) "
+        f"after chi {C['legal_chi_samples']} pon {C['legal_pon_samples']} (-{C['legal_kuikae_slots_removed']} slots) "
+        f"riichi offers {C['riichi_offers']}"
     )
 
 
@@ -670,6 +771,20 @@ def _patch_inputs(tp, edit):
         return x1, x2, x3
 
     tp._convert_state_obj_to_tensors = bad
+
+
+def _patch_mask(tp, edit):
+    """Corrupt the discard masks: edit(turn, mask) runs on a copy of each sample's mask and returns the mask used."""
+    orig = tp._discard_mask
+    tp._discard_mask = lambda turn: edit(turn, orig(turn).clone())
+
+
+def legal_samples(H, T):
+    """(DiscardTurn, Legality) for every discard sample (the forced discards of a player in riichi excluded)."""
+    for halfturns, tokens in zip(H, T):
+        for i, t in enumerate(halfturns):
+            if isinstance(t, DiscardTurn) and not (t.stateObj.reaches[t.player] and not t.is_riichi_declaration):
+                yield t, discard_legality(halfturns, i, tokens)
 
 
 def self_test():
@@ -877,6 +992,138 @@ def self_test():
     def stale_answered_token(H, T, tp):  # a PostTurn history stops one token early: it answers the event before
         t = next(t for halfturns in H for t in halfturns if isinstance(t, PostTurn) and expected_responders(t))
         t.encoding_idx -= 1
+
+    # ---- legal discard mask (T-031); every fixture predicate uses the oracle context, never after_call
+    def declaration_restricted(H, T):
+        return any(lg.context == "declaration" and lg.legal < held(t.stateObj) for t, lg in legal_samples(H, T))
+
+    def chi_holds_suji(H, T):
+        return any(lg.context == "chi" and (lg.forbidden - {lg.called}) & held(t.stateObj) for t, lg in legal_samples(H, T))
+
+    def call_holds_forbidden(H, T):
+        return any(lg.context in ("chi", "pon") and lg.forbidden & held(t.stateObj) for t, lg in legal_samples(H, T))
+
+    def red_only_legal_five(H, T):
+        return any(lg.context == "plain" and t.stateObj.hand_tensor[red] > 0
+                   and t.stateObj.hand_tensor[plain] == t.stateObj.hand_tensor[red]
+                   for t, lg in legal_samples(H, T) for red, plain in RED_TO_PLAIN.items())
+
+    def declaration_presence_mask(H, T, tp):  # the old mask on a declaration: every held tile
+        _patch_mask(tp, lambda turn, m: torch.from_numpy(legal.presence_mask(turn.stateObj.hand_tensor))
+                    if turn.is_riichi_declaration else m)
+
+    def drop_suji_ban(H, T, tp):  # after a chi, only the called kind is forbidden
+        def edit(turn, m):
+            call = turn.after_call
+            if call is None or not call.is_chi():
+                return m
+            color, number, which, *_ = call.pattern_chi()
+            called = 9 * color + number + which
+            m = torch.from_numpy(legal.presence_mask(turn.stateObj.hand_tensor))
+            m[called] = 0.0
+            if called in PLAIN_TO_RED:
+                m[PLAIN_TO_RED[called]] = 0.0
+            return m
+        _patch_mask(tp, edit)
+
+    def clear_after_call(H, T, tp):  # the parser forgets the call: no kuikae at all
+        n = 0
+        for t in (t for halfturns in H for t in halfturns if isinstance(t, DiscardTurn) and t.after_call is not None):
+            t.after_call = None
+            n += 1
+        found(n, "a discard after a chi / pon")
+
+    def first_sample_only(edit):  # edit(turn, m) -> m or None (skip this sample); applied to one sample
+        done = []
+        def once(turn, m):
+            if done:
+                return m
+            out = edit(turn, m)
+            if out is None:
+                return m
+            done.append(True)
+            return out
+        return once
+
+    def zero_legal_plain_slot(H, T, tp):  # an ordinary sample loses a legal, non-target tile
+        def edit(turn, m):
+            if turn.is_riichi_declaration or turn.after_call is not None:
+                return None
+            target = TILE2IDX[turn.discarded_tile][-1]
+            others = [j for j in np.flatnonzero(m.numpy()).tolist() if j != target]
+            if not others:
+                return None
+            m[others[0]] = 0.0
+            return m
+        _patch_mask(tp, first_sample_only(edit))
+
+    def zero_target_slot(H, T, tp):
+        def edit(turn, m):
+            if m.sum() < 2:
+                return None
+            m[TILE2IDX[turn.discarded_tile][-1]] = 0.0
+            return m
+        _patch_mask(tp, first_sample_only(edit))
+
+    def enable_unheld_slot(H, T, tp):
+        def edit(turn, m):
+            m[int(np.flatnonzero(turn.stateObj.hand_tensor == 0)[0])] = 1.0
+            return m
+        _patch_mask(tp, first_sample_only(edit))
+
+    def empty_mask(H, T, tp):
+        _patch_mask(tp, first_sample_only(lambda turn, m: m.zero_()))
+
+    def offer_riichi_off_tenpai(H, T, tp):  # a riichi offered on a hand with no tenpai-keeping discard
+        # the turn is picked with the gate's own oracle: this tests the gate's wiring, not the oracle (that is
+        # covered by riichi_mask_mismatch, which compares it with an independent shanten-based mask)
+        for t in (t for halfturns in H for t in halfturns if isinstance(t, DuringTurn)):
+            so = t.stateObj
+            if not t.decisions[DECISION_REACH_IDX] and not legal_oracles.tenpai_kinds_by_agari(so.hand_tensor, so.melds[t.player]):
+                t.decisions[DECISION_REACH_IDX].append(ReachDecision(t.player, executed=False))
+                return
+        found(0, "a DuringTurn whose hand has no tenpai-keeping discard")
+
+    def tsumogiri_declaration(H, T):  # a declaration whose discard is the drawn tile: the flag alone decides its fate
+        return any(t.is_riichi_declaration and (tokens[t.encoding_idx] >> 7) & 1
+                   for halfturns, tokens in zip(H, T) for t in halfturns if isinstance(t, DiscardTurn))
+
+    def unflag_tsumogiri_declaration(H, T, tp):  # the sample would vanish from the encoder AND the old gate set
+        for halfturns, tokens in zip(H, T):
+            for t in (t for t in halfturns if isinstance(t, DiscardTurn)):
+                if t.is_riichi_declaration and (tokens[t.encoding_idx] >> 7) & 1:
+                    t.is_riichi_declaration = False
+                    return
+        found(0, "a tsumogiri riichi declaration")
+
+    def zero_red_only_five(H, T, tp):  # a red-only five (plain slot 0) loses its red slot too
+        def edit(turn, m):
+            hand = turn.stateObj.hand_tensor
+            reds = [red for red, plain in RED_TO_PLAIN.items() if hand[red] > 0 and hand[plain] == hand[red] and m[red] == 1]
+            if not reds:
+                return None
+            m[reds[0]] = 0.0
+            return m
+        _patch_mask(tp, first_sample_only(edit))
+
+    expect_failure("declaration mask = every held tile", "riichi_mask_mismatch", declaration_presence_mask,
+                   game=_game_with(declaration_restricted))
+    expect_failure("suji kuikae ban dropped after a chi", "kuikae_mask_mismatch", drop_suji_ban,
+                   game=_game_with(chi_holds_suji))
+    expect_failure("after_call cleared on post-call discards", "kuikae_mask_mismatch", clear_after_call,
+                   game=_game_with(call_holds_forbidden))
+    expect_failure("legal tile removed from an ordinary sample", "discard_mask_unrestricted_mismatch", zero_legal_plain_slot)
+    expect_failure("executed discard masked out", "discard_target_illegal", zero_target_slot)
+    expect_failure("unheld tile enabled", "discard_mask_superset", enable_unheld_slot)
+    expect_failure("all-zero discard mask", "discard_mask_empty", empty_mask)
+    expect_failure("riichi offered with no tenpai-keeping discard", "riichi_offer_without_legal_discard", offer_riichi_off_tenpai)
+    expect_failure("red-only five's red slot cleared", "discard_mask_red_rule", zero_red_only_five,
+                   game=_game_with(red_only_legal_five))
+    unflag_game = _game_with(tsumogiri_declaration)
+    expect_failure("declaration flag cleared (tsumogiri)", "riichi_declaration_unflagged", unflag_tsumogiri_declaration,
+                   game=unflag_game)
+    expect_failure("declaration flag cleared (tsumogiri): sample lost", "discard_sample_count_mismatch",
+                   unflag_tsumogiri_declaration, game=unflag_game)
 
     expect_failure("un-labelled ron", "lab_ron", unlabel_ron)
     expect_failure("triple ron left unlabelled", "lab_ron", skip_ron3_marking, game=ron3)

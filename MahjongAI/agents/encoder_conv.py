@@ -21,6 +21,7 @@ from MahjongAI.utils.constants import (
     MAX_SEQUENCE_LENGTH,
     EventStateTypes,
 )
+from MahjongAI.utils.legal import legal_discard_mask
 
 # Hyperparameters
 DISCARD_ACTION_DIM = 37
@@ -32,7 +33,6 @@ MAX_ACTION_LEN = 150
 #   0 own hand, 1 unseen tile counts, 2 own discards, 3 drawn tile,
 #   4-6 opponents' discards, 7-9 tiles safe against each opponent's riichi (zero while not in riichi)
 N_X1_PLANES = 10
-RED_FIVE_SLOTS = ((4, 34), (13, 35), (22, 36))  # (plain slot, red slot) of 5m, 5p, 5s in the 37-index
 EMBD_SIZE = 64
 N_HEADS = 8
 N_LAYERS = 1
@@ -677,13 +677,12 @@ class TransformerTensorProcessor:
         return tensors_during, tensors_discard, tensors_post
 
     @staticmethod
-    def _discard_mask(hand_tensor: np.ndarray) -> torch.Tensor:
-        """37-way discard mask. A red five is only ever slot 34/35/36; the plain slot needs a non-red copy."""
-        hand = torch.as_tensor(np.asarray(hand_tensor), dtype=torch.float32)
-        mask = (hand > 0).float()
-        for plain, red in RED_FIVE_SLOTS:
-            mask[plain] = float(hand[plain] - hand[red] > 0)
-        return mask
+    def _discard_mask(turn: DiscardTurn) -> torch.Tensor:
+        """37-way LEGAL discard mask (MahjongAI.utils.legal): held tiles with the red-five split, minus the
+        tiles that break a riichi declaration's tenpai and the kuikae tiles after a chi / pon."""
+        return torch.from_numpy(
+            legal_discard_mask(turn.stateObj.hand_tensor, turn.is_riichi_declaration, turn.after_call)
+        )
 
     def _build_discard_tensor(
         self, discard_turns: List[DiscardTurn], encoding_token_tensor: torch.Tensor
@@ -718,6 +717,12 @@ class TransformerTensorProcessor:
                     self.skipped["riichi_discard_not_drawn"] += 1
                 continue
 
+            filter_tensor = self._discard_mask(turn)  # Shape: (37,)
+            if not filter_tensor.any():
+                # no legal discard: a parser / rules bug, not a model matter (gates.py asserts 0)
+                self.skipped["discard_mask_empty"] += 1
+                continue
+
             encoding_idx = turn.encoding_idx
             assert encoding_idx < MAX_SEQUENCE_LENGTH
 
@@ -736,8 +741,6 @@ class TransformerTensorProcessor:
             encoding_indices.append(encoding_idx)
 
             x1, x2, x3 = self._convert_state_obj_to_tensors(turn.stateObj)
-
-            filter_tensor = self._discard_mask(turn.stateObj.hand_tensor)  # Shape: (37,)
 
             # target: slot 34/35/36 for a red five (TILE2IDX[tile] = [kind, red slot]), else the kind
             discarded_tile_idx = TILE2IDX[turn.discarded_tile][-1]
