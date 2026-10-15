@@ -122,6 +122,7 @@ def process(file_path: str, verbose: bool = False):
         result_idx = None
         last_draw = None  # (player, TILE2IDX[tile]) of the latest draw; None after a chi/pon/kan until the next draw
         riichi_declaring = False  # True from REACH step 1 until the declaration discard
+        pending_call = None  # the chi / pon whose discard comes next (kuikae applies to it); None otherwise
         first_go_around_uninterrupted = True  # False after the first call of the round (any chi / pon / kan)
         own_discards = [0] * 4
         safe_tiles = np.zeros((4, 37), dtype=np.float32)  # safe_tiles[q]: tiles that cannot deal into q's riichi
@@ -225,6 +226,8 @@ def process(file_path: str, verbose: bool = False):
                 from_who = naki.from_who()
                 cycles += (player - from_who) % 4
                 melds[player] = melds[player][:] + [naki]
+                if naki.is_chi() or naki.is_pon():
+                    pending_call = naki  # the caller's discard follows directly: no draw in between
 
                 encoding_tokens.append(naki2idx(player, naki))
 
@@ -338,6 +341,7 @@ def process(file_path: str, verbose: bool = False):
 
             elif eventtype[0] in ["T", "U", "V", "W"]:
                 assert acquired is None
+                assert pending_call is None, f"a draw before the discard that follows {pending_call!r}"
                 curr_halfturn = None
 
                 player = ["T", "U", "V", "W"].index(eventtype[0])
@@ -446,8 +450,10 @@ def process(file_path: str, verbose: bool = False):
                     discarded_tile=tile,
                     encoding_idx=len(encoding_tokens),
                     is_riichi_declaration=riichi_declaring,
+                    after_call=pending_call,
                 )
                 riichi_declaring = False
+                pending_call = None
                 halfturns.append(half_turn)
 
                 hands[player, tile] = 0.0

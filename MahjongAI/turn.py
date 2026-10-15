@@ -1,7 +1,8 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from MahjongAI.state import StateObject
 from MahjongAI.decision import Decision
+from MahjongAI.draw import Naki
 
 
 class HalfTurn:
@@ -48,12 +49,18 @@ class DiscardTurn(HalfTurn):
         discarded_tile: int,  # 0-135
         encoding_idx: int,
         is_riichi_declaration: bool = False,
+        after_call: Optional[Naki] = None,
     ):
         """is_riichi_declaration: the player chose this tile while declaring riichi (a free choice).
-        Every later discard by a player in riichi is forced: it must be the drawn tile."""
+        Every later discard by a player in riichi is forced: it must be the drawn tile.
+        after_call: the chi / pon this discard directly follows (kuikae applies), else None. A kan is
+        followed by a rinshan draw, and riichi needs a closed hand, so neither can come with a call."""
+        assert after_call is None or after_call.is_chi() or after_call.is_pon(), f"after_call must be a chi / pon: {after_call!r}"
+        assert not (is_riichi_declaration and after_call is not None), "a riichi declaration cannot follow a call"
         super().__init__(player, HalfTurn.DISCARD, stateObj, encoding_idx)
         self.discarded_tile = discarded_tile
         self.is_riichi_declaration = is_riichi_declaration
+        self.after_call = after_call
 
     def __repr__(self):
         return "DiscardTurn Object | Player: {} | Discarded Tile: {}".format(

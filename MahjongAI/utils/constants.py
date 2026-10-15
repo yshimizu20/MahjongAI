@@ -10,6 +10,7 @@ TILE2IDX[16] += [34]
 TILE2IDX[52] += [35]
 TILE2IDX[88] += [36]
 TILE2IDX = np.array(TILE2IDX, dtype=object)
+RED_FIVE_SLOTS = ((4, 34), (13, 35), (22, 36))  # (plain slot, red slot) of 5m, 5p, 5s in the 37-index
 
 
 REMAINING_TSUMO = 70
