@@ -33,11 +33,13 @@ class ReachDecision(Decision):
 
 
 class AgariDecision(Decision):
-    def __init__(self, player: int, executed: bool):
+    def __init__(self, player: int, executed: bool, yaku: tuple = ()):
+        """yaku (debug, read by the gates only): the win's canonical yaku names (utils/agari.py win_yaku)."""
         super().__init__(player, Decision.AGARI, executed)
+        self.yaku = tuple(yaku)
 
     def __repr__(self) -> str:
-        return f"AgariDecision: player={self.player}, executed={self.executed}"
+        return f"AgariDecision: player={self.player}, executed={self.executed}, yaku={self.yaku}"
 
 
 class PassDecision(Decision):
