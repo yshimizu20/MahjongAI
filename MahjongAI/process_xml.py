@@ -1,14 +1,13 @@
 import sys
 import xml.etree.ElementTree as ET
 import numpy as np
-import copy
 from mahjong.shanten import Shanten
 
 sys.path.append("..")
 
-from MahjongAI.gameinfo import GameInfo, RoundInfo
+from MahjongAI.gameinfo import GameInfo
 from MahjongAI.utils.constants import *
-from MahjongAI.utils.agari import evaluate_ron, evaluate_tsumo
+from MahjongAI.utils.agari import FuritenTracker, WinContext, evaluate_ron, evaluate_tsumo, round_wind, seat_wind
 from MahjongAI.utils import legal
 from MahjongAI.draw import Naki
 from MahjongAI.state import StateObject
@@ -40,6 +39,19 @@ def _double_riichi(first_go_around_uninterrupted: bool, own_discards: int, cycle
     return first_go_around_uninterrupted and own_discards == 0
 
 
+def _is_haitei(remaining_tsumo: int, is_rinshan: bool) -> bool:
+    """Haitei: a tsumo on the last wall draw. A rinshan draw is never haitei, also when it is the 70th draw (Tenhou:
+    haitei and rinshan never combine)."""
+    return remaining_tsumo == 0 and not is_rinshan
+
+
+def _is_houtei(remaining_tsumo: int, is_chankan: bool, after_rinshan: bool) -> bool:
+    """Houtei: a ron on the discard after the last wall draw, also when that draw was a rinshan draw (75/75 such
+    rons in the 2021 logs carry houtei). A chankan is never houtei. after_rinshan is unused: it lets the gates
+    self-test reinstate the rule that drops houtei after a rinshan draw."""
+    return remaining_tsumo == 0 and not is_chankan
+
+
 class InvalidGameException(Exception):
     def __init__(self, msg):
         self.msg = msg
@@ -67,13 +79,14 @@ def process(file_path: str, verbose: bool = False):
 
         scores = [int(score) for score in kyoku_init_state["attr"]["ten"].split(",")]
         parent = kyoku_init_state["attr"]["oya"]
+        oya = int(parent)
         parent_tensor = np.zeros(4, dtype=np.float32)
         parent_tensor[int(parent)] = 1.0
         curr_round, honba, kyotaku, _, _, dora = list(map(int, kyoku_init_state["attr"]["seed"].split(",")))
         doras = [dora]
         rounds_remaining = gameinfo.n_rounds() - int(curr_round)
         parent_rounds_remaining = [(rounds_remaining + i) // 4 for i in range(4)]
-        roundinfo = RoundInfo(gameinfo, curr_round)
+        round_wind_ = round_wind(curr_round)
 
         # create state object tensors
         hand_indices = [
@@ -95,8 +108,6 @@ def process(file_path: str, verbose: bool = False):
         remaining_tiles[TILE2IDX[int(dora)]] -= 1
         for pov in remaining_tiles_pov:
             pov[TILE2IDX[int(dora)]] -= 1
-
-        hand_tensors_full = copy.deepcopy(hand_tensors)  # hand info including all melded tiles
 
         hands = np.zeros((4, 136), dtype=np.float32)
         player_indices = np.arange(4)[:, np.newaxis]
@@ -127,6 +138,27 @@ def process(file_path: str, verbose: bool = False):
         first_go_around_uninterrupted = True  # False after the first call of the round (any chi / pon / kan)
         own_discards = [0] * 4
         safe_tiles = np.zeros((4, 37), dtype=np.float32)  # safe_tiles[q]: tiles that cannot deal into q's riichi
+        rinshan_pending = False  # True from a kan until the rinshan draw that follows it
+        last_draw_rinshan = False  # the latest draw was a rinshan draw
+        furiten = FuritenTracker()
+        for p in range(4):
+            furiten.set_hand(p, hand_tensors[p][:34])
+
+        def ron_contexts(discarder: int, is_chankan: bool) -> dict:
+            """Each responder's WinContext for a ron on the tile just discarded (or added by a kakan)."""
+            return {
+                p: WinContext(
+                    is_tsumo=False,
+                    seat_wind=seat_wind(p, oya),
+                    round_wind=round_wind_,
+                    is_riichi=bool(reaches[p]),
+                    is_double_riichi=bool(double_reaches[p]),
+                    is_ippatsu=bool(ippatsu[p]),
+                    is_chankan=is_chankan,
+                    is_houtei=_is_houtei(remaining_tsumo, is_chankan, last_draw_rinshan),
+                )
+                for p in range(4) if p != discarder
+            }
 
         def make_state(p: int) -> StateObject:
             """Snapshot of the round as player p sees it right now.
@@ -230,6 +262,8 @@ def process(file_path: str, verbose: bool = False):
                 melds[player] = melds[player][:] + [naki]
                 if naki.is_chi() or naki.is_pon():
                     pending_call = naki  # the caller's discard follows directly: no draw in between
+                else:
+                    rinshan_pending = True  # any kan: the caller's next draw is the rinshan draw
 
                 encoding_tokens.append(naki2idx(player, naki))
 
@@ -269,9 +303,6 @@ def process(file_path: str, verbose: bool = False):
                     hands[player, e] -= 1.0
                     hand_tensors[player][TILE2IDX[e]] -= 1.0
 
-                if acquired is not None:
-                    hand_tensors_full[player][TILE2IDX[acquired]] += 1.0
-
                 # update open-hand / ippatsu flags BEFORE the snapshot so the discard that follows
                 # this call sees is_menzen[player] = 0 and ippatsu cleared. A kakan clears ippatsu only
                 # AFTER its chankan PostTurn below: ippatsu still counts for a chankan ron.
@@ -295,23 +326,9 @@ def process(file_path: str, verbose: bool = False):
                     new_post_decisions = [[[] for _ in range(3)] for _ in range(4)]
 
                     # evaluate chankan ron
-                    decisions = evaluate_ron(
-                        player=player,
-                        hand_tensors_full=hand_tensors_full,
-                        naki_list=melds,
-                        sutehai_tensor=sutehai_tensors,
-                        discarded_tile=exposed[0],
-                        doras=doras,
-                        reaches=reaches,
-                        ippatsu=ippatsu,
-                        is_chankan=True,
-                        is_haitei=False,
-                        double_reaches=double_reaches,
-                        is_renhou=[False] * 4,
-                        player_wind=roundinfo.player_wind,
-                        round_wind=roundinfo.round_wind,
-                        kyotaku=kyotaku,
-                        honba=honba,
+                    kakan_kind = exposed[0] // 4
+                    decisions, ron_blocked = evaluate_ron(
+                        player, kakan_kind, hand_tensors, melds, furiten, ron_contexts(player, is_chankan=True)
                     )
 
                     for decision in decisions:
@@ -324,9 +341,12 @@ def process(file_path: str, verbose: bool = False):
                         decisions=new_post_decisions,
                         encoding_idx=len(encoding_tokens),
                         responder_states={p: make_state(p) for p in range(4) if p != player},
+                        ron_blocked=ron_blocked,
                     )
 
                     halfturns.append(curr_halfturn)
+                    # the round goes on past the window only if every responder passed (a passed chankan counts)
+                    furiten.on_offer_passed(kakan_kind, [p for p in range(4) if p != player], reaches)
 
                     if sum(ippatsu):  # the chankan window is closed: the kakan breaks every ippatsu
                         ippatsu = [0] * 4
@@ -357,27 +377,29 @@ def process(file_path: str, verbose: bool = False):
 
                 hands[player, acquired] = 1.0
                 hand_tensors[player][tile_idx] += 1.0
-                hand_tensors_full[player][tile_idx] += 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 2
 
                 # check if tsumo is possible
-                agari_decisions = evaluate_tsumo(
-                    player=player,
-                    hand_tensors_full=hand_tensors_full,
-                    naki_list=melds,
-                    tsumo_tile=acquired,
-                    doras=doras,
-                    reaches=reaches,
-                    ippatsu=ippatsu,
-                    is_haitei=(remaining_tsumo == 0),
-                    is_rinshan=False,
-                    double_reaches=double_reaches,
-                    is_tenhou=(cycles == 1),
-                    is_chiihou=(2 <= cycles <= 4 and min(is_menzen)),
-                    player_wind=roundinfo.player_wind,
-                    round_wind=roundinfo.round_wind,
-                    kyotaku=kyotaku,
-                    honba=honba,
+                is_rinshan = last_draw_rinshan = rinshan_pending
+                rinshan_pending = False
+                first_draw = first_go_around_uninterrupted and own_discards[player] == 0  # no call of any kind yet
+                agari_decisions, tsumo_blocked = evaluate_tsumo(
+                    player,
+                    hand_tensors[player],
+                    melds[player],
+                    tile_idx[0],
+                    WinContext(
+                        is_tsumo=True,
+                        seat_wind=seat_wind(player, oya),
+                        round_wind=round_wind_,
+                        is_riichi=bool(reaches[player]),
+                        is_double_riichi=bool(double_reaches[player]),
+                        is_ippatsu=bool(ippatsu[player]),
+                        is_rinshan=is_rinshan,
+                        is_haitei=_is_haitei(remaining_tsumo, is_rinshan),
+                        is_tenhou=first_draw and player == oya,
+                        is_chiihou=first_draw and player != oya,
+                    ),
                 )
 
                 # check if reach is possible
@@ -427,6 +449,7 @@ def process(file_path: str, verbose: bool = False):
                     stateObj=stateObj,
                     decisions=during_decisions,
                     encoding_idx=len(encoding_tokens),
+                    tsumo_blocked=tsumo_blocked,
                 )
 
                 halfturns.append(halfturn)
@@ -466,10 +489,11 @@ def process(file_path: str, verbose: bool = False):
 
                 hands[player, tile] = 0.0
                 hand_tensors[player][tile_idx] -= 1.0
-                hand_tensors_full[player][tile_idx] -= 1.0
                 assert int(hand_tensors[player][:34].sum()) % 3 == 1, hand_tensors[player].sum()
                 sutehai_tensors[player, tile_idx] = 1.0
                 own_discards[player] += 1
+                furiten.on_discard(player, tile_idx[0])
+                furiten.set_hand(player, hand_tensors[player][:34])  # new waits; the own discard ends same-turn furiten
                 if reaches[player]:  # his own discard is safe against himself at once: he cannot ron it
                     _mark_safe(safe_tiles[player], tile_idx[0])
 
@@ -483,23 +507,8 @@ def process(file_path: str, verbose: bool = False):
                 # post_decisions will contain three lists of different decisions: ron, pon/kan, chi
                 post_decisions = [[[] for _ in range(3)] for _ in range(4)]
 
-                rons = evaluate_ron(
-                    player=player,
-                    hand_tensors_full=hand_tensors_full,
-                    naki_list=melds,
-                    sutehai_tensor=sutehai_tensors,
-                    discarded_tile=tile,
-                    doras=doras,
-                    reaches=reaches,
-                    ippatsu=ippatsu,
-                    is_chankan=False,
-                    is_haitei=(remaining_tsumo == 0),
-                    double_reaches=double_reaches,
-                    is_renhou=[(cycles <= 3 and player >= cycles and min(is_menzen)) for _ in range(4)],
-                    player_wind=roundinfo.player_wind,
-                    round_wind=roundinfo.round_wind,
-                    kyotaku=kyotaku,
-                    honba=honba,
+                rons, ron_blocked = evaluate_ron(
+                    player, tile_idx[0], hand_tensors, melds, furiten, ron_contexts(player, is_chankan=False)
                 )
 
                 for ron in rons:
@@ -528,9 +537,12 @@ def process(file_path: str, verbose: bool = False):
                     decisions=post_decisions,
                     encoding_idx=len(encoding_tokens),  # includes the discard token appended above
                     responder_states={p: make_state(p) for p in range(4) if p != player},
+                    ron_blocked=ron_blocked,
                 )
                 halfturns.append(half_turn)
                 curr_halfturn = half_turn  # carry over
+                # the round goes on past the window only if every responder passed the ron
+                furiten.on_offer_passed(tile_idx[0], [p for p in range(4) if p != player], reaches)
 
                 # Only now, with the responder snapshots built, is the discard safe against the OTHER riichi
                 # players (riichi furiten): a responder asked to ron this tile must not see it marked safe.
@@ -598,11 +610,12 @@ def _mark_agari_executed(halfturns: list, who: int, from_who: int) -> None:
 
 
 def _mark_ron3_executed(halfturns: list) -> None:
-    """Label the three rons of a triple-ron abort (<RYUUKYOKU type="ron3">): no AGARI event follows, so
-    every responder offered a ron on the last PostTurn that holds an agari decision declared it."""
-    last = next((t for t in reversed(halfturns) if isinstance(t, PostTurn) and any(
-        t.decisions[p][DECISION_AGARI_IDX] for p in range(4) if p != t.player)), None)
-    assert last is not None, "ron3 with no PostTurn offering a ron"
+    """Label the three rons of a triple-ron abort (<RYUUKYOKU type="ron3">): no AGARI event follows, and the
+    round ends on the tile the three players declared, so the FINAL halfturn is that PostTurn and all three
+    responders must hold a ron offer there."""
+    assert halfturns, "ron3 with no halfturns"
+    last = halfturns[-1]
+    assert isinstance(last, PostTurn), f"ron3, last halfturn: {last!r}"
     marked = 0
     for p in range(4):
         if p != last.player and last.decisions[p][DECISION_AGARI_IDX]:

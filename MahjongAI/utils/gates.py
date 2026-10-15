@@ -58,6 +58,13 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           suukaikan pending, no daiminkan with 4 kans down, no chi / pon that leaves no legal discard. A turn /
           responder that is not a sample has its parser options compared instead. One named counter per rule
           on the same bits; "options removed" per rule are diagnostics
+  WIN     win options rebuilt WITHOUT utils/agari.py (win_oracles.py): every executed win's yaku, mapped to Tenhou
+          ids, == the <AGARI> yaku (bonus ids dropped) or yakuman ids; for every PostTurn responder whose concealed
+          hand the answered tile completes (direct Agari.is_agari), the parser's furiten verdict == the one rebuilt
+          from the tokens (a wait among the seat's own discard tokens; a complete tile passed at an earlier
+          PostTurn after the seat's latest discard token / after its reach token); a complete hand has an offer XOR
+          a block reason, an incomplete one neither; every offer has a yaku; the built during / post win slot is
+          on iff the sample offers a win
 """
 import argparse
 import collections
@@ -76,8 +83,8 @@ from MahjongAI import process_xml
 from MahjongAI.process_xml import process, InvalidGameException, discard2idx, naki2idx, reach2idx, new_dora2idx
 from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.draw import Naki
-from MahjongAI.decision import NakiDecision, ReachDecision, decision_mask
-from MahjongAI.utils import legal, legal_oracles
+from MahjongAI.decision import AgariDecision, NakiDecision, ReachDecision, decision_mask
+from MahjongAI.utils import agari, legal, legal_oracles, win_oracles
 from MahjongAI.utils.constants import DECISION_AGARI_IDX, DECISION_NAKI_IDX, DECISION_REACH_IDX, EventStateTypes, EventTypes, TILE2IDX
 from MahjongAI.agents.encoder_conv import TransformerTensorProcessor, N_X1_PLANES
 
@@ -96,6 +103,21 @@ KAN4_ROUND = ("20210214", "2021021419gm-00a9-0000-57c92bbe.log", 3)  # 4th kan b
 DEAD_END_CALL = ("20210322", "2021032214gm-00a9-0000-6d556c69.log", 12)  # chi that leaves only kuikae kinds
 RIICHI_ANKAN = ("20210101", "2021010100gm-00a9-0000-17175841.log", None)  # an executed riichi ankan
 CHANKAN_WINDOW = ("20210101", "2021010100gm-00e1-0000-3219df3d.log", 6)  # kakan whose added tile is chi-able
+# T-033 win fixtures. YAKU(i): an <AGARI> whose yaku list holds id i
+def YAKU(i): return rf'<AGARI [^>]*\byaku="(\d+,\d+,)*{i},'
+SEAT_WIND_HOUTEI_LOG = ("20210101", "2021010100gm-00a9-0000-1222e403.log", YAKU(12))  # Haku + seat W; Houtei + Tanyao
+RINSHAN_LOG = ("20210101", "2021010101gm-00a9-0000-004c8ef1.log", YAKU(4))  # Haku + Rinshan; a no-yaku pass (round 2)
+SUUANKOU_LOG = ("20210101", "2021010111gm-00a9-0000-5390436b.log", r'yakuman="([^"]*,)?4[01]\b')
+CHIIHOU_LOG = ("20210219", "2021021911gm-00a9-0000-9ac4312b.log", r'yakuman="([^"]*,)?38\b')
+TENHOU_LOG = ("20210406", "2021040609gm-00a9-0000-6d605f30.log", r'yakuman="([^"]*,)?37\b')
+LAST_RINSHAN_TSUMO_LOG = ("20210117", "2021011702gm-00a9-0000-6c2bc28d.log", YAKU(4))  # rinshan on the 70th draw
+LAST_RINSHAN_HOUTEI_LOG = ("20210102", "2021010221gm-00a9-0000-f90354ec.log", YAKU(6))  # houtei-only ron after it
+TEMP_FURITEN_LOG = ("20210102", "2021010213gm-00a9-0000-5ed455ef.log", r'<AGARI ')
+RIICHI_FURITEN_LOG = ("20210101", "2021010100gm-00a9-0000-3b235798.log", r'<REACH [^>]*step="1"')
+# A passed chankan followed by a same-turn chance: no real log has one with the passer outside discard furiten (all of
+# 2013-2023 scanned, 2026-10-15), so this game is synthetic: seat 1 (45m, waits 3m / 6m) passes seat 0's kakan of 3m,
+# then seat 0 discards 6m from the rinshan draw before seat 1 discards again (Tenhou: same-turn furiten).
+CHANKAN_PASS_GAME = os.path.join(PACKAGE_DIR, "data", "sample", "chankan_pass_synthetic.xml")
 DEFAULT_DAYS = ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
                 "20210709", "20210815", "20210921", "20211030", "20211112", "20211225"]
 KINDS = ["chi", "pon", "minkan", "ankan", "kakan"]
@@ -121,11 +143,15 @@ ZERO_GATES = [
     "riichi_offer_low_points", "riichi_offer_few_draws", "riichi_offer_after_kan4", "riichi_okurikan_offer",
     "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
     "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard",
+    "yaku_oracle_mismatch", "furiten_mismatch", "win_reason_conflict", "win_mask_mismatch", "win_offer_without_yaku",
+    "ron_offer_incomplete", "tsumo_offer_incomplete",
 ]
 OPTION_RULES = ["riichi_offer_low_points", "riichi_offer_few_draws", "riichi_offer_after_kan4", "riichi_okurikan_offer",
                 "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
                 "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard"]
 Snap = collections.namedtuple("Snap", ["hands", "melds", "draws_left", "scores", "reaches", "last_draw", "actor", "tile", "window"])
+FURITEN = ("discard", "temp", "riichi")  # the parser's furiten block reasons; "no_yaku" is the only other one
+KAKAN_START = 37  # a kakan token's low byte is 37 + kind (Naki.get_during_turn_filter_idx)
 PON_IDX = range(83, 120)  # post-head pon indices; chi is 2-82 (the low 8 bits of a call token)
 CONTEXT_GATE = {"plain": "discard_mask_unrestricted_mismatch", "declaration": "riichi_mask_mismatch",
                 "chi": "kuikae_mask_mismatch", "pon": "kuikae_mask_mismatch"}
@@ -363,21 +389,24 @@ def xml_rounds(raw: str):
     """Per round, replayed from the XML alone, in log order: end ('agari' | 'exhaustive' | 'abortive'), the INIT
     dora indicator, the seats of the riichi declarations (REACH step 1) in order, and the history tokens the
     parser must emit: the INIT indicator, then DORA -> new dora, REACH step 1 -> reach, N -> call, D/E/F/G ->
-    discard (tsumogiri iff it is the tile just drawn); nothing after the round's first AGARI / RYUUKYOKU."""
+    discard (tsumogiri iff it is the tile just drawn); nothing after the round's first AGARI / RYUUKYOKU. wins: per
+    AGARI event, (who, fromWho, Tenhou yaku ids)."""
     rounds, acquired = [], None
     for m in XML_EVENT.finditer(raw):
         tag, attrs = m.group(1), m.group(2)
         if tag == "INIT":
             dora = int(_attr(attrs, "seed").split(",")[5])
-            rounds.append({"end": None, "dora": dora, "reach": [], "tokens": [new_dora2idx(dora // 4)]})
+            rounds.append({"end": None, "dora": dora, "reach": [], "tokens": [new_dora2idx(dora // 4)], "wins": []})
             acquired = None
             continue
         r = rounds[-1]
+        if tag == "AGARI" and r["end"] in (None, "agari"):  # a double ron is two AGARI events
+            r["wins"].append((int(_attr(attrs, "who")), int(_attr(attrs, "fromWho")), win_oracles.xml_yaku_ids(attrs)))
+            r["end"] = "agari"
+            continue
         if r["end"] is not None:
             continue
-        if tag == "AGARI":
-            r["end"] = "agari"
-        elif tag == "RYUUKYOKU":
+        if tag == "RYUUKYOKU":
             r["end"] = "abortive" if "type=" in attrs else "exhaustive"
         elif tag == "DORA":
             r["tokens"].append(new_dora2idx(int(_attr(attrs, "hai")) // 4))
@@ -640,11 +669,13 @@ def check_state(so, C, tp):
 def check_samples(head, tt, expected, tokens, C):
     """EVERY input of every built sample of one head against the StateObject and the history it was built from.
     expected: per sample, in build order, (target, state, history length, actor, answered token or None,
-    Legality or None)."""
+    Legality or None, win offered or None). The win slot is index 1 of the during and the post head."""
     enc, (x1, x2, x3), mask, y, pad = tt
-    for i, (target, so, eidx, actor, answer, lg) in enumerate(expected):
+    for i, (target, so, eidx, actor, answer, lg, win) in enumerate(expected):
         if y[i].item() != target:
             C[TARGET_GATE[head]] += 1
+        if win is not None and mask[i, 1].item() != float(win):
+            C["win_mask_mismatch"] += 1
         w1, w2, w3 = expected_inputs(so)
         if not torch.equal(x1[i, 0], w1[0]):
             C["hand_plane_mismatch"] += 1
@@ -679,21 +710,142 @@ def check_samples(head, tt, expected, tokens, C):
             C["post_history_last_token"] += 1
 
 
+def answered_kind(tok):
+    """The tile kind a PostTurn answers, from its last history token: a discard's kind, or the kind of a kakan."""
+    if _is_discard(tok):
+        return RED_TO_PLAIN.get(_tile(tok), _tile(tok))
+    if _is_call(tok) and _event(tok) == EventStateTypes.DURING and (tok & 0xFF) >= KAKAN_START:
+        return (tok & 0xFF) - KAKAN_START
+    return None
+
+
+def _executed_win(halfturns, who, from_who):
+    """The executed AgariDecision of an <AGARI> (who, fromWho): it sits on the round's final halfturn."""
+    last = halfturns[-1] if halfturns else None
+    if who == from_who and isinstance(last, DuringTurn):
+        agari = last.decisions[DECISION_AGARI_IDX]
+    elif who != from_who and isinstance(last, PostTurn) and last.player == from_who:
+        agari = last.decisions[who][DECISION_AGARI_IDX]
+    else:
+        return None
+    return next((d for d in agari if d.executed), None)
+
+
+def check_wins(path, ri, xr, halfturns, tokens, C):
+    """WIN gates of one round (win_oracles, never utils/agari.py):
+      yaku_oracle_mismatch  an executed win's yaku (Tenhou ids) != its <AGARI> yaku / yakuman ids
+      furiten_mismatch      for a PostTurn responder whose concealed hand the answered kind completes: the parser's
+                            furiten reason (ron_blocked in FURITEN, else none) != the one rebuilt from the tokens and
+                            the earlier PostTurns (a pass = an earlier PostTurn whose answered kind completed the
+                            seat's hand then; the current PostTurn is not one of its own passes)
+      win_reason_conflict   a complete hand with both or neither of (offer, block reason); an incomplete hand with a
+                            block reason
+      ron/tsumo_offer_incomplete  an offer on an incomplete hand
+      win_offer_without_yaku      an offer whose yaku is empty
+    Diagnostics (not gates): offers taken / declined, block reasons."""
+    for who, from_who, xml_ids in xr["wins"]:
+        C["xml_agari"] += 1
+        d = _executed_win(halfturns, who, from_who)
+        if d is None:
+            continue  # lab_tsumo / lab_ron fail
+        C["yaku_checked"] += 1
+        ids = win_oracles.parser_yaku_ids(d.yaku)
+        if ids != xml_ids:
+            C["yaku_oracle_mismatch"] += 1
+            if C["yaku_oracle_mismatch"] <= 5:
+                print(f"yaku mismatch in {os.path.basename(path)} round {ri} who {who} fromWho {from_who}: "
+                      f"parser {d.yaku} -> {sorted(ids) if ids is not None else None}, xml {sorted(xml_ids)}")
+
+    passes = collections.defaultdict(list)  # seat -> [(answered token index, the answered kind completed the hand)]
+    for t in halfturns:
+        if isinstance(t, DuringTurn):
+            offers = t.decisions[DECISION_AGARI_IDX]
+            complete = win_oracles.complete_hand(t.stateObj.hand_tensor[:34])
+            if not complete and offers:
+                C["tsumo_offer_incomplete"] += 1
+            if (complete and bool(offers) == bool(t.tsumo_blocked)) or (not complete and t.tsumo_blocked):
+                C["win_reason_conflict"] += 1
+            C["win_offer_without_yaku"] += sum(1 for d in offers if not d.yaku)
+            C["diag_tsumo_offered"] += len(offers)
+            C["diag_tsumo_declined"] += sum(1 for d in offers if not d.executed)
+            if t.tsumo_blocked:
+                C[f"diag_tsumo_blocked_{t.tsumo_blocked}"] += 1
+            continue
+        if not isinstance(t, PostTurn) or t.encoding_idx == 0:
+            continue
+        ans = t.encoding_idx - 1
+        kind = answered_kind(tokens[ans])
+        if kind is None:
+            continue  # post_answered_event_hidden fails
+        for p, rs in t.responder_states.items():
+            offers = t.decisions[p][DECISION_AGARI_IDX]
+            blocked = t.ron_blocked.get(p)
+            concealed = rs.hand_tensor[:34]
+            complete = win_oracles.complete_on(concealed, kind)
+            C["win_offer_without_yaku"] += sum(1 for d in offers if not d.yaku)
+            C["diag_ron_offered"] += len(offers)
+            C["diag_ron_declined"] += sum(1 for d in offers if not d.executed)
+            if blocked:
+                C[f"diag_ron_blocked_{blocked}"] += 1
+            if not complete:
+                if offers:
+                    C["ron_offer_incomplete"] += 1
+                if blocked:
+                    C["win_reason_conflict"] += 1
+            else:
+                if bool(offers) == bool(blocked):
+                    C["win_reason_conflict"] += 1
+                own = [i for i in range(ans) if _is_discard(tokens[i]) and _who(tokens[i]) == p]
+                reach = next((i for i in range(ans) if _is_reach(tokens[i]) and _who(tokens[i]) == p), None)
+                last_own = own[-1] if own else -1
+                verdict = win_oracles.furiten_reason(
+                    concealed,
+                    {answered_kind(tokens[i]) for i in own},
+                    any(c for j, c in passes[p] if j > last_own),
+                    reach is not None and any(c for j, c in passes[p] if j > reach),
+                )
+                C["furiten_checked"] += 1
+                if verdict != (blocked if blocked in FURITEN else None):
+                    C["furiten_mismatch"] += 1
+                    if C["furiten_mismatch"] <= 5:
+                        print(f"furiten mismatch in {os.path.basename(path)} round {ri} token {ans} seat {p} kind "
+                              f"{kind}: parser {blocked}, oracle {verdict}")
+            passes[p].append((ans, complete))
+
+
+def declined_offers(H):
+    """(round, halfturn index, seat, 'tsumo' | 'ron', yaku, scores) of every win offer that was not taken."""
+    for ri, halfturns in enumerate(H):
+        for i, t in enumerate(halfturns):
+            if isinstance(t, DuringTurn):
+                for d in t.decisions[DECISION_AGARI_IDX]:
+                    if not d.executed:
+                        yield ri, i, t.player, "tsumo", d.yaku, t.stateObj.scores
+            elif isinstance(t, PostTurn):
+                for p, rs in t.responder_states.items():
+                    for d in t.decisions[p][DECISION_AGARI_IDX]:
+                        if not d.executed:
+                            yield ri, i, p, "ron", d.yaku, rs.scores
+
+
 def count_game(path, H, T, C, tp):
     """Add every counter of one parsed game (H = halfturns per round, T = tokens per round) to C."""
     raw = open(path, "rb").read().decode("utf-8", "ignore")
     ag = re.findall(r'<AGARI [^>]*?who="(\d)"[^>]*?fromWho="(\d)"', raw)
     C["xml_tsumo"] += sum(1 for w, fw in ag if w == fw)
     C["xml_ron"] += sum(1 for w, fw in ag if w != fw)
-    C["xml_ron"] += 3 * len(re.findall(r'<RYUUKYOKU [^>]*type="ron3"', raw))  # triple ron: three rons, no AGARI
+    ron3 = len(re.findall(r'<RYUUKYOKU [^>]*type="ron3"', raw))
+    C["xml_ron3"] += ron3
+    C["xml_ron"] += 3 * ron3  # triple ron: three rons, no AGARI
     for m in re.findall(r'<N who="\d" m="(\d+)"', raw):
         C["xml_" + kind_of(Naki(int(m)))] += 1
     rounds = xml_rounds(raw)
     assert len(rounds) == len(H), f"{path}: {len(rounds)} rounds in XML, {len(H)} parsed"
     replays = xml_snapshots(raw)
 
-    for xr, xs, halfturns, tokens in zip(rounds, replays, H, T):
+    for ri, (xr, xs, halfturns, tokens) in enumerate(zip(rounds, replays, H, T)):
         C["rounds"] += 1
+        check_wins(path, ri, xr, halfturns, tokens, C)
         if not (_event(tokens[0]) == EventStateTypes.NEW_DORA and _tile(tokens[0]) == xr["dora"] // 4):
             C["first_token_not_dora"] += 1
         if list(tokens) != xr["tokens"]:
@@ -744,7 +896,8 @@ def count_game(path, H, T, C, tp):
                     if not sum(map(len, t.decisions)):  # no sample: the parser offered nothing
                         check_options(set(), oracle, hits, "during_mask_mismatch", C)
                 if sum(map(len, t.decisions)):
-                    exp["during"].append((expected_during_target(t), so, t.encoding_idx, t.player, None, None))
+                    exp["during"].append((expected_during_target(t), so, t.encoding_idx, t.player, None, None,
+                                          bool(t.decisions[DECISION_AGARI_IDX])))
                     opt["during"].append((oracle, hits) if snap is not None else None)
                 if t.decisions[DECISION_REACH_IDX]:
                     C["riichi_offers"] += 1
@@ -768,7 +921,7 @@ def count_game(path, H, T, C, tp):
                     lg = discard_legality(halfturns, i, tokens)
                     if lg.context == "broken":
                         C["kuikae_mask_mismatch"] += 1
-                    exp["discard"].append((TILE2IDX[t.discarded_tile][-1], so, t.encoding_idx, t.player, None, lg))
+                    exp["discard"].append((TILE2IDX[t.discarded_tile][-1], so, t.encoding_idx, t.player, None, lg, None))
                 if t.is_riichi_declaration != declared or (declared and so.reaches[t.player] != 1):
                     C["riichi_declaration_unflagged"] += 1  # the flag disagrees with the tokens, either way
                 elif so.reaches[t.player] and not declared:
@@ -829,7 +982,8 @@ def count_game(path, H, T, C, tp):
                     C["post_samples_gained"] += len(after - before)
                     C["post_samples_lost"] += len(before - after)
                 for p, target in samples:
-                    exp["post"].append((target, t.responder_states[p], t.encoding_idx, p, answer, None))
+                    exp["post"].append((target, t.responder_states[p], t.encoding_idx, p, answer, None,
+                                        bool(t.decisions[p][DECISION_AGARI_IDX])))
                     opt["post"].append(post_opt.get(p))
 
         for p, called, first, disc, nxt in ippatsu_windows(halfturns, tokens):
@@ -937,6 +1091,12 @@ def failed_gates(C) -> dict:
     # every riichi declaration and every chi / pon has its discard sample, and the oracle found its context
     if C["legal_declaration_samples"] != C["lab_riichi"]:
         bad["legal_declaration_coverage"] = f"{C['legal_declaration_samples']} != lab_riichi={C['lab_riichi']}"
+    if C["yaku_checked"] != C["xml_agari"]:  # every <AGARI> had its executed decision checked against Tenhou's yaku
+        bad["yaku_coverage"] = f"{C['yaku_checked']} != xml_agari={C['xml_agari']}"
+    # ... and xml_rounds() saw every <AGARI>: tie its count to the raw regex counts (a triple ron has no AGARI)
+    if C["xml_agari"] != C["xml_tsumo"] + C["xml_ron"] - 3 * C["xml_ron3"]:
+        bad["agari_coverage"] = (f"xml_agari={C['xml_agari']} != xml_tsumo + xml_ron - 3 * xml_ron3="
+                                 f"{C['xml_tsumo'] + C['xml_ron'] - 3 * C['xml_ron3']}")
     if C["legal_chi_samples"] + C["legal_pon_samples"] != C["lab_chi"] + C["lab_pon"]:
         bad["legal_call_coverage"] = (f"{C['legal_chi_samples']} + {C['legal_pon_samples']} != "
                                       f"lab_chi + lab_pon={C['lab_chi'] + C['lab_pon']}")
@@ -957,7 +1117,11 @@ def check(C):
         f"after chi {C['legal_chi_samples']} pon {C['legal_pon_samples']} (-{C['legal_kuikae_slots_removed']} slots) "
         f"riichi offers {C['riichi_offers']} | options removed: "
         + " ".join(f"{r} {C['removed_' + r]}" for r in OPTION_RULES if r != "call_offer_in_chankan")
-        + f" | post samples +{C['post_samples_gained']} -{C['post_samples_lost']}"
+        + f" | post samples +{C['post_samples_gained']} -{C['post_samples_lost']} | "
+        f"win: yaku == tenhou {C['yaku_checked']} furiten checked {C['furiten_checked']}; offers tsumo "
+        f"{C['diag_tsumo_offered']} (declined {C['diag_tsumo_declined']}) ron {C['diag_ron_offered']} (declined "
+        f"{C['diag_ron_declined']}); blocked tsumo no_yaku {C['diag_tsumo_blocked_no_yaku']}, ron "
+        + " ".join(f"{r} {C['diag_ron_blocked_' + r]}" for r in FURITEN + ("no_yaku",))
     )
 
 
@@ -986,8 +1150,8 @@ def _game_with(pred, limit=60):
 def _named_game(fixture):
     """A named fixture game (day, file, regex): the self-test pool and the default --games sample lack its event."""
     day, name, pattern = fixture
-    found = glob.glob(os.path.join(DATA_ROOT, "2021", day, "*", name))
-    assert found, f"self-test needs the game {name} under {DATA_ROOT}/2021/{day}"
+    found = glob.glob(os.path.join(DATA_ROOT, day[:4], day, "*", name))
+    assert found, f"self-test needs the game {name} under {DATA_ROOT}/{day[:4]}/{day}"
     raw = open(found[0], "rb").read().decode("utf-8", "ignore")
     assert re.search(pattern, raw), f"{found[0]} does not match {pattern}"
     return found[0]
@@ -1214,9 +1378,12 @@ def self_test():
             raise SystemExit(f"self-test FAILED: {name}: the clean game {game} already fails {baseline}")
         tp = TransformerTensorProcessor()
         H, T = process(game)
-        ctx = corrupt(H, T, tp)
-        with ctx or contextlib.nullcontext():
-            bad = failed_gates(_count(game, H, T, tp))
+        ret = corrupt(H, T, tp)  # a context manager kept active while the game is counted, or run()'s counters
+        if hasattr(ret, "__enter__"):
+            with ret:
+                bad = failed_gates(_count(game, H, T, tp))
+        else:
+            bad = failed_gates(ret if ret is not None else _count(game, H, T, tp))
         missed = [g for g in gates if g not in bad]
         if missed:
             raise SystemExit(f"self-test FAILED: {name} did not fail gate(s) {missed} (failed: {bad or 'none'})")
@@ -1662,6 +1829,140 @@ def self_test():
             return m
         _patch_mask(tp, first_sample_only(edit))
 
+    # ---- win options (T-033)
+    def rerun(game, *patchers):
+        """Re-run `game` under mock patchers and return run()'s counters: a parser exception (an unoffered real win,
+        a library error) counts as parse_error, as on real data."""
+        def corrupt(H, T, tp):
+            with contextlib.ExitStack() as stack:
+                for patcher in patchers:
+                    stack.enter_context(patcher)
+                return run([game], tp)
+        return corrupt
+
+    def win_context_with(**forced):  # every WinContext the parser builds, with some flags forced
+        return mock.patch.object(process_xml, "WinContext", lambda **kw: agari.WinContext(**{**kw, **forced}))
+
+    def tracker(cls):
+        return mock.patch.object(process_xml, "FuritenTracker", cls)
+
+    def spy_rons(seen):  # evaluate_ron that records the offered seats and the chankan flag of the latest window
+        orig = process_xml.evaluate_ron
+
+        def spy(discarder, kind, hands, melds, furiten, contexts):
+            rons, blocked = orig(discarder, kind, hands, melds, furiten, contexts)
+            seen["offered"] = {p for p, d in enumerate(rons) if d is not None}
+            seen["chankan"] = any(c.is_chankan for c in contexts.values())
+            return rons, blocked
+        return mock.patch.object(process_xml, "evaluate_ron", spy)
+
+    class NoTempFuriten(agari.FuritenTracker):  # a pass makes only a riichi player furiten
+        def on_offer_passed(self, kind, responders, reaches):
+            super().on_offer_passed(kind, [q for q in responders if reaches[q]], reaches)
+
+    class TempNeverCleared(agari.FuritenTracker):
+        def set_hand(self, p, concealed34):
+            temp = self._temp[p]
+            super().set_hand(p, concealed34)
+            self._temp[p] = temp
+
+    class NoRiichiFuriten(agari.FuritenTracker):
+        def on_offer_passed(self, kind, responders, reaches):
+            super().on_offer_passed(kind, responders, [0] * 4)
+
+    def pass_filter(seen, keep):  # a tracker that counts a pass only when keep(seen, responder)
+        class Filtered(agari.FuritenTracker):
+            def on_offer_passed(self, kind, responders, reaches):
+                super().on_offer_passed(kind, [q for q in responders if keep(seen, q)], reaches)
+        return Filtered
+
+    def offered_kind_only():  # the old rule: discard furiten only when the OFFERED kind is among the own discards
+        orig = process_xml.evaluate_ron
+
+        def old(discarder, kind, hands, melds, furiten, contexts):
+            class Old:
+                def reason(self, p):
+                    if kind in furiten._discards[p]:
+                        return agari.FURITEN_DISCARD
+                    return agari.FURITEN_RIICHI if furiten._riichi[p] else agari.FURITEN_TEMP if furiten._temp[p] else None
+            return orig(discarder, kind, hands, melds, Old(), contexts)
+        return mock.patch.object(process_xml, "evaluate_ron", old)
+
+    def partial_discard_furiten(H, T):  # a block on 'discard' whose answered kind is NOT among the seat's own discards
+        return any(r == agari.FURITEN_DISCARD and not t.responder_states[p].sutehai_tensors[p, answered_kind(tokens[t.encoding_idx - 1])]
+                   for halfturns, tokens in zip(H, T) for t in halfturns if isinstance(t, PostTurn)
+                   for p, r in t.ron_blocked.items())
+
+    def ron_kept_while_blocked(H, T, tp):
+        for t in (t for halfturns in H for t in halfturns if isinstance(t, PostTurn)):
+            for p in t.ron_blocked:
+                t.decisions[p][DECISION_AGARI_IDX].append(AgariDecision(p, False, yaku=("Riichi",)))
+                return
+        found(0, "a PostTurn with a blocked responder")
+
+    def win_slot_without_offer(head):
+        def corrupt(H, T, tp):
+            _patch_tensors(tp, lambda td, tdisc, tpost: {"during": td, "post": tpost}[head][2][:, 1].fill_(1.0))
+        return corrupt
+
+    seen = {}
+    seat_wind_game = _named_game(SEAT_WIND_HOUTEI_LOG)
+    rinshan_game = _named_game(RINSHAN_LOG)
+    expect_failure("seat wind shared by all four seats (old player_wind)", "yaku_oracle_mismatch",
+                   rerun(seat_wind_game, mock.patch.object(process_xml, "seat_wind", lambda p, oya: agari.EAST + oya)),
+                   game=seat_wind_game)
+    expect_failure("rinshan flag off", "yaku_oracle_mismatch", rerun(rinshan_game, win_context_with(is_rinshan=False)),
+                   game=rinshan_game)
+    last_rinshan = _named_game(LAST_RINSHAN_TSUMO_LOG)
+    expect_failure("haitei on a last-tile rinshan draw (old rule)", "parse_error",
+                   rerun(last_rinshan, mock.patch.object(process_xml, "_is_haitei", lambda r, rinshan: r == 0)),
+                   game=last_rinshan)
+    expect_failure("houtei off on rons", "yaku_oracle_mismatch",
+                   rerun(seat_wind_game, mock.patch.object(process_xml, "_is_houtei", lambda r, chankan, after: False)),
+                   game=seat_wind_game)
+    houtei_after_rinshan = _named_game(LAST_RINSHAN_HOUTEI_LOG)
+    expect_failure("houtei off after a last-tile rinshan", "parse_error",
+                   rerun(houtei_after_rinshan, mock.patch.object(
+                       process_xml, "_is_houtei", lambda r, chankan, after: r == 0 and not chankan and not after)),
+                   game=houtei_after_rinshan)
+    for name, fixture, flag in (("chiihou", CHIIHOU_LOG, "is_chiihou"), ("tenhou", TENHOU_LOG, "is_tenhou")):
+        game = _named_game(fixture)
+        expect_failure(f"{name} flag off", "yaku_oracle_mismatch", rerun(game, win_context_with(**{flag: False})), game=game)
+    suuankou = _named_game(SUUANKOU_LOG)
+
+    def suuankou_ids_swapped(H, T, tp):  # the library's own ids: Suuankou 41, SuuankouTanki 40
+        with mock.patch.dict(win_oracles.TENHOU_YAKU_ID, {"Suuankou": 41, "SuuankouTanki": 40}):
+            return _count(suuankou, H, T, tp)
+    expect_failure("suuankou id override removed", "yaku_oracle_mismatch", suuankou_ids_swapped, game=suuankou)
+    expect_failure("yaku check off (shape only)", "win_offer_without_yaku",
+                   rerun(f, mock.patch.object(agari, "win_yaku", lambda *a: ())))
+    partial = _game_with(partial_discard_furiten)
+    expect_failure("furiten on the offered kind only (old rule)", "furiten_mismatch", rerun(partial, offered_kind_only()),
+                   game=partial)
+    temp_game = _named_game(TEMP_FURITEN_LOG)
+    expect_failure("same-turn furiten off", "furiten_mismatch", rerun(temp_game, tracker(NoTempFuriten)), game=temp_game)
+    expect_failure("same-turn furiten only after an offered ron (no-yaku pass ignored)", "furiten_mismatch",
+                   rerun(rinshan_game, spy_rons(seen), tracker(pass_filter(seen, lambda s, q: q in s["offered"]))),
+                   game=rinshan_game)
+    expect_failure("same-turn furiten never cleared", "furiten_mismatch", rerun(rinshan_game, tracker(TempNeverCleared)),
+                   game=rinshan_game)
+    riichi_furiten = _named_game(RIICHI_FURITEN_LOG)
+    expect_failure("riichi furiten off", "furiten_mismatch", rerun(riichi_furiten, tracker(NoRiichiFuriten)),
+                   game=riichi_furiten)
+    expect_failure("ron offer kept while blocked", "win_reason_conflict", ron_kept_while_blocked,
+                   game=_game_with(lambda H, T: any(t.ron_blocked for hs in H for t in hs if isinstance(t, PostTurn))))
+    for head in ("during", "post"):
+        expect_failure(f"{head} win slot enabled with no offer", "win_mask_mismatch", win_slot_without_offer(head))
+
+    def wins_dropped(H, T, tp):  # xml_rounds() misses every <AGARI>: yaku_coverage shrinks on both sides and passes
+        orig = xml_rounds
+        with mock.patch(f"{__name__}.xml_rounds", lambda raw: [dict(r, wins=[]) for r in orig(raw)]):
+            return _count(f, H, T, tp)
+    expect_failure("xml_rounds drops the wins", "agari_coverage", wins_dropped)
+    expect_failure("passed chankan ignored", "furiten_mismatch",
+                   rerun(CHANKAN_PASS_GAME, spy_rons(seen), tracker(pass_filter(seen, lambda s, q: not s["chankan"]))),
+                   game=CHANKAN_PASS_GAME)
+
     expect_failure("declaration mask = every held tile", "riichi_mask_mismatch", declaration_presence_mask,
                    game=_game_with(declaration_restricted))
     expect_failure("suji kuikae ban dropped after a chi", "kuikae_mask_mismatch", drop_suji_ban,
@@ -1731,6 +2032,7 @@ if __name__ == "__main__":
     ap.add_argument("--days", nargs="*", default=DEFAULT_DAYS, help="day directories to sample from")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verbose", action="store_true", help="print every counter")
+    ap.add_argument("--list-declined", action="store_true", help="print every win offer that was not taken")
     args = ap.parse_args()
     if args.test:
         self_test()
@@ -1742,4 +2044,12 @@ if __name__ == "__main__":
     if args.verbose:
         for k in sorted(C):
             print(f"{k:34s} {C[k]}")
+    if args.list_declined:
+        for f in files:
+            try:
+                H, _ = process(f)
+            except Exception:
+                continue
+            for ri, i, seat, kind, yaku, scores in declined_offers(H):
+                print(f"declined {kind}: {os.path.basename(f)} round {ri} halfturn {i} seat {seat} yaku {yaku} scores {scores}")
     check(C)
