@@ -1,10 +1,6 @@
 """Unit tests for MahjongAI.utils.legal: riichi-declaration tenpai, kuikae, the 37-slot red-five mask, and the
 option rules (riichi points / wall / suukaikan, kan wall / cap, riichi ankan, calls, kuikae dead end).
 Hands are written in Tenhou notation: 0m / 0p / 0s is a red five (it counts in its kind AND its red slot)."""
-import sys
-
-sys.path.append("../../")
-
 import numpy as np
 import pytest
 

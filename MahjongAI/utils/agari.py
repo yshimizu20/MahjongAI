@@ -16,6 +16,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from MahjongAI.utils.mahjong_version import require_mahjong_1
+
+require_mahjong_1()
+
 from mahjong.agari import Agari
 from mahjong.constants import EAST
 from mahjong.hand_calculating.hand import HandCalculator

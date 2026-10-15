@@ -13,6 +13,11 @@ import re
 from typing import FrozenSet, Iterable, Optional
 
 import numpy as np
+
+from MahjongAI.utils.mahjong_version import require_mahjong_1
+
+require_mahjong_1()
+
 from mahjong.agari import Agari
 from mahjong.hand_calculating.yaku_config import YakuConfig
 
