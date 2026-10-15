@@ -1,4 +1,5 @@
-"""Unit tests for MahjongAI.utils.legal: riichi-declaration tenpai, kuikae, and the 37-slot red-five mask.
+"""Unit tests for MahjongAI.utils.legal: riichi-declaration tenpai, kuikae, the 37-slot red-five mask, and the
+option rules (riichi points / wall / suukaikan, kan wall / cap, riichi ankan, calls, kuikae dead end).
 Hands are written in Tenhou notation: 0m / 0p / 0s is a red five (it counts in its kind AND its red slot)."""
 import sys
 
@@ -10,6 +11,13 @@ import pytest
 from MahjongAI.draw import Naki
 from MahjongAI.turn import DiscardTurn
 from MahjongAI.utils.legal import (
+    call_leaves_legal_discard,
+    calls_allowed,
+    kan_allowed,
+    kans_on_table,
+    riichi_allowed,
+    riichi_ankan_allowed,
+    wait_kinds,
     kuikae_forbidden_kinds,
     legal_discard_kinds,
     legal_discard_mask,
@@ -174,3 +182,91 @@ def test_discard_turn_rejects_riichi_after_call():
 def test_discard_turn_accepts_chi_and_pon():
     for call in (Naki.from_chi_info(0, 0, 0, False), Naki.from_pon_info(27, 0, False, 2)):
         assert DiscardTurn(0, None, 0, 0, after_call=call).after_call is call
+
+
+# ---- option rules (T-032)
+
+def kind(text: str) -> int:
+    (k,) = kinds(text)
+    return k
+
+
+@pytest.mark.parametrize("score, draws, n_kans, n_owners, ok", [
+    (10, 4, 0, 0, True),  # exactly 1,000 points and exactly one own draw left: legal
+    (9, 4, 0, 0, False),
+    (10, 3, 0, 0, False),
+    (10, 4, 4, 2, False),  # right after a 4th kan by two players: the round ends with the next discard
+    (10, 4, 4, 1, True),  # four kans by one player: no abort, play goes on
+    (10, 4, 3, 2, True),
+])
+def test_riichi_allowed(score, draws, n_kans, n_owners, ok):
+    assert riichi_allowed(score, draws, n_kans, n_owners) is ok
+
+
+@pytest.mark.parametrize("draws, n_kans, ok", [(1, 3, True), (0, 0, False), (1, 4, False)])
+def test_kan_allowed(draws, n_kans, ok):
+    assert kan_allowed(draws, n_kans) is ok
+
+
+@pytest.mark.parametrize("draws, n_kans, n_owners, ok", [
+    (1, 0, 0, True),
+    (0, 0, 0, False),  # the last discard (houtei)
+    (5, 4, 2, False),  # suukaikan pending
+    (5, 4, 1, True),  # chi / pon stay legal; daiminkan is refused by kan_allowed
+])
+def test_calls_allowed(draws, n_kans, n_owners, ok):
+    assert calls_allowed(draws, n_kans, n_owners) is ok
+
+
+def test_kans_on_table():
+    melds = [[Naki.from_ankan_info(0), Naki.from_pon_info(9, 0, False, 1)], [], [Naki.from_minkan_info(27, 1, 0)], []]
+    assert kans_on_table(melds) == (2, 2)
+    assert kans_on_table([[Naki.from_ankan_info(k) for k in range(4)], [], [], []]) == (4, 1)
+
+
+def test_riichi_okurikan_refused():
+    # 3333m held from before the riichi, 1z drawn: a kan of any kind but the drawn one is refused (okurikan)
+    assert not riichi_ankan_allowed(hand("3333m123p456p789s1z"), kind("1z"), kind("3m"), [])
+
+
+def test_riichi_ankan_that_changes_the_wait_is_refused():
+    before = hand("3335m123p456p789s")  # 33 + 35 waits 4m, 333 + 5 waits 5m
+    assert wait_kinds(before, []) == kinds("45m")
+    assert not riichi_ankan_allowed(hand("33335m123p456p789s"), kind("3m"), kind("3m"), [])
+
+
+def test_riichi_ankan_same_tanki_wait_is_allowed():
+    assert riichi_ankan_allowed(hand("1111m234p567p789s9m"), kind("1m"), kind("1m"), [])
+
+
+def test_riichi_ankan_that_changes_the_decomposition_but_not_the_wait_is_allowed():
+    # 1112444m: 2m by 111 + 22 + 444, 3m by 111 + 234 + 44 (4m in a run); after the kan, 1112m waits 2m / 3m too
+    assert wait_kinds(hand("1112444m123p456p"), []) == kinds("23m")
+    assert riichi_ankan_allowed(hand("11124444m123p456p"), kind("4m"), kind("4m"), [])
+
+
+def test_riichi_ankan_fifth_copy_wait_regression():
+    # Codex review: 4455556678999m; an unfiltered shanten oracle would add 5m (all four 5m concealed) before the
+    # kan only. With the junkara filter both sides wait 3m 4m 6m 7m 9m, so the kan of the drawn 9m is legal.
+    assert wait_kinds(hand("4455556678999m"), []) == kinds("34679m")
+    assert riichi_ankan_allowed(hand("4455556678999m9m"), kind("9m"), kind("9m"), [])
+
+
+def test_riichi_ankan_with_an_earlier_ankan():
+    kan = [Naki.from_ankan_info(kind("1z"))]
+    assert riichi_ankan_allowed(hand("1111m234p567p9m"), kind("1m"), kind("1m"), kan)
+    assert not riichi_ankan_allowed(hand("33335m123p456p"), kind("3m"), kind("3m"), kan)
+
+
+def test_call_leaving_only_kuikae_kinds_is_refused():
+    # three melds down, 3445m held: chi 4m with 35m leaves 44m, both forbidden (called kind 4m)
+    chi = Naki.from_chi_info(0, 2, 1, False)  # run 345m, called 4m (the middle)
+    assert sorted(kuikae_forbidden_kinds(chi)) == [kind("4m")]
+    assert not call_leaves_legal_discard(hand("3445m"), chi)
+    assert call_leaves_legal_discard(hand("3445m1z"), chi)
+
+
+def test_pon_always_leaves_a_legal_discard():
+    # a pon dead end would need five copies of one kind: with 111z2z, a pon of 1z leaves 1z (forbidden) and 2z
+    pon = Naki.from_pon_info(kind("1z"), 0, False, 1)
+    assert call_leaves_legal_discard(hand("111z2z"), pon)

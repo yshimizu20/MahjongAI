@@ -9,6 +9,7 @@ sys.path.append("..")
 from MahjongAI.gameinfo import GameInfo, RoundInfo
 from MahjongAI.utils.constants import *
 from MahjongAI.utils.agari import evaluate_ron, evaluate_tsumo
+from MahjongAI.utils import legal
 from MahjongAI.draw import Naki
 from MahjongAI.state import StateObject
 from MahjongAI.decision import (
@@ -189,10 +190,11 @@ def process(file_path: str, verbose: bool = False):
                     assert isinstance(curr_halfturn, DuringTurn) and curr_halfturn.player == player
                     assert acquired is not None
 
-                    for decision in curr_halfturn.decisions[DECISION_REACH_IDX]:
-                        assert isinstance(decision, ReachDecision)
-                        decision.executed = True
-                        break
+                    offered = curr_halfturn.decisions[DECISION_REACH_IDX]
+                    assert len(offered) == 1 and isinstance(offered[0], ReachDecision), (
+                        f"riichi by player {player} matched {len(offered)} offered riichi decisions"
+                    )
+                    offered[0].executed = True
 
                     # The declaration is public BEFORE the declaration discard: the player picks that
                     # tile knowing it is in riichi, and every responder sees the riichi token.
@@ -329,9 +331,7 @@ def process(file_path: str, verbose: bool = False):
                     if sum(ippatsu):  # the chankan window is closed: the kakan breaks every ippatsu
                         ippatsu = [0] * 4
 
-                # TODO: add logic for ankan kokushi ron
-                if naki.is_ankan():
-                    pass
+                # no PostTurn after an ankan: tenhou.net/man 「他家が暗槓した牌では国士無双はあがれない」
 
                 curr_halfturn = None
 
@@ -381,21 +381,29 @@ def process(file_path: str, verbose: bool = False):
                 )
 
                 # check if reach is possible
+                n_kans, kan_owners = legal.kans_on_table(melds)
                 reach_decisions = []
-                if not reaches[player] and is_menzen[player]:
+                if (not reaches[player] and is_menzen[player]
+                        and legal.riichi_allowed(scores[player], remaining_tsumo, n_kans, kan_owners)):
                     shanten = shanten_solver.calculate_shanten(hand_tensors[player][:34])
                     if shanten <= 0:
                         reach_decisions.append(ReachDecision(player, executed=False))
 
                 # check if naki is possible
                 naki_decisions = []
+                kan_ok = legal.kan_allowed(remaining_tsumo, n_kans)
                 # check if ankan is possible
-                for i in np.where(hand_tensors[player] == 4.0)[0]:
+                for i in np.where(hand_tensors[player] == 4.0)[0] if kan_ok else []:
+                    if reaches[player] and not legal.riichi_ankan_allowed(
+                        hand_tensors[player], tile_idx[0], int(i), melds[player]
+                    ):
+                        continue
                     naki_decisions.append(NakiDecision(player, Naki.from_ankan_info(i), executed=False))
 
                 # check if kakan is possible
-                for meld in melds[player]:
+                for meld in melds[player] if kan_ok else []:
                     if meld.is_pon():
+                        assert not reaches[player], f"player {player} in riichi holds a pon"
                         color, number, *_ = meld.pattern_pon()
                         if hand_tensors[player][9 * color + number] == 1.0:
                             naki_decisions.append(
@@ -499,14 +507,20 @@ def process(file_path: str, verbose: bool = False):
                         post_decisions[ron.player][DECISION_AGARI_IDX].append(ron)
 
                 naki_decisions = decision_mask(player, hand_tensors, tile_idx[0], len(tile_idx) == 2)
+                n_kans, kan_owners = legal.kans_on_table(melds)
+                calls_ok = legal.calls_allowed(remaining_tsumo, n_kans, kan_owners)
 
                 for p, decision_lst in enumerate(naki_decisions):
                     if p == player:
                         assert len(decision_lst) == 0
                         continue
-                    if reaches[p]:  # a player in riichi cannot chi, pon or daiminkan
+                    if reaches[p] or not calls_ok:  # no call by a riichi player, on the last discard, or with suukaikan pending
                         continue
-                    post_decisions[p][DECISION_NAKI_IDX] = decision_lst
+                    post_decisions[p][DECISION_NAKI_IDX] = [
+                        d for d in decision_lst
+                        if (not d.naki.is_minkan() or legal.kan_allowed(remaining_tsumo, n_kans))
+                        and (d.naki.is_minkan() or legal.call_leaves_legal_discard(hand_tensors[p], d.naki))
+                    ]
 
                 half_turn = PostTurn(
                     player=player,

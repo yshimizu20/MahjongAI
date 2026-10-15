@@ -47,13 +47,26 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           The executed discard is always enabled, no unheld slot is, no mask is empty, and every riichi offer
           has at least one tenpai-keeping discard. Coverage: declaration samples == riichi labels and post-call
           samples == chi + pon labels; is_riichi_declaration == the token context, both ways
+  STATE   every state a head reads (and every DiscardTurn state) == the round replayed from the XML alone
+          (xml_snapshots): the 37-slot hand, every seat's melds, the drawn tile, the live draws left, the scores,
+          the riichi seats and the menzen flags. The option oracles below read only that replay.
+  OPTIONS the riichi / kan bits of every BUILT during mask and the call bits of every BUILT post mask == the
+          Tenhou option rules rebuilt WITHOUT utils/legal.py (legal_oracles.py, on the replay): riichi needs
+          menzen, no riichi yet, shanten <= 0, >= 1,000 points, >= 4 live draws and no suukaikan pending; no
+          kan without a live draw or with 4 kans down; in riichi only the ankan of the drawn kind that keeps the
+          waits (Shanten wait set); no call in a chankan window, by a riichi player, on the last discard, with
+          suukaikan pending, no daiminkan with 4 kans down, no chi / pon that leaves no legal discard. A turn /
+          responder that is not a sample has its parser options compared instead. One named counter per rule
+          on the same bits; "options removed" per rule are diagnostics
 """
 import argparse
 import collections
+import contextlib
 import glob
 import os
 import random
 import re
+import sys
 from unittest import mock
 
 import numpy as np
@@ -63,7 +76,7 @@ from MahjongAI import process_xml
 from MahjongAI.process_xml import process, InvalidGameException, discard2idx, naki2idx, reach2idx, new_dora2idx
 from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.draw import Naki
-from MahjongAI.decision import ReachDecision
+from MahjongAI.decision import NakiDecision, ReachDecision, decision_mask
 from MahjongAI.utils import legal, legal_oracles
 from MahjongAI.utils.constants import DECISION_AGARI_IDX, DECISION_NAKI_IDX, DECISION_REACH_IDX, EventStateTypes, EventTypes, TILE2IDX
 from MahjongAI.agents.encoder_conv import TransformerTensorProcessor, N_X1_PLANES
@@ -76,6 +89,13 @@ RON3_LOG = ("20210105", "2021010521gm-00a9-0000-e76b4550.log", r'<RYUUKYOKU [^>]
 RED_KAN_DORA_LOG = ("20210101", "2021010100gm-00a9-0000-3ceec6a2.log", r'<DORA hai="(16|52|88)"')  # red kan indicator
 CHANKAN_IPPATSU_LOG = ("20210101", "2021010110gm-00a9-0000-85d17b74.log", r'<REACH [^>]*step="2"')  # kakan in ippatsu
 EARLY_ANKAN_LOG = ("20210109", "2021010919gm-00a9-0000-b25465a8.log", r'<REACH [^>]*step="1"')  # ankan, then riichi
+# T-032 fixtures (day, file, round): the option rules they exercise are rare (T-032 plan, Problem table)
+LOW_POINTS_RIICHI = ("20210103", "2021010301gm-00a9-0000-ac500e01.log", 11)  # riichi tenpai below 1,000 points
+WAIT_CHANGE_ANKAN = ("20210103", "2021010313gm-00a9-0000-5120e1eb.log", 10)  # drawn-kind ankan in riichi changes waits
+KAN4_ROUND = ("20210214", "2021021419gm-00a9-0000-57c92bbe.log", 3)  # 4th kan by 2 players, then a pon-able discard
+DEAD_END_CALL = ("20210322", "2021032214gm-00a9-0000-6d556c69.log", 12)  # chi that leaves only kuikae kinds
+RIICHI_ANKAN = ("20210101", "2021010100gm-00a9-0000-17175841.log", None)  # an executed riichi ankan
+CHANKAN_WINDOW = ("20210101", "2021010100gm-00e1-0000-3219df3d.log", 6)  # kakan whose added tile is chi-able
 DEFAULT_DAYS = ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
                 "20210709", "20210815", "20210921", "20211030", "20211112", "20211225"]
 KINDS = ["chi", "pon", "minkan", "ankan", "kakan"]
@@ -97,7 +117,15 @@ ZERO_GATES = [
     "ippatsu_window_wrong", "red_pov_mismatch",
     "discard_target_illegal", "discard_mask_unrestricted_mismatch", "discard_mask_superset", "discard_mask_empty",
     "riichi_mask_mismatch", "kuikae_mask_mismatch", "riichi_offer_without_legal_discard",
+    "state_xml_mismatch", "during_mask_mismatch", "post_mask_mismatch",
+    "riichi_offer_low_points", "riichi_offer_few_draws", "riichi_offer_after_kan4", "riichi_okurikan_offer",
+    "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
+    "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard",
 ]
+OPTION_RULES = ["riichi_offer_low_points", "riichi_offer_few_draws", "riichi_offer_after_kan4", "riichi_okurikan_offer",
+                "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
+                "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard"]
+Snap = collections.namedtuple("Snap", ["hands", "melds", "draws_left", "scores", "reaches", "last_draw", "actor", "tile", "window"])
 PON_IDX = range(83, 120)  # post-head pon indices; chi is 2-82 (the low 8 bits of a call token)
 CONTEXT_GATE = {"plain": "discard_mask_unrestricted_mismatch", "declaration": "riichi_mask_mismatch",
                 "chi": "kuikae_mask_mismatch", "pon": "kuikae_mask_mismatch"}
@@ -293,17 +321,22 @@ def answered_token(halfturns, i, tokens):
     return None
 
 
-def expected_responders(t: PostTurn):
+def expected_responders(t: PostTurn, calls=None):
     """Responders that must be post samples, in turn order, with the exact target of each: executors always;
     a non-executor only when no other responder executed something of higher priority than ANY action this
     responder was offered (ron 3 > pon/kan 2 > chi 1), because it may have chosen the weaker one and lost.
     This restates the rule of TransformerTensorProcessor._post_turn_responders, so it catches a regression
-    of that code, not a wrong rule; the XML-count gates (tensor_ron == xml_ron, ...) are the independent check."""
+    of that code, not a wrong rule; the XML-count gates (tensor_ron == xml_ron, ...) are the independent check.
+    calls: {seat: set of post call indices} in place of the parser's call offers (the executed call is kept)."""
     lowest, done, target = {}, {}, {}
     for p in range(4):
         decs = t.decisions[p]
         kinds = [(3, d.executed, 1) for d in decs[DECISION_AGARI_IDX]]
         kinds += [(1 if d.naki.is_chi() else 2, d.executed, d.naki.get_post_turn_filter_idx()) for d in decs[DECISION_NAKI_IDX]]
+        if calls is not None:
+            executed = {i for _, x, i in kinds[len(decs[DECISION_AGARI_IDX]):] if x}
+            kinds = kinds[:len(decs[DECISION_AGARI_IDX])] + [(1 if i < PON_IDX.start else 2, i in executed, i)
+                                                             for i in sorted(calls.get(p, set()) | executed)]
         if not kinds:
             continue
         lowest[p] = min(k for k, _, _ in kinds)
@@ -417,6 +450,181 @@ def discard_legality(halfturns, i, tokens) -> Legality:
     return Legality(context, held(so) - forbidden, forbidden, called)
 
 
+def xml_snapshots(raw: str):
+    """Per round, replayed from the XML alone: the state at every decision point the parser builds a halfturn for,
+    in log order. 'during': after each draw (T/U/V/W); 'discard': each discard, the tile still in hand; 'post':
+    after each discard, and after each kakan (window 'kakan', the chankan window). A Snap holds the 37-slot hands
+    (INIT hai0-3, draws, discards, the tiles each N takes from its caller), every seat's meld codes (a kakan
+    replaces its pon), the live draws left (70 minus the draws so far), the scores (INIT ten minus 10 per own
+    REACH step 2), the riichi seats (REACH step 1), the latest draw (seat, tile; None after a call), the actor
+    and the tile (drawn / discarded / added by the kakan)."""
+    rounds, st = [], None
+
+    def snap(actor, tile, window):
+        return Snap(st["hands"].copy(), [list(x) for x in st["melds"]], st["draws"], list(st["scores"]),
+                    list(st["reaches"]), st["last_draw"], actor, tile, window)
+
+    def move(seat, tile, sign):
+        for slot in TILE2IDX[tile]:
+            st["hands"][seat, slot] += sign
+
+    for m in XML_EVENT.finditer(raw):
+        tag, attrs = m.group(1), m.group(2)
+        if tag == "INIT":
+            st = {"hands": np.zeros((4, 37), dtype=int), "melds": [[] for _ in range(4)], "draws": 70,
+                  "scores": [int(x) for x in _attr(attrs, "ten").split(",")], "reaches": [0] * 4, "last_draw": None}
+            for q in range(4):
+                for tile in map(int, _attr(attrs, f"hai{q}").split(",")):
+                    move(q, tile, 1)
+            rounds.append({"during": [], "discard": [], "post": [], "ended": False})
+            continue
+        r = rounds[-1]
+        if r["ended"]:
+            continue
+        if tag in ("AGARI", "RYUUKYOKU"):
+            r["ended"] = True
+        elif tag == "DORA":
+            continue  # no option rule reads the indicators
+        elif tag == "REACH":
+            who = int(_attr(attrs, "who"))
+            if _attr(attrs, "step") == "1":
+                st["reaches"][who] = 1
+            else:
+                st["scores"][who] -= 10
+        elif tag == "N":
+            who, code = int(_attr(attrs, "who")), int(_attr(attrs, "m"))
+            nk = Naki(code)
+            exposed, _ = nk.get_exposed()
+            for tile in exposed:
+                move(who, tile, -1)
+            if nk.is_kakan():
+                pon = next(c for c in st["melds"][who] if Naki(c).is_pon() and Naki(c).get_exposed()[0][0] // 4 == exposed[0] // 4)
+                st["melds"][who].remove(pon)
+            st["melds"][who].append(code)
+            st["last_draw"] = None
+            if nk.is_kakan():
+                r["post"].append(snap(who, exposed[0], "kakan"))
+        elif tag[0] in "TUVW":
+            who, tile = "TUVW".index(tag[0]), int(tag[1:])
+            move(who, tile, 1)
+            st["draws"] -= 1
+            st["last_draw"] = (who, tile)
+            r["during"].append(snap(who, tile, "draw"))
+        elif tag[0] in "DEFG":
+            who, tile = "DEFG".index(tag[0]), int(tag[1:])
+            r["discard"].append(snap(who, tile, "discard"))
+            move(who, tile, -1)
+            r["post"].append(snap(who, tile, "discard"))
+    return rounds
+
+
+def snap_kans(snap):
+    """(kan count, distinct kan owners) of a Snap."""
+    owners = [q for q in range(4) for c in snap.melds[q] if kind_of(Naki(c)) in ("ankan", "minkan", "kakan")]
+    return len(owners), len(set(owners))
+
+
+def snap_menzen(snap, q) -> bool:
+    return all(Naki(c).is_ankan() for c in snap.melds[q])
+
+
+def check_state_xml(so, snap, seat, C):
+    """so (the state of `seat`) == the XML replay: hand, melds, drawn tile, draws left, scores, riichi, menzen."""
+    drawn = list(TILE2IDX[snap.last_draw[1]]) if snap.last_draw is not None and snap.last_draw[0] == seat else None
+    fields = {
+        "hand": np.array_equal(np.asarray(so.hand_tensor), snap.hands[seat]),
+        "melds": all(sorted(m.naki_code for m in so.melds[q]) == sorted(snap.melds[q]) for q in range(4)),
+        "drawn": (None if so.drawn_tile is None else list(so.drawn_tile)) == drawn,
+        "draws": so.remaining_tsumo == snap.draws_left,
+        "scores": list(so.scores) == snap.scores,
+        "reaches": list(so.reaches) == snap.reaches,
+        "menzen": list(so.is_menzen) == [int(snap_menzen(snap, q)) for q in range(4)],
+    }
+    bad = [name for name, ok in fields.items() if not ok]
+    if bad:
+        C["state_xml_mismatch"] += 1
+        for name in bad:
+            C["state_xml_" + name] += 1  # which field drifted (named in the failure)
+
+
+def during_options(snap):
+    """(oracle bits, tile-only bits) of the during head (2 riichi, 3-36 ankan, 37-70 kakan) from the replay; the
+    tile-only bits are what the parser offered before T-032 (diagnostics)."""
+    p, c = snap.actor, snap.hands[snap.actor][:34]
+    n_kans, n_owners = snap_kans(snap)
+    menzen, in_riichi = snap_menzen(snap, p), bool(snap.reaches[p])
+    pons = [Naki(x).get_exposed()[0][0] // 4 for x in snap.melds[p] if Naki(x).is_pon()]
+    oracle = {legal_oracles.RIICHI_IDX} if legal_oracles.riichi_by_rules(
+        c, menzen, in_riichi, snap.scores[p], snap.draws_left, n_kans, n_owners) else set()
+    oracle |= legal_oracles.kan_by_rules(c, pons, in_riichi, snap.tile // 4, snap.draws_left, n_kans)
+    base = {legal_oracles.RIICHI_IDX} if menzen and not in_riichi and legal_oracles.riichi_by_rules(
+        c, True, False, 10 ** 6, 70, 0, 0) else set()
+    base |= {legal_oracles.ANKAN_IDX + k for k in np.flatnonzero(c == 4).tolist()}
+    base |= {legal_oracles.KAKAN_IDX + k for k in pons if c[k] >= 1}
+    return oracle, base
+
+
+def during_rule_hits(idx, snap):
+    """The named option rules that forbid during-head bit idx in this state."""
+    p = snap.actor
+    n_kans, n_owners = snap_kans(snap)
+    if idx == legal_oracles.RIICHI_IDX:
+        return ([g for g, bad in (("riichi_offer_low_points", snap.scores[p] < legal_oracles.MIN_RIICHI_SCORE),
+                                  ("riichi_offer_few_draws", snap.draws_left < legal_oracles.MIN_RIICHI_DRAWS),
+                                  ("riichi_offer_after_kan4", legal_oracles.suukaikan(n_kans, n_owners))) if bad])
+    hits = [g for g, bad in (("kan_offer_no_draw", snap.draws_left == 0), ("kan_offer_over_cap", n_kans >= legal_oracles.KAN_CAP)) if bad]
+    if snap.reaches[p]:
+        kind = idx - legal_oracles.ANKAN_IDX if idx < legal_oracles.KAKAN_IDX else None
+        if kind != snap.tile // 4:
+            hits.append("riichi_okurikan_offer")
+        elif snap.hands[p][kind] == 4 and not legal_oracles.riichi_ankan_keeps_waits(snap.hands[p][:34], kind):
+            hits.append("riichi_ankan_wait_change_offer")
+    return hits
+
+
+def post_options(snap, p, unrestricted):
+    """(oracle bits, tile-only bits) of responder p's call bits (2-153); unrestricted = decision_mask's offers."""
+    n_kans, n_owners = snap_kans(snap)
+    chankan = snap.window == "kakan"
+    base = set() if chankan or snap.reaches[p] else set(unrestricted)
+    oracle = legal_oracles.calls_by_rules(base, snap.hands[p][:34], snap.tile // 4, bool(snap.reaches[p]), chankan,
+                                          snap.draws_left, n_kans, n_owners)
+    return oracle, base
+
+
+def post_rule_hits(idx, snap, p):
+    n_kans, n_owners = snap_kans(snap)
+    hits = [g for g, bad in (("call_offer_last_discard", snap.draws_left == 0),
+                             ("call_offer_kan4_abort", legal_oracles.suukaikan(n_kans, n_owners)),
+                             ("call_offer_in_chankan", snap.window == "kakan")) if bad]
+    if idx >= legal_oracles.MINKAN_IDX:
+        if n_kans >= legal_oracles.KAN_CAP:
+            hits.append("kan_offer_over_cap")
+    else:
+        used = legal_oracles.call_used_kinds(idx)
+        held_used = all(snap.hands[p][k] >= used.count(k) for k in set(used))
+        if held_used and snap.window == "discard" and legal_oracles.call_dead_end(snap.hands[p][:34], idx, snap.tile // 4):
+            hits.append("call_offer_no_legal_discard")
+    return hits
+
+
+def check_options(bits, oracle, hits, gate, C):
+    """bits (the built mask, or the parser's options of a non-sample) == oracle; every rule that forbids an
+    offered bit is counted under its own name."""
+    if bits != oracle:
+        C[gate] += 1
+    for idx in bits:
+        for rule in hits(idx):
+            C[rule] += 1
+
+
+def unrestricted_calls(snap):
+    """decision_mask (tile-only chi / pon / daiminkan) on the replayed hands: {seat: set of post indices}."""
+    kind = TILE2IDX[snap.tile]
+    offers = decision_mask(snap.actor, snap.hands.astype(np.float32), kind[0], len(kind) == 2)
+    return {q: {d.naki.get_post_turn_filter_idx() for d in offers[q]} for q in range(4)}
+
+
 def check_state(so, C, tp):
     """Built-tensor invariants of one StateObject: plane count, actor-first rows, input scale."""
     x1, x2, x3 = tp._convert_state_obj_to_tensors(so)
@@ -482,8 +690,9 @@ def count_game(path, H, T, C, tp):
         C["xml_" + kind_of(Naki(int(m)))] += 1
     rounds = xml_rounds(raw)
     assert len(rounds) == len(H), f"{path}: {len(rounds)} rounds in XML, {len(H)} parsed"
+    replays = xml_snapshots(raw)
 
-    for xr, halfturns, tokens in zip(rounds, H, T):
+    for xr, xs, halfturns, tokens in zip(rounds, replays, H, T):
         C["rounds"] += 1
         if not (_event(tokens[0]) == EventStateTypes.NEW_DORA and _tile(tokens[0]) == xr["dora"] // 4):
             C["first_token_not_dora"] += 1
@@ -514,11 +723,29 @@ def count_game(path, H, T, C, tp):
             check_bounds(so, C)
 
         exp = {h: [] for h in HEADS}  # per head, in build order: (target, state, history length, actor, answered)
+        opt = {"during": [], "post": []}  # per sample, in build order: (oracle bits, hits(idx))
+        kinds = {DuringTurn: "during", DiscardTurn: "discard", PostTurn: "post"}
+        aligned = all(len(xs[k]) == sum(isinstance(t, cls) for t in halfturns) for cls, k in kinds.items())
+        if not aligned:
+            C["state_xml_mismatch"] += 1  # the parser built other decision points than the XML has
+            C["state_xml_alignment"] += 1
+        snaps = {k: iter(xs[k]) for k in kinds.values()}
         for i, t in enumerate(halfturns):
             so = t.stateObj
+            snap = next(snaps[kinds[type(t)]]) if aligned else None
             if isinstance(t, DuringTurn):
+                if snap is not None:
+                    check_state_xml(so, snap, t.player, C)
+                    oracle, base = during_options(snap)
+                    hits = lambda idx, snap=snap: during_rule_hits(idx, snap)
+                    for idx in base:
+                        for rule in hits(idx):
+                            C["removed_" + rule] += 1
+                    if not sum(map(len, t.decisions)):  # no sample: the parser offered nothing
+                        check_options(set(), oracle, hits, "during_mask_mismatch", C)
                 if sum(map(len, t.decisions)):
                     exp["during"].append((expected_during_target(t), so, t.encoding_idx, t.player, None, None))
+                    opt["during"].append((oracle, hits) if snap is not None else None)
                 if t.decisions[DECISION_REACH_IDX]:
                     C["riichi_offers"] += 1
                     if not legal_oracles.tenpai_kinds_by_agari(so.hand_tensor, so.melds[t.player]):
@@ -531,6 +758,8 @@ def count_game(path, H, T, C, tp):
                 check_state(so, C, tp)
 
             elif isinstance(t, DiscardTurn):
+                if snap is not None:
+                    check_state_xml(so, snap, t.player, C)
                 # a declaration discard is a sample, a later riichi discard is not: decided from the tokens (the
                 # seat's own reach right before), never from is_riichi_declaration, which is checked against it
                 prev = tokens[t.encoding_idx - 1] if t.encoding_idx else 0
@@ -573,8 +802,35 @@ def count_game(path, H, T, C, tp):
                         if d.executed:
                             C["lab_" + kind_of(d.naki)] += 1
                     check_state(rs, C, tp)
-                for p, target in expected_responders(t):
+                samples = expected_responders(t)
+                post_opt = {}
+                if snap is not None:
+                    unrestricted = unrestricted_calls(snap)
+                    bases = {}
+                    for p in (q for q in range(4) if q != snap.actor):  # every seat but the actor, from the replay
+                        rs = t.responder_states.get(p)
+                        if rs is None:  # a missing state would hide this seat's options from every gate
+                            C["state_xml_mismatch"] += 1
+                            C["state_xml_responder_missing"] += 1
+                        else:
+                            check_state_xml(rs, snap, p, C)
+                        oracle, base = post_options(snap, p, unrestricted[p])
+                        bases[p] = base
+                        hits = lambda idx, snap=snap, p=p: post_rule_hits(idx, snap, p)
+                        for idx in base:
+                            for rule in hits(idx):
+                                C["removed_" + rule] += 1
+                        post_opt[p] = (oracle, hits)
+                        if p not in {q for q, _ in samples}:  # not a sample: its parser options are what it saw
+                            offered = {d.naki.get_post_turn_filter_idx() for d in t.decisions[p][DECISION_NAKI_IDX]}
+                            check_options(offered, oracle, hits, "post_mask_mismatch", C)
+                    before = {q for q, _ in expected_responders(t, bases)}
+                    after = {q for q, _ in samples}
+                    C["post_samples_gained"] += len(after - before)
+                    C["post_samples_lost"] += len(before - after)
+                for p, target in samples:
                     exp["post"].append((target, t.responder_states[p], t.encoding_idx, p, answer, None))
+                    opt["post"].append(post_opt.get(p))
 
         for p, called, first, disc, nxt in ippatsu_windows(halfturns, tokens):
             C["ippatsu_windows"] += 1
@@ -599,6 +855,10 @@ def count_game(path, H, T, C, tp):
                 C[f"{name}_sample_count_mismatch"] += 1
             else:
                 check_samples(name, tt, exp[name], tokens, C)
+                for row, o in zip(tt[2], opt.get(name, [])):  # the BUILT masks the loss uses
+                    if o is not None:
+                        oracle, hits = o
+                        check_options(set((np.flatnonzero(row[2:].numpy()) + 2).tolist()), oracle, hits, f"{name}_mask_mismatch", C)
         tensor_counts(td[3].tolist(), tpost[3].tolist(), C)
 
 
@@ -671,6 +931,9 @@ def failed_gates(C) -> dict:
         if C[f"{h}_label_outside_mask"]:
             bad[f"{h}_label_outside_mask"] = C[f"{h}_label_outside_mask"]
     bad.update({k: C[k] for k in ZERO_GATES if C[k] != 0})
+    if "state_xml_mismatch" in bad:  # name the fields that drifted
+        bad["state_xml_mismatch"] = f"{C['state_xml_mismatch']} " + str(
+            {k[len("state_xml_"):]: v for k, v in C.items() if k.startswith("state_xml_") and k != "state_xml_mismatch" and v})
     # every riichi declaration and every chi / pon has its discard sample, and the oracle found its context
     if C["legal_declaration_samples"] != C["lab_riichi"]:
         bad["legal_declaration_coverage"] = f"{C['legal_declaration_samples']} != lab_riichi={C['lab_riichi']}"
@@ -692,7 +955,9 @@ def check(C):
         f"samples " + " ".join(f"{h} {C[h + '_samples']}" for h in HEADS) + " | tensors == parser == xml | "
         f"legal mask: declarations {C['legal_declaration_samples']} (-{C['legal_declaration_slots_removed']} slots) "
         f"after chi {C['legal_chi_samples']} pon {C['legal_pon_samples']} (-{C['legal_kuikae_slots_removed']} slots) "
-        f"riichi offers {C['riichi_offers']}"
+        f"riichi offers {C['riichi_offers']} | options removed: "
+        + " ".join(f"{r} {C['removed_' + r]}" for r in OPTION_RULES if r != "call_offer_in_chankan")
+        + f" | post samples +{C['post_samples_gained']} -{C['post_samples_lost']}"
     )
 
 
@@ -726,6 +991,147 @@ def _named_game(fixture):
     raw = open(found[0], "rb").read().decode("utf-8", "ignore")
     assert re.search(pattern, raw), f"{found[0]} does not match {pattern}"
     return found[0]
+
+
+def _parsed_fixture(fixture, pred):
+    """A named fixture game (day, file, round) whose parsed round (every round if None) satisfies pred(H, T)."""
+    day, name, rnd = fixture
+    found = glob.glob(os.path.join(DATA_ROOT, "2021", day, "*", name))
+    assert found, f"self-test needs the game {name} under {DATA_ROOT}/2021/{day}"
+    H, T = process(found[0])
+    sel = (H, T) if rnd is None else ([H[rnd]], [T[rnd]])
+    assert pred(*sel), f"{found[0]} round {rnd} no longer has the case its self-test needs"
+    return found[0]
+
+
+def _durings(H):
+    return (t for halfturns in H for t in halfturns if isinstance(t, DuringTurn))
+
+
+def _base_riichi(t) -> bool:
+    """Menzen, not in riichi, shanten <= 0: the tile conditions of a riichi."""
+    so, p = t.stateObj, t.player
+    return bool(so.is_menzen[p]) and not so.reaches[p] and legal_oracles.riichi_by_rules(
+        so.hand_tensor, True, False, 10 ** 6, 70, 0, 0)
+
+
+def _executed_kinds(H) -> set:
+    return {kind_of(d.naki) for halfturns in H for t in halfturns
+            for decs in ([t.decisions] if isinstance(t, DuringTurn) else t.decisions if isinstance(t, PostTurn) else [])
+            for d in (decs[DECISION_NAKI_IDX] if decs else []) if d.executed}
+
+
+def _houtei_call_candidate(H) -> bool:
+    """A responder not in riichi who holds a pon / chi shape for the last discard."""
+    for halfturns in H:
+        for t in halfturns:
+            if not isinstance(t, PostTurn):
+                continue
+            for p, rs in t.responder_states.items():
+                if rs.remaining_tsumo or rs.reaches[p]:
+                    continue
+                hands = np.zeros((4, 37), dtype=np.float32)
+                hands[p] = rs.hand_tensor
+                tile = TILE2IDX[next(d.discarded_tile for d in halfturns if isinstance(d, DiscardTurn) and d.encoding_idx + 1 == t.encoding_idx)]
+                if decision_mask(t.player, hands, tile[0], len(tile) == 2)[p]:
+                    return True
+    return False
+
+
+def _quiet_draw(H, kind_idx):
+    """(round, remaining_tsumo) of the first DuringTurn offered an option of decisions[kind_idx] that executed
+    nothing: switching that draw's options off cannot hit the parser's label asserts. None if there is none."""
+    for r, halfturns in enumerate(H):
+        for t in halfturns:
+            if isinstance(t, DuringTurn) and t.decisions[kind_idx] and not any(d.executed for ds in t.decisions for d in ds):
+                return r, t.stateObj.remaining_tsumo
+    return None
+
+
+def _option_fixtures() -> dict:
+    """Games for the T-032 corruptions: the 2021-01-01 pool where it has the case, else a named fixture."""
+    def riichi_at(draws):  # an offer at exactly `draws`, and no EXECUTED riichi there (a stricter rule then removes
+        # only unexecuted offers: the re-parse cannot trip the L10 assert)
+        def pred(H, T):
+            at = [t for t in _durings(H) if t.decisions[DECISION_REACH_IDX] and t.stateObj.remaining_tsumo == draws]
+            return bool(at) and not any(d.executed for t in at for d in t.decisions[DECISION_REACH_IDX])
+        return pred
+
+    def kan_offer_unexecuted(H, T):
+        return _quiet_draw(H, DECISION_NAKI_IDX) is not None
+
+    def riichi_offer_unexecuted(H, T):
+        return _quiet_draw(H, DECISION_REACH_IDX) is not None
+
+    def okurikan(H, T):
+        return any(t.stateObj.reaches[t.player] and any(t.stateObj.hand_tensor[k] == 4 and k != t.stateObj.drawn_tile[0]
+                                                         for k in range(34)) for t in _durings(H))
+
+    def haitei_kan(H, T):
+        def kan_shape(t):
+            so, p = t.stateObj, t.player
+            pons = [m.get_exposed()[0][0] // 4 for m in so.melds[p] if m.is_pon()]
+            return (so.hand_tensor[:34] == 4).any() or any(so.hand_tensor[k] >= 1 for k in pons)
+        return any(t.stateObj.remaining_tsumo == 0 and kan_shape(t) for t in _durings(H))
+
+    def chankan(H, T):
+        return "kakan" in _executed_kinds(H)
+
+    def call_choice(H, T):
+        return any(len(t.decisions[p][DECISION_NAKI_IDX]) >= 2 for halfturns in H for t in halfturns
+                   if isinstance(t, PostTurn) for p in range(4))
+
+    def named(fixture, pred):
+        return _parsed_fixture(fixture, pred)
+
+    def riichi_low_points(H, T):
+        return any(_base_riichi(t) and t.stateObj.scores[t.player] < 10 for t in _durings(H))
+
+    def wait_change(H, T):
+        return any(t.stateObj.reaches[t.player] and t.stateObj.hand_tensor[t.stateObj.drawn_tile[0]] == 4
+                   and not legal_oracles.riichi_ankan_keeps_waits(t.stateObj.hand_tensor, t.stateObj.drawn_tile[0])
+                   for t in _durings(H))
+
+    def kan4(H, T):
+        return any(isinstance(t, PostTurn) and any(legal_oracles.suukaikan(*legal.kans_on_table(rs.melds)) and rs.remaining_tsumo
+                                                    for rs in t.responder_states.values()) for halfturns in H for t in halfturns)
+
+    def riichi_ankan(H, T):
+        return any(t.stateObj.reaches[t.player] and any(d.executed for d in t.decisions[DECISION_NAKI_IDX]) for t in _durings(H))
+
+    def dead_end(H, T):
+        for halfturns in H:
+            for t in (t for t in halfturns if isinstance(t, PostTurn)):
+                for p, rs in t.responder_states.items():
+                    hands = np.zeros((4, 37), dtype=np.float32)
+                    hands[p] = rs.hand_tensor
+                    disc = next((d for d in halfturns if isinstance(d, DiscardTurn) and d.encoding_idx + 1 == t.encoding_idx), None)
+                    if disc is None or rs.reaches[p] or not rs.remaining_tsumo:
+                        continue
+                    tile = TILE2IDX[disc.discarded_tile]
+                    for d in decision_mask(t.player, hands, tile[0], len(tile) == 2)[p]:
+                        if not d.naki.is_minkan() and not legal.call_leaves_legal_discard(rs.hand_tensor, d.naki):
+                            return True
+        return False
+
+    pool = {
+        "few_draws": lambda H, T: any(_base_riichi(t) and t.stateObj.remaining_tsumo < 4 for t in _durings(H)),
+        "riichi_at_4": riichi_at(4),
+        "okurikan": okurikan,
+        "haitei_kan": haitei_kan,
+        "houtei_call": lambda H, T: _houtei_call_candidate(H),
+        "kan_offer_unexecuted": kan_offer_unexecuted,
+        "riichi_offer_unexecuted": riichi_offer_unexecuted,
+        "chankan": chankan,
+        "call_choice": call_choice,
+    }
+    games = {name: _game_with(pred) for name, pred in pool.items()}
+    games["low_points"] = named(LOW_POINTS_RIICHI, riichi_low_points)
+    games["wait_change"] = named(WAIT_CHANGE_ANKAN, wait_change)
+    games["kan4"] = named(KAN4_ROUND, kan4)
+    games["dead_end"] = named(DEAD_END_CALL, dead_end)
+    games["riichi_ankan"] = named(RIICHI_ANKAN, riichi_ankan)
+    return games
 
 
 def _count(game, H=None, T=None, tp=None):
@@ -795,19 +1201,26 @@ def self_test():
     red_kan_dora = _named_game(RED_KAN_DORA_LOG)
     chankan_ippatsu = _named_game(CHANKAN_IPPATSU_LOG)
     early_ankan = _named_game(EARLY_ANKAN_LOG)
-    check(run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan], TransformerTensorProcessor()))
+    option_games = _option_fixtures()
+    check(run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan] + sorted(set(option_games.values())),
+              TransformerTensorProcessor()))
 
     def expect_failure(name, gate, corrupt, game=f):
+        """corrupt(H, T, tp) edits the parse in place; it may return a context manager that stays active while the
+        game is counted. gate: one gate name or a tuple of names, every one of which must fail."""
+        gates = (gate,) if isinstance(gate, str) else gate
         baseline = failed_gates(_count(game))
         if baseline:
             raise SystemExit(f"self-test FAILED: {name}: the clean game {game} already fails {baseline}")
         tp = TransformerTensorProcessor()
         H, T = process(game)
-        corrupt(H, T, tp)
-        bad = failed_gates(_count(game, H, T, tp))
-        if gate not in bad:
-            raise SystemExit(f"self-test FAILED: {name} did not fail gate {gate} (failed: {bad or 'none'})")
-        print(f"self-test OK: {name} -> {gate}={bad[gate]}")
+        ctx = corrupt(H, T, tp)
+        with ctx or contextlib.nullcontext():
+            bad = failed_gates(_count(game, H, T, tp))
+        missed = [g for g in gates if g not in bad]
+        if missed:
+            raise SystemExit(f"self-test FAILED: {name} did not fail gate(s) {missed} (failed: {bad or 'none'})")
+        print(f"self-test OK: {name} -> " + ", ".join(f"{g}={bad[g]}" for g in gates))
 
     def found(n, what):
         if not n:
@@ -993,6 +1406,149 @@ def self_test():
         t = next(t for halfturns in H for t in halfturns if isinstance(t, PostTurn) and expected_responders(t))
         t.encoding_idx -= 1
 
+    # ---- option legality (T-032): parser rules switched off / made too strict, then re-parsed
+    def reparse(game, **patches):  # corrupt: re-parse with legal.<name> replaced
+        def corrupt(H, T, tp):
+            with contextlib.ExitStack() as stack:
+                for name, value in patches.items():
+                    stack.enter_context(mock.patch.object(legal, name, value))
+                H[:], T[:] = process(game)
+        return corrupt
+
+    riichi_allowed, ankan_allowed, kans_on_table = legal.riichi_allowed, legal.riichi_ankan_allowed, legal.kans_on_table
+    g = option_games
+    expect_failure("riichi points rule off", ("riichi_offer_low_points", "during_mask_mismatch"),
+                   reparse(g["low_points"], RIICHI_MIN_SCORE=0), game=g["low_points"])
+    expect_failure("riichi wall rule off", "riichi_offer_few_draws", reparse(g["few_draws"], RIICHI_MIN_DRAWS_LEFT=0),
+                   game=g["few_draws"])
+    expect_failure("riichi wall rule too strict (5 draws)", "during_mask_mismatch",
+                   reparse(g["riichi_at_4"], RIICHI_MIN_DRAWS_LEFT=5), game=g["riichi_at_4"])
+    expect_failure("riichi okurikan allowed", ("riichi_okurikan_offer", "during_mask_mismatch"),
+                   reparse(g["okurikan"], riichi_ankan_allowed=lambda c, d, k, m: k != d or ankan_allowed(c, d, k, m)),
+                   game=g["okurikan"])
+    expect_failure("riichi ankan wait check off", ("riichi_ankan_wait_change_offer", "during_mask_mismatch"),
+                   reparse(g["wait_change"], riichi_ankan_allowed=lambda c, d, k, m: k == d), game=g["wait_change"])
+    expect_failure("kan on the haitei draw allowed", ("kan_offer_no_draw", "during_mask_mismatch"),
+                   reparse(g["haitei_kan"], kan_allowed=lambda draws, n: n < legal.MAX_KANS), game=g["haitei_kan"])
+    expect_failure("calls on the last discard allowed", ("call_offer_last_discard", "post_mask_mismatch"),
+                   reparse(g["houtei_call"], calls_allowed=lambda draws, n, o: not legal.suukaikan_pending(n, o)),
+                   game=g["houtei_call"])
+    expect_failure("calls after a 4th kan by two players allowed", ("call_offer_kan4_abort", "post_mask_mismatch"),
+                   reparse(g["kan4"], calls_allowed=lambda draws, n, o: draws > 0), game=g["kan4"])
+    expect_failure("kuikae dead-end call allowed", ("call_offer_no_legal_discard", "post_mask_mismatch"),
+                   reparse(g["dead_end"], call_leaves_legal_discard=lambda hand, call: True), game=g["dead_end"])
+    expect_failure("parser riichi rule reads the draw counter off by one", "during_mask_mismatch",
+                   reparse(g["few_draws"], riichi_allowed=lambda sc, d, n, o: riichi_allowed(sc, d + 1, n, o)),
+                   game=g["few_draws"])
+
+    def at_draw(game, kind_idx, fake):  # kans_on_table answers `fake` on ONE quiet draw of the parser, else the truth
+        target = _quiet_draw(process(game)[0], kind_idx)
+
+        def patched(melds):
+            loc = sys._getframe(1).f_locals
+            ev = loc.get("eventtype", "")
+            here = ev and ev[0] in "TUVW" and (len(loc["all_halfturns"]), loc["remaining_tsumo"]) == target
+            return fake if here else kans_on_table(melds)
+        return patched
+
+    kan_game, riichi_offer_game = g["kan_offer_unexecuted"], g["riichi_offer_unexecuted"]
+    expect_failure("parser sees 4 kans (one owner) at a draw: its kan bits vanish", "during_mask_mismatch",
+                   reparse(kan_game, kans_on_table=at_draw(kan_game, DECISION_NAKI_IDX, (4, 1))), game=kan_game)
+    expect_failure("parser sees suukaikan pending at a draw: its riichi bit vanishes", "during_mask_mismatch",
+                   reparse(riichi_offer_game, kans_on_table=at_draw(riichi_offer_game, DECISION_REACH_IDX, (4, 2))),
+                   game=riichi_offer_game)
+
+    def replay_sees_kans(fake):  # the gate's replay believes `fake` kans are down: the counters must see real offers
+        return lambda H, T, tp: mock.patch.object(sys.modules[__name__], "snap_kans", lambda snap: fake)
+
+    expect_failure("replay sees 4 kans (one owner): real kan offers counted", "kan_offer_over_cap",
+                   replay_sees_kans((4, 1)), game=g["kan_offer_unexecuted"])
+    expect_failure("replay sees suukaikan pending: real riichi offers counted", "riichi_offer_after_kan4",
+                   replay_sees_kans((4, 2)), game=g["riichi_offer_unexecuted"])
+
+    def drop_executed_riichi_ankan(H, T, tp):  # after parsing: a legal, executed riichi ankan removed
+        for t in (t for halfturns in H for t in halfturns if isinstance(t, DuringTurn) and t.stateObj.reaches[t.player]):
+            kans = [d for d in t.decisions[DECISION_NAKI_IDX] if d.executed]
+            if kans:
+                t.decisions[DECISION_NAKI_IDX].remove(kans[0])
+                return
+        found(0, "an executed riichi ankan")
+
+    expect_failure("executed riichi ankan removed", ("lab_ankan", "during_mask_mismatch"), drop_executed_riichi_ankan,
+                   game=g["riichi_ankan"])
+
+    def drop_riichi_offers(H, T, tp):  # what the parser would emit without the REACH-step-1 assert
+        n = 0
+        for t in (t for halfturns in H for t in halfturns if isinstance(t, DuringTurn)):
+            n += sum(d.executed for d in t.decisions[DECISION_REACH_IDX])
+            t.decisions[DECISION_REACH_IDX].clear()
+        found(n, "an executed riichi")
+
+    riichi_game = f if has_riichi(*process(f)) else _game_with(has_riichi)
+    expect_failure("riichi offers dropped", "riichi_label_mismatch", drop_riichi_offers, game=riichi_game)
+    try:  # L10: an executed riichi that was not offered stops the parse
+        with mock.patch.object(legal, "riichi_allowed", lambda *a: False):
+            process(riichi_game)
+        raise SystemExit("self-test FAILED: an executed, un-offered riichi parsed without the REACH assert")
+    except AssertionError as e:
+        assert "riichi" in str(e), e
+        print("self-test OK: an executed, un-offered riichi raises at REACH step 1")
+
+    def wrong_riichi_drawn_tile(H, T, tp):
+        for t in (t for halfturns in H for t in halfturns if isinstance(t, DuringTurn) and t.stateObj.reaches[t.player]):
+            so = t.stateObj
+            so.drawn_tile = [(so.drawn_tile[0] + 1) % 34]
+            return
+        found(0, "a draw by a player in riichi")
+
+    expect_failure("riichi-turn drawn tile corrupted", "state_xml_mismatch", wrong_riichi_drawn_tile, game=riichi_game)
+
+    def extra_during_bit(H, T, tp):
+        def edit(td, tdisc, tpost):
+            if len(td[3]):
+                off = [j for j in range(2, 71) if td[2][0, j] == 0]
+                td[2][0, off[0]] = 1.0
+        _patch_tensors(tp, edit)
+
+    def cleared_post_call_bit(H, T, tp):
+        def edit(td, tdisc, tpost):
+            for i in range(len(tpost[3])):
+                on = [j for j in range(2, 154) if tpost[2][i, j] == 1 and j != tpost[3][i].item()]
+                if on:
+                    tpost[2][i, on[0]] = 0.0
+                    return
+        _patch_tensors(tp, edit)
+
+    expect_failure("built during mask gains a bit", "during_mask_mismatch", extra_during_bit)
+    expect_failure("built post mask loses a call bit", "post_mask_mismatch", cleared_post_call_bit,
+                   game=g["call_choice"])
+
+    def chi_in_chankan_window(H, T, tp):
+        for halfturns in H:
+            for i, t in enumerate(halfturns):
+                prev = halfturns[i - 1] if i else None
+                if isinstance(t, PostTurn) and isinstance(prev, DuringTurn) and any(
+                        d.executed and d.naki.is_kakan() for d in prev.decisions[DECISION_NAKI_IDX]):
+                    p = (t.player + 1) % 4
+                    t.decisions[p][DECISION_NAKI_IDX].append(NakiDecision(p, Naki.from_chi_info(0, 0, 0, False), False))
+                    return
+        found(0, "a kakan")
+
+    def drop_call_and_responder(H, T, tp):  # a legal, unexecuted call removed together with its responder state
+        for t in (t for halfturns in H for t in halfturns if isinstance(t, PostTurn)):
+            for p in range(4):
+                calls = [d for d in t.decisions[p][DECISION_NAKI_IDX] if not d.executed]
+                if calls and not any(d.executed for ds in t.decisions[p] for d in ds):
+                    t.decisions[p][DECISION_NAKI_IDX].remove(calls[0])
+                    del t.responder_states[p]
+                    return
+        found(0, "an unexecuted call")
+
+    expect_failure("legal call removed with its responder state", ("post_mask_mismatch", "state_xml_mismatch"),
+                   drop_call_and_responder)
+    expect_failure("chi offered in a chankan window", ("call_offer_in_chankan", "post_mask_mismatch"),
+                   chi_in_chankan_window, game=g["chankan"])
+
     # ---- legal discard mask (T-031); every fixture predicate uses the oracle context, never after_call
     def declaration_restricted(H, T):
         return any(lg.context == "declaration" and lg.legal < held(t.stateObj) for t, lg in legal_samples(H, T))
@@ -1127,7 +1683,6 @@ def self_test():
 
     expect_failure("un-labelled ron", "lab_ron", unlabel_ron)
     expect_failure("triple ron left unlabelled", "lab_ron", skip_ron3_marking, game=ron3)
-    riichi_game = f if has_riichi(*process(f)) else _game_with(has_riichi)
     expect_failure("executed riichi labels erased", "riichi_label_mismatch", erase_riichi_labels, game=riichi_game)
     expect_failure("tsumogiri bit flipped in the token list", "token_xml_mismatch", flip_tsumogiri_bit)
     expect_failure("wrong responder POV", "post_wrong_pov", wrong_pov)
