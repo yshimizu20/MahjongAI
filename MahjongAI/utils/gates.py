@@ -102,7 +102,6 @@ WAIT_CHANGE_ANKAN = ("20210103", "2021010313gm-00a9-0000-5120e1eb.log", 10)  # d
 KAN4_ROUND = ("20210214", "2021021419gm-00a9-0000-57c92bbe.log", 3)  # 4th kan by 2 players, then a pon-able discard
 DEAD_END_CALL = ("20210322", "2021032214gm-00a9-0000-6d556c69.log", 12)  # chi that leaves only kuikae kinds
 RIICHI_ANKAN = ("20210101", "2021010100gm-00a9-0000-17175841.log", None)  # an executed riichi ankan
-CHANKAN_WINDOW = ("20210101", "2021010100gm-00e1-0000-3219df3d.log", 6)  # kakan whose added tile is chi-able
 # T-033 win fixtures. YAKU(i): an <AGARI> whose yaku list holds id i
 def YAKU(i): return rf'<AGARI [^>]*\byaku="(\d+,\d+,)*{i},'
 SEAT_WIND_HOUTEI_LOG = ("20210101", "2021010100gm-00a9-0000-1222e403.log", YAKU(12))  # Haku + seat W; Houtei + Tanyao
