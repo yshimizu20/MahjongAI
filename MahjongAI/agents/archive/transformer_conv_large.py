@@ -1138,5 +1138,5 @@ class TransformerTensorProcessor:
 
 
 if __name__ == "__main__":
-    model = TransformerConvModel().to(device)
+    model = TransformerConvLargeModel(n_layers=2).to(device)
     print(f"{sum(p.numel() for p in model.parameters()) / 1e6} M params")

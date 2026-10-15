@@ -1,9 +1,5 @@
 """Unit tests for MahjongAI.utils.agari: the yaku check, the win-context flags, waits and furiten (T-033).
 Hands are written in Tenhou notation (1z-7z = E S W N haku hatsu chun); counts are 34-kind vectors."""
-import sys
-
-sys.path.append("../../")
-
 import numpy as np
 import pytest
 from mahjong.constants import EAST, NORTH, SOUTH, WEST

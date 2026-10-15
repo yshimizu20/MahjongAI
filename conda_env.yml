@@ -11,6 +11,6 @@ dependencies:
   - ipykernel
   - pip
   - pip:
-      - mahjong
+      - mahjong==1.4.0  # 2.x breaks utils/agari.py and utils/win_oracles.py; port = T-036
       - requests
-      - pytest
+      - pytest>=7  # pytest.ini uses the pythonpath key (7.0+)

@@ -1,48 +1,33 @@
-import sys
-
-sys.path.append("../../")
-
-import MahjongAI.utils.dataloader as dl
-from MahjongAI.agents.archive.transformer import TransformerModel
-import MahjongAI.process_xml as px
-from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
-from MahjongAI.state import StateObject
-import torch
+"""Unit test for the discard-head tensors of encoder_conv.TransformerTensorProcessor on a hand-built round:
+seven discards in seat order 0, 1, 2, 3, 0, 1, 2, each of a plain (non-red) tile the actor holds."""
 import numpy as np
-import pytest
+import torch
+
+import MahjongAI.process_xml as px
+from MahjongAI.agents.encoder_conv import N_X1_PLANES, TransformerTensorProcessor
+from MahjongAI.state import StateObject
+from MahjongAI.turn import DiscardTurn
+
+SCORES = [250, 240, 230, 280]  # Tenhou "ten" units (x100 points); distinct per seat so a wrong POV shows in x2
+DISCARDED = [0, 4, 8, 12, 17, 20, 24]  # 136-index tiles: 1m..7m, and 17 is a plain 5m (16 is the red one)
+TSUMOGIRI = [False, True] * 4
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-@pytest.fixture(scope="module")
-def model():
-    return TransformerModel()
-
-
-@pytest.fixture(scope="module")
-def dataloader(model):
-    return dl.DataLoader("data/")
-
-
-def test_discard(dataloader):
-    hand_tensor = np.zeros(37)
-    hand_tensor[:14] = 1
-
-    remaining_tiles = np.ones(37) * 3
-
-    default_state_obj = StateObject(
+def state_for(player: int) -> StateObject:
+    hand = np.zeros(37)
+    hand[:14] = 1  # one each of 1m..9m, 1p..5p: every discarded kind is held, no red five
+    return StateObject(
         remaining_turns=70,
-        hand_tensor=hand_tensor,
-        remaining_tiles=remaining_tiles,
-        remaining_tiles_pov=remaining_tiles,
-        sutehai_tensor=np.zeros(37),
+        hand_tensor=hand,
+        remaining_tiles=np.full(37, 3.0),
+        remaining_tiles_pov=np.full(37, 3.0),
+        sutehai_tensors=np.zeros((4, 37)),
         is_menzen=[1, 1, 1, 1],
         double_reaches=[0, 0, 0, 0],
         reaches=[0, 0, 0, 0],
         ippatsu=[0, 0, 0, 0],
         melds=[[], [], [], []],
-        scores=[25000, 25000, 25000, 25000],
+        scores=SCORES,
         kyotaku=0,
         honba=0,
         dora=[0],
@@ -50,90 +35,37 @@ def test_discard(dataloader):
         rounds_remaining=4,
         parent_rounds_remaining=[1, 1, 1, 1],
         remaining_tsumo=70,
-    )
-    encodings = torch.tensor(
-        [
-            px.discard2idx(0, 0, False),
-            px.discard2idx(1, 1, True),
-            px.discard2idx(2, 2, False),
-            px.discard2idx(3, 3, True),
-            px.discard2idx(0, 4, False),
-            px.discard2idx(1, 5, True),
-            px.discard2idx(2, 6, False),
-            px.discard2idx(3, 7, True),
-        ]
-    ).to(device)
-
-    halfturns = [
-        DiscardTurn(
-            0,
-            default_state_obj,
-            0,
-            0,
-        ),
-        DiscardTurn(
-            1,
-            default_state_obj,
-            4,
-            1,
-        ),
-        DiscardTurn(
-            2,
-            default_state_obj,
-            8,
-            2,
-        ),
-        DiscardTurn(
-            3,
-            default_state_obj,
-            12,
-            3,
-        ),
-        DiscardTurn(
-            0,
-            default_state_obj,
-            16,
-            4,
-        ),
-        DiscardTurn(
-            1,
-            default_state_obj,
-            20,
-            5,
-        ),
-        DiscardTurn(
-            2,
-            default_state_obj,
-            24,
-            6,
-        ),
-    ]
-
-    embeddings_tensor, state_obj_tensor_batch, action_mask_batch, y_tensor = (
-        dataloader._build_discard_tensor(halfturns, encodings)
+        player=player,
     )
 
-    assert embeddings_tensor.shape == (7, 150)
-    assert max(embeddings_tensor[0]) == min(embeddings_tensor[0]) == 0
-    assert max(embeddings_tensor[1, 1:]) == min(embeddings_tensor[1, 1:]) == 0
-    assert (
-        max(embeddings_tensor[1:, 0])
-        == min(embeddings_tensor[1:, 0])
-        == px.discard2idx(0, 0, False)
-    )
-    assert (
-        max(embeddings_tensor[2:, 1])
-        == min(embeddings_tensor[2:, 1])
-        == px.discard2idx(1, 1, True)
-    )
 
-    x1, x2, x3 = state_obj_tensor_batch
-    assert x1.shape == torch.Size([7, 3, 37])
-    assert x2.shape == torch.Size([7, 7, 4])
-    assert x3.shape == torch.Size([7, 4])
+def test_discard():
+    n = len(DISCARDED)
+    tokens = [px.discard2idx(j % 4, DISCARDED[j] // 4, TSUMOGIRI[j]) for j in range(n)]
+    token_tensor = torch.nn.functional.pad(torch.tensor(tokens, dtype=torch.int64), (0, 150 - n))
+    turns = [DiscardTurn(i % 4, state_for(i % 4), DISCARDED[i], i) for i in range(n)]
 
-    assert action_mask_batch.shape == (7, 37)
-    assert (action_mask_batch[:, :14] == 1).all()
-    assert (action_mask_batch[:, 14:] == 0).all()
+    tp = TransformerTensorProcessor()
+    history, (x1, x2, x3), mask, y, padding = tp._build_discard_tensor(turns, token_tensor)
 
-    assert (y_tensor == torch.tensor([0, 1, 2, 3, 4, 5, 6]).to(device)).all().item()
+    assert not tp.skipped
+    assert history.shape == (n, 150)
+    assert x1.shape == (n, N_X1_PLANES, 37, 4)
+    assert x2.shape == (n, 7, 4)
+    assert x3.shape == (n, 4)
+    assert mask.shape == (n, 37)
+
+    for i in range(n):
+        actor = i % 4
+        # sample i sees exactly the i earlier discards (nothing from its own turn on), seats relative to the actor
+        expected = [px.discard2idx((j % 4 - actor) % 4, DISCARDED[j] // 4, TSUMOGIRI[j]) for j in range(i)]
+        assert history[i, :i].tolist() == expected
+        assert (history[i, i:] == 0).all()
+        assert padding[i].tolist() == [p < i for p in range(150)]
+        # x2 row 0 is the score row rotated actor-first: column 0 is the actor's own score
+        torch.testing.assert_close(x2[i, 0], torch.tensor([SCORES[(actor + k) % 4] / 250.0 for k in range(4)]))
+
+    # legal mask = the held kinds (no riichi declaration, no call), and every target is inside it
+    assert (mask[:, :14] == 1).all() and (mask[:, 14:] == 0).all()
+    assert mask[torch.arange(n), y].all()
+    assert y.tolist() == list(range(n))
