@@ -8,6 +8,7 @@ class Decision:
     REACH = 2
     AGARI = 3
     PASS = 4
+    ABORT = 5
 
     def __init__(self, player: int, type_: int, executed: bool):
         self.player = player
@@ -40,6 +41,16 @@ class AgariDecision(Decision):
 
     def __repr__(self) -> str:
         return f"AgariDecision: player={self.player}, executed={self.executed}, yaku={self.yaku}"
+
+
+class AbortDecision(Decision):
+    """Kyuushu kyuuhai: abort the round on the first draw (utils/legal.py kyuushu_legal)."""
+
+    def __init__(self, player: int, executed: bool):
+        super().__init__(player, Decision.ABORT, executed)
+
+    def __repr__(self) -> str:
+        return f"AbortDecision: player={self.player}, executed={self.executed}"
 
 
 class PassDecision(Decision):

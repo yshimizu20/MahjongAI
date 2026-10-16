@@ -11,6 +11,8 @@ same rule by another route:
                              the riichi-ankan wait set by Shanten == -1 on the concealed hand (not Agari with kan
                              sets), the kuikae dead end from the post-head action index (index arithmetic, not
                              the Naki decoder)
+  kyuushu_by_rules (T-034)   the seat's draw count and "any call yet" from the replay (not the parser's
+                             first-go-around flag), terminals / honors by rank arithmetic (not a kind list)
 Pure functions over plain values; gates.py extracts those values from the tokens and the halfturns.
 """
 from typing import List, Optional, Set
@@ -29,6 +31,8 @@ MIN_RIICHI_DRAWS = 4
 KAN_CAP = 4
 ANKAN_IDX, KAKAN_IDX = 3, 37  # during head: 0 pass, 1 tsumo, 2 riichi, 3-36 ankan, 37-70 kakan
 RIICHI_IDX = 2
+KYUUSHU_IDX = 71  # during head: kyuushu kyuuhai abort
+KYUUSHU_KINDS = 9
 MINKAN_IDX = 120  # post head: 0 pass, 1 ron, 2-82 chi, 83-119 pon, 120-153 daiminkan
 RED_CHI_SLOT = {0: (2, 0), 1: (2, 1), 2: (3, 0), 3: (3, 2), 4: (4, 1), 5: (4, 2)}  # slot -> (lowest rank, called pos)
 
@@ -187,3 +191,11 @@ def calls_by_rules(unrestricted: Set[int], concealed34, called: int, in_riichi: 
         return set()
     return {i for i in unrestricted
             if (i >= MINKAN_IDX and n_kans < KAN_CAP) or (i < MINKAN_IDX and not call_dead_end(concealed34, i, called))}
+
+
+def kyuushu_by_rules(concealed34, own_draws: int, called: bool) -> bool:
+    """Kyuushu kyuuhai is offered: the seat's first draw of the round, no N (chi / pon / kan, ankan included) by
+    anyone before it, and >= 9 distinct kinds of rank 1 or 9 or honor (kind >= 27) in the 14 tiles."""
+    c = np.asarray(concealed34)[:34]
+    terminal_kinds = sum(1 for k in range(34) if c[k] > 0 and (k >= 27 or k % 9 in (0, 8)))
+    return own_draws == 1 and not called and terminal_kinds >= KYUUSHU_KINDS

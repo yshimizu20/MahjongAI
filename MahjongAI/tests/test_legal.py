@@ -1,5 +1,6 @@
 """Unit tests for MahjongAI.utils.legal: riichi-declaration tenpai, kuikae, the 37-slot red-five mask, and the
-option rules (riichi points / wall / suukaikan, kan wall / cap, riichi ankan, calls, kuikae dead end).
+option rules (riichi points / wall / suukaikan, kan wall / cap, riichi ankan, calls, kuikae dead end), and
+kyuushu kyuuhai.
 Hands are written in Tenhou notation: 0m / 0p / 0s is a red five (it counts in its kind AND its red slot)."""
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ from MahjongAI.utils.legal import (
     calls_allowed,
     kan_allowed,
     kans_on_table,
+    kyuushu_legal,
     riichi_allowed,
     riichi_ankan_allowed,
     wait_kinds,
@@ -266,3 +268,23 @@ def test_pon_always_leaves_a_legal_discard():
     # a pon dead end would need five copies of one kind: with 111z2z, a pon of 1z leaves 1z (forbidden) and 2z
     pon = Naki.from_pon_info(kind("1z"), 0, False, 1)
     assert call_leaves_legal_discard(hand("111z2z"), pon)
+
+
+def test_kyuushu_nine_kinds_on_the_first_draw():
+    h = hand("19m19p1s1234z23456m")  # 1m 9m 1p 9p 1s E S W N: 9 kinds, 14 tiles
+    assert kyuushu_legal(h[:34], True)
+    assert not kyuushu_legal(h[:34], False)  # not the first draw, or a call came before it
+
+
+def test_kyuushu_eight_kinds_is_not_enough():
+    assert not kyuushu_legal(hand("19m19p1s123z234566m")[:34], True)
+
+
+def test_kyuushu_counts_distinct_kinds_not_tiles():
+    # 11m 99m 11p 99p 11s 11z 22z: 14 tiles, all terminal / honor, but 7 kinds
+    assert not kyuushu_legal(hand("1199m1199p11s1122z")[:34], True)
+    assert kyuushu_legal(hand("1199m1199p15s1234z")[:34], True)  # 9 kinds once the pairs open up
+
+
+def test_kyuushu_ignores_red_fives_and_middle_tiles():
+    assert not kyuushu_legal(hand("19m19p1s123z0m0p0556s")[:34], True)  # 8 kinds; a red five is a five
