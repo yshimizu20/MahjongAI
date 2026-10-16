@@ -25,6 +25,8 @@ far, rinshan included); scores in 100-point units:
                       can only be ronned (suukaikan); no daiminkan when 4 kans exist; no chi after which
                       every concealed tile is kuikae-forbidden (no legal discard would remain; a pon cannot reach
                       this: it would need five copies of one kind)
+  kyuushu kyuuhai     「第一ツモで、ポン/チー/カン(暗槓含む)が入っていない」 and 9+ distinct terminal / honor
+                      kinds in the 14 tiles (the drawn tile included): the player may abort the round
 """
 from typing import List, Optional, Set, Tuple
 
@@ -41,6 +43,8 @@ _agari = Agari()
 RIICHI_MIN_SCORE = 10  # 1,000 points (scores are in 100-point units)
 RIICHI_MIN_DRAWS_LEFT = 4  # an own draw must remain after this one
 MAX_KANS = 4
+YAOCHU_KINDS = frozenset({0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33})  # 1/9 of each suit, 7 honors
+KYUUSHU_MIN_KINDS = 9
 
 
 def held_kinds(hand: np.ndarray) -> Set[int]:
@@ -200,3 +204,9 @@ def call_leaves_legal_discard(concealed34: np.ndarray, call: Naki) -> bool:
         after[k] -= 1
     assert (after >= 0).all(), f"{call!r} uses tiles the hand does not hold"
     return bool(held_kinds(after) - kuikae_forbidden_kinds(call))
+
+
+def kyuushu_legal(hand34: np.ndarray, first_draw: bool) -> bool:
+    """The player may abort (kyuushu kyuuhai): their first draw with no call by anyone before it (first_draw) and
+    >= 9 distinct terminal / honor kinds in the 14-tile hand, the drawn tile included."""
+    return first_draw and sum(1 for k in YAOCHU_KINDS if hand34[k] > 0) >= KYUUSHU_MIN_KINDS

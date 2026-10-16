@@ -11,7 +11,7 @@ Gate groups (counted over every game, round, halfturn and built tensor):
   RIICHI  executed riichi labels == <REACH step="1"> events: the same seats in the same order per round, and
           the during-head riichi targets (index 2) == their count
   CALLS   executed chi / pon / minkan / ankan / kakan labels == <N> events by kind
-  MASK    every label index is inside its action mask (during 71, discard 37, post 154); chi/pon indices injective
+  MASK    every label index is inside its action mask (during 72, discard 37, post 154); chi/pon indices injective
   POV     a PostTurn sample's state belongs to the responder; unseen counts + own hand <= 135 and no negative
           count in EVERY state (each PostTurn responder state included); no two StateObjects of a round share
           a mutable buffer (remaining_tiles_pov, hand, remaining_tiles, discards, safe tiles)
@@ -50,12 +50,13 @@ Gate groups (counted over every game, round, halfturn and built tensor):
   STATE   every state a head reads (and every DiscardTurn state) == the round replayed from the XML alone
           (xml_snapshots): the 37-slot hand, every seat's melds, the drawn tile, the live draws left, the scores,
           the riichi seats and the menzen flags. The option oracles below read only that replay.
-  OPTIONS the riichi / kan bits of every BUILT during mask and the call bits of every BUILT post mask == the
+  OPTIONS the riichi / kan / kyuushu bits of every BUILT during mask and the call bits of every BUILT post mask == the
           Tenhou option rules rebuilt WITHOUT utils/legal.py (legal_oracles.py, on the replay): riichi needs
           menzen, no riichi yet, shanten <= 0, >= 1,000 points, >= 4 live draws and no suukaikan pending; no
           kan without a live draw or with 4 kans down; in riichi only the ankan of the drawn kind that keeps the
           waits (Shanten wait set); no call in a chankan window, by a riichi player, on the last discard, with
-          suukaikan pending, no daiminkan with 4 kans down, no chi / pon that leaves no legal discard. A turn /
+          suukaikan pending, no daiminkan with 4 kans down, no chi / pon that leaves no legal discard; kyuushu
+          kyuuhai only on the seat's first draw with no call yet and >= 9 terminal / honor kinds. A turn /
           responder that is not a sample has its parser options compared instead. One named counter per rule
           on the same bits; "options removed" per rule are diagnostics
   WIN     win options rebuilt WITHOUT utils/agari.py (win_oracles.py): every executed win's yaku, mapped to Tenhou
@@ -65,6 +66,8 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           PostTurn after the seat's latest discard token / after its reach token); a complete hand has an offer XOR
           a block reason, an incomplete one neither; every offer has a yaku; the built during / post win slot is
           on iff the sample offers a win
+  KYUUSHU executed kyuushu aborts == <RYUUKYOKU type="yao9"> (lab / tensor / xml counts), and per round the
+          executed abort is exactly the yao9 seat on its latest draw (seat, draw number), none without a yao9
 """
 import argparse
 import collections
@@ -85,8 +88,9 @@ from MahjongAI.turn import DuringTurn, DiscardTurn, PostTurn
 from MahjongAI.draw import Naki
 from MahjongAI.decision import AgariDecision, NakiDecision, ReachDecision, decision_mask
 from MahjongAI.utils import agari, legal, legal_oracles, win_oracles
-from MahjongAI.utils.constants import DECISION_AGARI_IDX, DECISION_NAKI_IDX, DECISION_REACH_IDX, EventStateTypes, EventTypes, TILE2IDX
-from MahjongAI.agents.encoder_conv import TransformerTensorProcessor, N_X1_PLANES
+from MahjongAI.utils.constants import (DECISION_ABORT_IDX, DECISION_AGARI_IDX, DECISION_NAKI_IDX, DECISION_REACH_IDX,
+                                       EventStateTypes, EventTypes, TILE2IDX)
+from MahjongAI.agents.encoder_conv import TransformerTensorProcessor, N_X1_PLANES, DURING_TURN_ACTION_DIM
 
 PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_ROOT = os.path.join(PACKAGE_DIR, "data", "processed")
@@ -102,6 +106,14 @@ WAIT_CHANGE_ANKAN = ("20210103", "2021010313gm-00a9-0000-5120e1eb.log", 10)  # d
 KAN4_ROUND = ("20210214", "2021021419gm-00a9-0000-57c92bbe.log", 3)  # 4th kan by 2 players, then a pon-able discard
 DEAD_END_CALL = ("20210322", "2021032214gm-00a9-0000-6d556c69.log", 12)  # chi that leaves only kuikae kinds
 RIICHI_ANKAN = ("20210101", "2021010100gm-00a9-0000-17175841.log", None)  # an executed riichi ankan
+# T-034 kyuushu fixtures. Named games: (day, file, regex); parsed fixtures: (day, file, round)
+YAO9 = r'<RYUUKYOKU [^>]*type="yao9"'
+YAO9_LOG = ("20210101", "2021010100gm-00a9-0000-c851c43f.log", YAO9)  # round 0 seat 0: exactly 9 kinds, aborted
+KYUUSHU_AFTER_CALL_LOG = ("20210101", "2021010115gm-00a9-0000-52ecaf6b.log", YAO9)  # round 8 seat 0: 9 kinds after a
+#   pon (no offer); round 6 seat 0 declines an offer; round 11 seat 2 aborts
+NINTH_KIND_DRAWN_ABORT_LOG = ("20210101", "2021010101gm-00a9-0000-004c8ef1.log", YAO9)  # round 1 seat 2: 8 kinds + the draw
+NINTH_KIND_DRAWN_DECLINED = ("20210101", "2021010102gm-00a9-0000-54704a83.log", 2)  # seat 3: 8 kinds + the draw, declined
+KYUUSHU_DECLINED = ("20210101", "2021010100gm-00a9-0000-c8ce9c2b.log", 4)  # seat 3 declines an offer
 # T-033 win fixtures. YAKU(i): an <AGARI> whose yaku list holds id i
 def YAKU(i): return rf'<AGARI [^>]*\byaku="(\d+,\d+,)*{i},'
 SEAT_WIND_HOUTEI_LOG = ("20210101", "2021010100gm-00a9-0000-1222e403.log", YAKU(12))  # Haku + seat W; Houtei + Tanyao
@@ -120,7 +132,7 @@ CHANKAN_PASS_GAME = os.path.join(PACKAGE_DIR, "data", "sample", "chankan_pass_sy
 DEFAULT_DAYS = ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
                 "20210709", "20210815", "20210921", "20211030", "20211112", "20211225"]
 KINDS = ["chi", "pon", "minkan", "ankan", "kakan"]
-LABELLED = ["tsumo", "ron", "riichi"] + KINDS  # lab_<k> (parser) == tensor_<k> (built targets) == xml_<k>
+LABELLED = ["tsumo", "ron", "riichi", "kyuushu"] + KINDS  # lab_<k> (parser) == tensor_<k> (built targets) == xml_<k>
 HEADS = ["during", "discard", "post"]
 ZERO_GATES = [
     "parse_error", "tensor_build_error",
@@ -144,11 +156,14 @@ ZERO_GATES = [
     "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard",
     "yaku_oracle_mismatch", "furiten_mismatch", "win_reason_conflict", "win_mask_mismatch", "win_offer_without_yaku",
     "ron_offer_incomplete", "tsumo_offer_incomplete",
+    "kyuushu_offer_not_first_draw", "kyuushu_offer_after_call", "kyuushu_offer_few_kinds", "kyuushu_label_mismatch",
 ]
 OPTION_RULES = ["riichi_offer_low_points", "riichi_offer_few_draws", "riichi_offer_after_kan4", "riichi_okurikan_offer",
                 "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
-                "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard"]
-Snap = collections.namedtuple("Snap", ["hands", "melds", "draws_left", "scores", "reaches", "last_draw", "actor", "tile", "window"])
+                "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard",
+                "kyuushu_offer_not_first_draw", "kyuushu_offer_after_call", "kyuushu_offer_few_kinds"]
+Snap = collections.namedtuple("Snap", ["hands", "melds", "draws_left", "scores", "reaches", "last_draw", "actor", "tile",
+                                       "window", "own_draws", "called"])
 FURITEN = ("discard", "temp", "riichi")  # the parser's furiten block reasons; "no_yaku" is the only other one
 KAKAN_START = 37  # a kakan token's low byte is 37 + kind (Naki.get_during_turn_filter_idx)
 PON_IDX = range(83, 120)  # post-head pon indices; chi is 2-82 (the low 8 bits of a call token)
@@ -372,7 +387,10 @@ def expected_responders(t: PostTurn, calls=None):
 
 
 def expected_during_target(t: DuringTurn) -> int:
-    """The executed action of a DuringTurn in the 71-way layout: 1 tsumo, 2 riichi, 3-70 ankan / kakan, else 0."""
+    """The executed action of a DuringTurn in the 72-way layout: 1 tsumo, 2 riichi, 3-70 ankan / kakan, 71 kyuushu
+    abort, else 0."""
+    if any(d.executed for d in t.decisions[DECISION_ABORT_IDX]):
+        return legal_oracles.KYUUSHU_IDX
     if any(d.executed for d in t.decisions[DECISION_AGARI_IDX]):
         return 1
     if any(d.executed for d in t.decisions[DECISION_REACH_IDX]):
@@ -389,13 +407,15 @@ def xml_rounds(raw: str):
     dora indicator, the seats of the riichi declarations (REACH step 1) in order, and the history tokens the
     parser must emit: the INIT indicator, then DORA -> new dora, REACH step 1 -> reach, N -> call, D/E/F/G ->
     discard (tsumogiri iff it is the tile just drawn); nothing after the round's first AGARI / RYUUKYOKU. wins: per
-    AGARI event, (who, fromWho, Tenhou yaku ids)."""
+    AGARI event, (who, fromWho, Tenhou yaku ids). yao9: (seat, that seat's draw count) of a kyuushu abort (the
+    seat whose hai<N> the RYUUKYOKU shows), else None."""
     rounds, acquired = [], None
     for m in XML_EVENT.finditer(raw):
         tag, attrs = m.group(1), m.group(2)
         if tag == "INIT":
             dora = int(_attr(attrs, "seed").split(",")[5])
-            rounds.append({"end": None, "dora": dora, "reach": [], "tokens": [new_dora2idx(dora // 4)], "wins": []})
+            rounds.append({"end": None, "dora": dora, "reach": [], "tokens": [new_dora2idx(dora // 4)], "wins": [],
+                           "yao9": None, "draws": [0] * 4})
             acquired = None
             continue
         r = rounds[-1]
@@ -407,6 +427,9 @@ def xml_rounds(raw: str):
             continue
         if tag == "RYUUKYOKU":
             r["end"] = "abortive" if "type=" in attrs else "exhaustive"
+            if 'type="yao9"' in attrs:
+                shown = [q for q in range(4) if re.search(rf'\bhai{q}="', attrs)]
+                r["yao9"] = (shown[0], r["draws"][shown[0]]) if len(shown) == 1 else ("hands shown", tuple(shown))
         elif tag == "DORA":
             r["tokens"].append(new_dora2idx(int(_attr(attrs, "hai")) // 4))
         elif tag == "REACH":
@@ -418,6 +441,7 @@ def xml_rounds(raw: str):
             acquired = None
         elif tag[0] in "TUVW":
             acquired = int(tag[1:])
+            r["draws"]["TUVW".index(tag[0])] += 1
         else:
             tile = int(tag[1:])
             r["tokens"].append(discard2idx("DEFG".index(tag[0]), TILE2IDX[tile][-1], tile == acquired))
@@ -485,12 +509,13 @@ def xml_snapshots(raw: str):
     (INIT hai0-3, draws, discards, the tiles each N takes from its caller), every seat's meld codes (a kakan
     replaces its pon), the live draws left (70 minus the draws so far), the scores (INIT ten minus 10 per own
     REACH step 2), the riichi seats (REACH step 1), the latest draw (seat, tile; None after a call), the actor
-    and the tile (drawn / discarded / added by the kakan)."""
+    and the tile (drawn / discarded / added by the kakan), each seat's draw count (T/U/V/W, rinshan included) and
+    whether any N (chi / pon / kan, ankan included) came yet."""
     rounds, st = [], None
 
     def snap(actor, tile, window):
         return Snap(st["hands"].copy(), [list(x) for x in st["melds"]], st["draws"], list(st["scores"]),
-                    list(st["reaches"]), st["last_draw"], actor, tile, window)
+                    list(st["reaches"]), st["last_draw"], actor, tile, window, tuple(st["own_draws"]), st["called"])
 
     def move(seat, tile, sign):
         for slot in TILE2IDX[tile]:
@@ -500,7 +525,8 @@ def xml_snapshots(raw: str):
         tag, attrs = m.group(1), m.group(2)
         if tag == "INIT":
             st = {"hands": np.zeros((4, 37), dtype=int), "melds": [[] for _ in range(4)], "draws": 70,
-                  "scores": [int(x) for x in _attr(attrs, "ten").split(",")], "reaches": [0] * 4, "last_draw": None}
+                  "scores": [int(x) for x in _attr(attrs, "ten").split(",")], "reaches": [0] * 4, "last_draw": None,
+                  "own_draws": [0] * 4, "called": False}
             for q in range(4):
                 for tile in map(int, _attr(attrs, f"hai{q}").split(",")):
                     move(q, tile, 1)
@@ -530,12 +556,14 @@ def xml_snapshots(raw: str):
                 st["melds"][who].remove(pon)
             st["melds"][who].append(code)
             st["last_draw"] = None
+            st["called"] = True
             if nk.is_kakan():
                 r["post"].append(snap(who, exposed[0], "kakan"))
         elif tag[0] in "TUVW":
             who, tile = "TUVW".index(tag[0]), int(tag[1:])
             move(who, tile, 1)
             st["draws"] -= 1
+            st["own_draws"][who] += 1
             st["last_draw"] = (who, tile)
             r["during"].append(snap(who, tile, "draw"))
         elif tag[0] in "DEFG":
@@ -576,8 +604,9 @@ def check_state_xml(so, snap, seat, C):
 
 
 def during_options(snap):
-    """(oracle bits, tile-only bits) of the during head (2 riichi, 3-36 ankan, 37-70 kakan) from the replay; the
-    tile-only bits are what the parser offered before T-032 (diagnostics)."""
+    """(oracle bits, tile-only bits) of the during head (2 riichi, 3-36 ankan, 37-70 kakan, 71 kyuushu) from the
+    replay; the tile-only bits are what the parser offered before T-032 (diagnostics; kyuushu: >= 9 kinds on the
+    seat's first draw, so removed_kyuushu_offer_after_call counts first draws that a call made ineligible)."""
     p, c = snap.actor, snap.hands[snap.actor][:34]
     n_kans, n_owners = snap_kans(snap)
     menzen, in_riichi = snap_menzen(snap, p), bool(snap.reaches[p])
@@ -589,6 +618,10 @@ def during_options(snap):
         c, True, False, 10 ** 6, 70, 0, 0) else set()
     base |= {legal_oracles.ANKAN_IDX + k for k in np.flatnonzero(c == 4).tolist()}
     base |= {legal_oracles.KAKAN_IDX + k for k in pons if c[k] >= 1}
+    if legal_oracles.kyuushu_by_rules(c, snap.own_draws[p], snap.called):
+        oracle.add(legal_oracles.KYUUSHU_IDX)
+    if legal_oracles.kyuushu_by_rules(c, snap.own_draws[p], False):
+        base.add(legal_oracles.KYUUSHU_IDX)
     return oracle, base
 
 
@@ -596,6 +629,11 @@ def during_rule_hits(idx, snap):
     """The named option rules that forbid during-head bit idx in this state."""
     p = snap.actor
     n_kans, n_owners = snap_kans(snap)
+    if idx == legal_oracles.KYUUSHU_IDX:
+        return [g for g, bad in (("kyuushu_offer_not_first_draw", snap.own_draws[p] != 1),
+                                 ("kyuushu_offer_after_call", snap.called),
+                                 ("kyuushu_offer_few_kinds", not legal_oracles.kyuushu_by_rules(snap.hands[p][:34], 1, False)))
+                if bad]
     if idx == legal_oracles.RIICHI_IDX:
         return ([g for g, bad in (("riichi_offer_low_points", snap.scores[p] < legal_oracles.MIN_RIICHI_SCORE),
                                   ("riichi_offer_few_draws", snap.draws_left < legal_oracles.MIN_RIICHI_DRAWS),
@@ -827,12 +865,32 @@ def declined_offers(H):
                             yield ri, i, p, "ron", d.yaku, rs.scores
 
 
+def check_kyuushu(halfturns, xr, C):
+    """The executed kyuushu aborts of one round, as (seat, that seat's draw count): one DuringTurn per draw, so the
+    rank of a DuringTurn among its seat's DuringTurns is the seat's draw count. == the XML yao9, none without one."""
+    draws, executed = [0] * 4, []
+    for t in halfturns:
+        if not isinstance(t, DuringTurn):
+            continue
+        draws[t.player] += 1
+        offered = t.decisions[DECISION_ABORT_IDX]
+        C["kyuushu_offers"] += len(offered)
+        if any(d.executed for d in offered):
+            executed.append((t.player, draws[t.player]))
+        elif offered:
+            C["kyuushu_declined"] += 1
+    C["lab_kyuushu"] += len(executed)
+    if executed != ([xr["yao9"]] if xr["yao9"] is not None else []):
+        C["kyuushu_label_mismatch"] += 1
+
+
 def count_game(path, H, T, C, tp):
     """Add every counter of one parsed game (H = halfturns per round, T = tokens per round) to C."""
     raw = open(path, "rb").read().decode("utf-8", "ignore")
     ag = re.findall(r'<AGARI [^>]*?who="(\d)"[^>]*?fromWho="(\d)"', raw)
     C["xml_tsumo"] += sum(1 for w, fw in ag if w == fw)
     C["xml_ron"] += sum(1 for w, fw in ag if w != fw)
+    C["xml_kyuushu"] += len(re.findall(YAO9, raw))
     ron3 = len(re.findall(r'<RYUUKYOKU [^>]*type="ron3"', raw))
     C["xml_ron3"] += ron3
     C["xml_ron"] += 3 * ron3  # triple ron: three rons, no AGARI
@@ -855,6 +913,7 @@ def count_game(path, H, T, C, tp):
         C["lab_riichi"] += len(riichi)
         if riichi != xr["reach"]:
             C["riichi_label_mismatch"] += 1
+        check_kyuushu(halfturns, xr, C)
         durings = [t for t in halfturns if isinstance(t, DuringTurn)]
         if xr["end"] == "exhaustive" and durings and durings[-1].stateObj.remaining_tsumo != 0:
             C["exhaustive_draw_tsumo_not_zero"] += 1
@@ -1016,11 +1075,12 @@ def count_game(path, H, T, C, tp):
 
 
 def tensor_counts(y_during, y_post, C):
-    """Count the built targets per action kind (the head layouts: during 71, post 154)."""
+    """Count the built targets per action kind (the head layouts: during 72, post 154)."""
     C["tensor_tsumo"] += sum(1 for v in y_during if v == 1)
     C["tensor_riichi"] += sum(1 for v in y_during if v == 2)
     C["tensor_ankan"] += sum(1 for v in y_during if 3 <= v <= 36)
     C["tensor_kakan"] += sum(1 for v in y_during if 37 <= v <= 70)
+    C["tensor_kyuushu"] += sum(1 for v in y_during if v == legal_oracles.KYUUSHU_IDX)
     C["tensor_ron"] += sum(1 for v in y_post if v == 1)
     C["tensor_chi"] += sum(1 for v in y_post if 2 <= v <= 82)
     C["tensor_pon"] += sum(1 for v in y_post if 83 <= v <= 119)
@@ -1114,7 +1174,8 @@ def check(C):
         f"samples " + " ".join(f"{h} {C[h + '_samples']}" for h in HEADS) + " | tensors == parser == xml | "
         f"legal mask: declarations {C['legal_declaration_samples']} (-{C['legal_declaration_slots_removed']} slots) "
         f"after chi {C['legal_chi_samples']} pon {C['legal_pon_samples']} (-{C['legal_kuikae_slots_removed']} slots) "
-        f"riichi offers {C['riichi_offers']} | options removed: "
+        f"riichi offers {C['riichi_offers']} | kyuushu {C['lab_kyuushu']}/{C['xml_kyuushu']} (offers "
+        f"{C['kyuushu_offers']}, declined {C['kyuushu_declined']}) | options removed: "
         + " ".join(f"{r} {C['removed_' + r]}" for r in OPTION_RULES if r != "call_offer_in_chankan")
         + f" | post samples +{C['post_samples_gained']} -{C['post_samples_lost']} | "
         f"win: yaku == tenhou {C['yaku_checked']} furiten checked {C['furiten_checked']}; offers tsumo "
@@ -1365,7 +1426,8 @@ def self_test():
     chankan_ippatsu = _named_game(CHANKAN_IPPATSU_LOG)
     early_ankan = _named_game(EARLY_ANKAN_LOG)
     option_games = _option_fixtures()
-    check(run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan] + sorted(set(option_games.values())),
+    kyuushu_games = [_named_game(YAO9_LOG), _named_game(KYUUSHU_AFTER_CALL_LOG)]  # an abort, a decline, 9 kinds after a call
+    check(run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan] + sorted(set(option_games.values())) + kyuushu_games,
               TransformerTensorProcessor()))
 
     def expect_failure(name, gate, corrupt, game=f):
@@ -1672,7 +1734,7 @@ def self_test():
     def extra_during_bit(H, T, tp):
         def edit(td, tdisc, tpost):
             if len(td[3]):
-                off = [j for j in range(2, 71) if td[2][0, j] == 0]
+                off = [j for j in range(2, DURING_TURN_ACTION_DIM) if td[2][0, j] == 0]
                 td[2][0, off[0]] = 1.0
         _patch_tensors(tp, edit)
 
@@ -1961,6 +2023,77 @@ def self_test():
     expect_failure("passed chankan ignored", "furiten_mismatch",
                    rerun(CHANKAN_PASS_GAME, spy_rons(seen), tracker(pass_filter(seen, lambda s, q: not s["chankan"]))),
                    game=CHANKAN_PASS_GAME)
+
+    # ---- kyuushu kyuuhai (T-034)
+    yao9_game, after_call_game = kyuushu_games
+    drawn_abort_game = _named_game(NINTH_KIND_DRAWN_ABORT_LOG)
+    has_declined = lambda H, T: any(t.decisions[DECISION_ABORT_IDX] and not t.decisions[DECISION_ABORT_IDX][0].executed
+                                    for t in _durings(H))
+    drawn_declined_game = _parsed_fixture(NINTH_KIND_DRAWN_DECLINED, has_declined)
+    declined_game = _parsed_fixture(KYUUSHU_DECLINED, has_declined)
+    kyuushu_legal = legal.kyuushu_legal
+
+    def ignore_calls(hand34, first_draw):  # the seat's own first draw is enough, a call before it is ignored
+        loc = sys._getframe(1).f_locals
+        return kyuushu_legal(hand34, loc["own_discards"][loc["player"]] == 0)
+
+    def thirteen_tiles(hand34, first_draw):  # the kinds counted before the draw (13 tiles)
+        h = np.array(hand34, copy=True)
+        h[sys._getframe(1).f_locals["tile_idx"][0]] -= 1
+        return kyuushu_legal(h, first_draw)
+
+    def skip_yao9_marking(H, T, tp):
+        with mock.patch.object(process_xml, "_mark_yao9_executed", lambda halfturns, attr: None):
+            H[:], T[:] = process(yao9_game)
+
+    def built_during(pick):  # pick(mask_row, target) -> True for the ONE built during sample to edit; edits once
+        done = []
+        def patch(tp, edit):
+            def wrapped(td, tdisc, tpost):
+                for i in range(len(td[3])):
+                    if not done and pick(td[2][i], td[3][i].item()):
+                        edit(td, i)
+                        done.append(i)
+            _patch_tensors(tp, wrapped)
+        return patch
+
+    K = legal_oracles.KYUUSHU_IDX
+
+    def zero_kyuushu_targets(H, T, tp):
+        _patch_tensors(tp, lambda td, tdisc, tpost: td[3].masked_fill_(td[3] == K, 0))
+
+    def clear_bit(pick):
+        return lambda H, T, tp: built_during(pick)(tp, lambda td, i: td[2][i].__setitem__(K, 0.0))
+
+    def set_bit(H, T, tp):
+        built_during(lambda m, y: m[K] == 0)(tp, lambda td, i: td[2][i].__setitem__(K, 1.0))
+
+    def abort_moved_to_declined(H, T, tp):
+        offers = [t.decisions[DECISION_ABORT_IDX][0] for t in _durings(H) if t.decisions[DECISION_ABORT_IDX]]
+        executed, declined = [d for d in offers if d.executed], [d for d in offers if not d.executed]
+        found(executed and declined, "an executed and a declined kyuushu offer in one game")
+        executed[0].executed, declined[0].executed = False, True
+
+    expect_failure("yao9 abort left unlabelled", ("lab_kyuushu", "kyuushu_label_mismatch"), skip_yao9_marking,
+                   game=yao9_game)
+    expect_failure("kyuushu rule ignores calls", ("kyuushu_offer_after_call", "during_mask_mismatch"),
+                   reparse(after_call_game, kyuushu_legal=ignore_calls), game=after_call_game)
+    expect_failure("kyuushu threshold 8 kinds", ("kyuushu_offer_few_kinds", "during_mask_mismatch"),
+                   reparse(f, KYUUSHU_MIN_KINDS=8))
+    expect_failure("kyuushu kinds counted on 13 tiles (declined offer lost)", "during_mask_mismatch",
+                   reparse(drawn_declined_game, kyuushu_legal=thirteen_tiles), game=drawn_declined_game)
+    expect_failure("kyuushu kinds counted on 13 tiles (abort not offered)", "parse_error",
+                   rerun(drawn_abort_game, mock.patch.object(legal, "kyuushu_legal", thirteen_tiles)),
+                   game=drawn_abort_game)
+    expect_failure("zeroed kyuushu targets", ("tensor_kyuushu", "during_target_mismatch"), zero_kyuushu_targets,
+                   game=yao9_game)
+    expect_failure("abort slot cleared on the executed abort", ("during_label_outside_mask", "during_mask_mismatch"),
+                   clear_bit(lambda m, y: y == K), game=yao9_game)
+    expect_failure("abort slot cleared on a declined offer", "during_mask_mismatch",
+                   clear_bit(lambda m, y: m[K] == 1 and y != K), game=declined_game)
+    expect_failure("abort slot set on a sample with no offer", "during_mask_mismatch", set_bit, game=yao9_game)
+    expect_failure("executed abort moved to a declined offer", "kyuushu_label_mismatch", abort_moved_to_declined,
+                   game=after_call_game)
 
     expect_failure("declaration mask = every held tile", "riichi_mask_mismatch", declaration_presence_mask,
                    game=_game_with(declaration_restricted))
