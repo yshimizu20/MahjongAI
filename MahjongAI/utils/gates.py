@@ -58,6 +58,14 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           suukaikan pending, no daiminkan with 4 kans down, no chi / pon that leaves no legal discard. A turn /
           responder that is not a sample has its parser options compared instead. One named counter per rule
           on the same bits; "options removed" per rule are diagnostics
+  DORA    Tenhou flips an ankan indicator at once, a daiminkan / kakan one only after the kan player's discard (or
+          right before his next rinshan draw); the XML writes the open-kan DORA before that discard. Every state
+          the XML replay checks has exactly the public indicators (state_xml_dora) and unseen counts == 4 (1 for a
+          red slot) - own hand - every discard - meld tiles from a hand - public indicators, remaining_tiles == 4 -
+          dealt and drawn tiles - public indicators (pov_xml_mismatch); rule-free: between a seat's draw decision
+          and its discard decision no indicator appears (dora_draw_to_discard); Tenhou's own data: each <AGARI>'s
+          doraHai == the indicators of the winner's state at the win decision (dora_vs_agari, with coverage); the
+          parser defers exactly the XML's `T DORA D` triples (open_kan_dora_deferred)
   WIN     win options rebuilt WITHOUT utils/agari.py (win_oracles.py): every executed win's yaku, mapped to Tenhou
           ids, == the <AGARI> yaku (bonus ids dropped) or yakuman ids; for every PostTurn responder whose concealed
           hand the answered tile completes (direct Agari.is_agari), the parser's furiten verdict == the one rebuilt
@@ -117,6 +125,17 @@ RIICHI_FURITEN_LOG = ("20210101", "2021010100gm-00a9-0000-3b235798.log", r'<REAC
 # 2013-2023 scanned, 2026-10-15), so this game is synthetic: seat 1 (45m, waits 3m / 6m) passes seat 0's kakan of 3m,
 # then seat 0 discards 6m from the rinshan draw before seat 1 discards again (Tenhou: same-turn furiten).
 CHANKAN_PASS_GAME = os.path.join(PACKAGE_DIR, "data", "sample", "chankan_pass_synthetic.xml")
+# T-035 fixtures: open-kan indicators. OPEN_KAN_DORA_RE = an open kan's DORA between its rinshan draw and discard
+OPEN_KAN_DORA_RE = r'<[TUVW]\d+/><DORA hai="\d+"\s*/><[DEFG]\d+/>'
+OPEN_KAN_RON_LOG = ("20210101", "2021010101gm-00a9-0000-6422c07e.log",  # red-five indicator, then a ron on that discard
+                    r'<[TUVW]\d+/><DORA hai="16"\s*/><[DEFG]\d+/><AGARI ')
+OPEN_KAN_LOG = ("20210101", "2021010105gm-00a9-0000-0e0fb57b.log",  # 2 kakan; the 1st indicator flips before the 2nd rinshan
+                    r'<[TUVW]\d+/><N [^>]*/><DORA hai="\d+"\s*/><[TUVW]\d+/><DORA hai="\d+"\s*/><[DEFG]\d+/>')
+PENDING_FLIP_TSUMO_LOG = ("20210102", "2021010214gm-00a9-0000-7ed48ecb.log",  # 2 kakan, rinshan tsumo counts the 1st
+                          r'<N [^>]*/><DORA hai="31"\s*/><[TUVW]\d+/><AGARI [^>]*doraHai="121,31"')
+OPEN_KAN_THEN_ANKAN_LOG = ("20210108", "2021010823gm-00a9-0000-725fdda5.log",  # daiminkan, ankan: both flip at once
+                           r'<N [^>]*/><DORA hai="\d+"\s*/><DORA hai="\d+"\s*/><[TUVW]\d+/><[DEFG]\d+/>')
+FULL_WALL = np.array([4] * 34 + [1] * 3)  # copies per 37-slot index (slots 34-36: the red fives)
 DEFAULT_DAYS = ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
                 "20210709", "20210815", "20210921", "20211030", "20211112", "20211225"]
 KINDS = ["chi", "pon", "minkan", "ankan", "kakan"]
@@ -144,11 +163,13 @@ ZERO_GATES = [
     "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard",
     "yaku_oracle_mismatch", "furiten_mismatch", "win_reason_conflict", "win_mask_mismatch", "win_offer_without_yaku",
     "ron_offer_incomplete", "tsumo_offer_incomplete",
+    "state_xml_dora", "pov_xml_mismatch", "dora_draw_to_discard", "dora_vs_agari",
 ]
 OPTION_RULES = ["riichi_offer_low_points", "riichi_offer_few_draws", "riichi_offer_after_kan4", "riichi_okurikan_offer",
                 "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
                 "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard"]
-Snap = collections.namedtuple("Snap", ["hands", "melds", "draws_left", "scores", "reaches", "last_draw", "actor", "tile", "window"])
+Snap = collections.namedtuple("Snap", ["hands", "melds", "draws_left", "scores", "reaches", "last_draw", "actor", "tile", "window",
+                                     "doras", "seen", "wall_out"])
 FURITEN = ("discard", "temp", "riichi")  # the parser's furiten block reasons; "no_yaku" is the only other one
 KAKAN_START = 37  # a kakan token's low byte is 37 + kind (Naki.get_during_turn_filter_idx)
 PON_IDX = range(83, 120)  # post-head pon indices; chi is 2-82 (the low 8 bits of a call token)
@@ -332,12 +353,15 @@ def expected_inputs(so):
 
 def answered_token(halfturns, i, tokens):
     """The exact token PostTurn halfturns[i] answers, from the halfturn before it: the preceding DiscardTurn's own
-    discard token (same seat, same 37-slot tile, right before the PostTurn's history end), or the token of the
-    kakan the preceding DuringTurn executed. None when the PostTurn lines up with neither."""
+    discard token (same seat, same 37-slot tile, right before the PostTurn's history end; only an open kan's
+    indicator, flipped after the discard decision, may sit between the two), or the token of the kakan the
+    preceding DuringTurn executed. None when the PostTurn lines up with neither."""
     t, prev = halfturns[i], halfturns[i - 1] if i else None
-    if isinstance(prev, DiscardTurn) and prev.player == t.player and t.encoding_idx == prev.encoding_idx + 1:
-        tok = tokens[prev.encoding_idx]
-        if _is_discard(tok) and _who(tok) == t.player and _tile(tok) == TILE2IDX[prev.discarded_tile][-1]:
+    if isinstance(prev, DiscardTurn) and prev.player == t.player and t.encoding_idx > prev.encoding_idx:
+        gap = tokens[prev.encoding_idx: t.encoding_idx - 1]
+        tok = tokens[t.encoding_idx - 1]
+        if (len(gap) <= 1 and all(_event(g) == EventStateTypes.NEW_DORA for g in gap)
+                and _is_discard(tok) and _who(tok) == t.player and _tile(tok) == TILE2IDX[prev.discarded_tile][-1]):
             return tok
     if isinstance(prev, DuringTurn) and prev.player == t.player and t.encoding_idx > 0:
         kakan = [d for d in prev.decisions[DECISION_NAKI_IDX] if d.executed and d.naki.is_kakan()]
@@ -395,12 +419,14 @@ def xml_rounds(raw: str):
         tag, attrs = m.group(1), m.group(2)
         if tag == "INIT":
             dora = int(_attr(attrs, "seed").split(",")[5])
-            rounds.append({"end": None, "dora": dora, "reach": [], "tokens": [new_dora2idx(dora // 4)], "wins": []})
+            rounds.append({"end": None, "dora": dora, "reach": [], "tokens": [new_dora2idx(dora // 4)], "wins": [],
+                           "win_dora": []})
             acquired = None
             continue
         r = rounds[-1]
         if tag == "AGARI" and r["end"] in (None, "agari"):  # a double ron is two AGARI events
             r["wins"].append((int(_attr(attrs, "who")), int(_attr(attrs, "fromWho")), win_oracles.xml_yaku_ids(attrs)))
+            r["win_dora"].append([int(x) for x in _attr(attrs, "doraHai").split(",")])
             r["end"] = "agari"
             continue
         if r["end"] is not None:
@@ -485,12 +511,20 @@ def xml_snapshots(raw: str):
     (INIT hai0-3, draws, discards, the tiles each N takes from its caller), every seat's meld codes (a kakan
     replaces its pon), the live draws left (70 minus the draws so far), the scores (INIT ten minus 10 per own
     REACH step 2), the riichi seats (REACH step 1), the latest draw (seat, tile; None after a call), the actor
-    and the tile (drawn / discarded / added by the kakan)."""
+    and the tile (drawn / discarded / added by the kakan); the public indicators (136-ids in flip order), the
+    37-slot counts of every tile in the open (discards, meld tiles taken from a hand) and of every tile dealt or
+    drawn. A DORA whose last non-DORA event is a draw that directly follows a daiminkan / kakan N is that kan's
+    indicator: it turns public after the drawer's discard snapshot, before the responders' one."""
     rounds, st = [], None
 
     def snap(actor, tile, window):
         return Snap(st["hands"].copy(), [list(x) for x in st["melds"]], st["draws"], list(st["scores"]),
-                    list(st["reaches"]), st["last_draw"], actor, tile, window)
+                    list(st["reaches"]), st["last_draw"], actor, tile, window,
+                    list(st["doras"]), st["seen"].copy(), st["wall_out"].copy())
+
+    def count(key, tile):
+        for slot in TILE2IDX[tile]:
+            st[key][slot] += 1
 
     def move(seat, tile, sign):
         for slot in TILE2IDX[tile]:
@@ -500,10 +534,13 @@ def xml_snapshots(raw: str):
         tag, attrs = m.group(1), m.group(2)
         if tag == "INIT":
             st = {"hands": np.zeros((4, 37), dtype=int), "melds": [[] for _ in range(4)], "draws": 70,
-                  "scores": [int(x) for x in _attr(attrs, "ten").split(",")], "reaches": [0] * 4, "last_draw": None}
+                  "scores": [int(x) for x in _attr(attrs, "ten").split(",")], "reaches": [0] * 4, "last_draw": None,
+                  "doras": [int(_attr(attrs, "seed").split(",")[5])], "hidden": None, "events": [],
+                  "seen": np.zeros(37, dtype=int), "wall_out": np.zeros(37, dtype=int)}
             for q in range(4):
                 for tile in map(int, _attr(attrs, f"hai{q}").split(",")):
                     move(q, tile, 1)
+                    count("wall_out", tile)
             rounds.append({"during": [], "discard": [], "post": [], "ended": False})
             continue
         r = rounds[-1]
@@ -512,7 +549,13 @@ def xml_snapshots(raw: str):
         if tag in ("AGARI", "RYUUKYOKU"):
             r["ended"] = True
         elif tag == "DORA":
-            continue  # no option rule reads the indicators
+            tile, ev = int(_attr(attrs, "hai")), st["events"]
+            if len(ev) >= 2 and ev[-1][0][0] in "TUVW" and ev[-2][0] == "N" and kind_of(Naki(int(_attr(ev[-2][1], "m")))) in ("minkan", "kakan"):
+                assert st["hidden"] is None, "two open-kan indicators face down"
+                st["hidden"] = tile
+            else:
+                st["doras"].append(tile)
+            continue  # not an event of its own for the lookback
         elif tag == "REACH":
             who = int(_attr(attrs, "who"))
             if _attr(attrs, "step") == "1":
@@ -525,6 +568,7 @@ def xml_snapshots(raw: str):
             exposed, _ = nk.get_exposed()
             for tile in exposed:
                 move(who, tile, -1)
+                count("seen", tile)
             if nk.is_kakan():
                 pon = next(c for c in st["melds"][who] if Naki(c).is_pon() and Naki(c).get_exposed()[0][0] // 4 == exposed[0] // 4)
                 st["melds"][who].remove(pon)
@@ -535,14 +579,20 @@ def xml_snapshots(raw: str):
         elif tag[0] in "TUVW":
             who, tile = "TUVW".index(tag[0]), int(tag[1:])
             move(who, tile, 1)
+            count("wall_out", tile)
             st["draws"] -= 1
             st["last_draw"] = (who, tile)
             r["during"].append(snap(who, tile, "draw"))
         elif tag[0] in "DEFG":
             who, tile = "DEFG".index(tag[0]), int(tag[1:])
             r["discard"].append(snap(who, tile, "discard"))
+            if st["hidden"] is not None:  # the open kan's indicator flips once its discard is made
+                st["doras"].append(st["hidden"])
+                st["hidden"] = None
             move(who, tile, -1)
+            count("seen", tile)
             r["post"].append(snap(who, tile, "discard"))
+        st["events"].append((tag, attrs))
     return rounds
 
 
@@ -573,6 +623,15 @@ def check_state_xml(so, snap, seat, C):
         C["state_xml_mismatch"] += 1
         for name in bad:
             C["state_xml_" + name] += 1  # which field drifted (named in the failure)
+    if list(so.dora) != snap.doras:
+        C["state_xml_dora"] += 1
+    public = np.zeros(37, dtype=int)
+    for tile in snap.doras:
+        for slot in TILE2IDX[tile]:
+            public[slot] += 1
+    if not (np.array_equal(np.asarray(so.remaining_tiles_pov), FULL_WALL - snap.hands[seat] - snap.seen - public)
+            and np.array_equal(np.asarray(so.remaining_tiles), FULL_WALL - snap.wall_out - public)):
+        C["pov_xml_mismatch"] += 1
 
 
 def during_options(snap):
@@ -730,6 +789,14 @@ def _executed_win(halfturns, who, from_who):
     return next((d for d in agari if d.executed), None)
 
 
+def _win_state(halfturns, who, from_who):
+    """The winner's StateObject at the executed win decision of an <AGARI> (the round's final halfturn), or None."""
+    if _executed_win(halfturns, who, from_who) is None:
+        return None
+    last = halfturns[-1]
+    return last.stateObj if who == from_who else last.responder_states[who]
+
+
 def check_wins(path, ri, xr, halfturns, tokens, C):
     """WIN gates of one round (win_oracles, never utils/agari.py):
       yaku_oracle_mismatch  an executed win's yaku (Tenhou ids) != its <AGARI> yaku / yakuman ids
@@ -754,6 +821,14 @@ def check_wins(path, ri, xr, halfturns, tokens, C):
             if C["yaku_oracle_mismatch"] <= 5:
                 print(f"yaku mismatch in {os.path.basename(path)} round {ri} who {who} fromWho {from_who}: "
                       f"parser {d.yaku} -> {sorted(ids) if ids is not None else None}, xml {sorted(xml_ids)}")
+
+    for (who, from_who, _), dora_hai in zip(xr["wins"], xr["win_dora"]):
+        so = _win_state(halfturns, who, from_who)
+        if so is None:
+            continue  # dora_vs_agari_coverage fails
+        C["dora_vs_agari_checked"] += 1
+        if list(so.dora) != dora_hai:
+            C["dora_vs_agari"] += 1
 
     passes = collections.defaultdict(list)  # seat -> [(answered token index, the answered kind completed the hand)]
     for t in halfturns:
@@ -838,6 +913,7 @@ def count_game(path, H, T, C, tp):
     C["xml_ron"] += 3 * ron3  # triple ron: three rons, no AGARI
     for m in re.findall(r'<N who="\d" m="(\d+)"', raw):
         C["xml_" + kind_of(Naki(int(m)))] += 1
+    C["xml_open_kan_dora"] += len(re.findall(OPEN_KAN_DORA_RE, raw))
     rounds = xml_rounds(raw)
     assert len(rounds) == len(H), f"{path}: {len(rounds)} rounds in XML, {len(H)} parsed"
     replays = xml_snapshots(raw)
@@ -912,6 +988,14 @@ def count_game(path, H, T, C, tp):
             elif isinstance(t, DiscardTurn):
                 if snap is not None:
                     check_state_xml(so, snap, t.player, C)
+                if t.encoding_idx < len(tokens) and _event(tokens[t.encoding_idx]) == EventStateTypes.NEW_DORA:
+                    C["open_kan_dora_deferred"] += 1  # an indicator flipped between this decision and its token
+                drew = halfturns[i - 1] if i else None
+                if isinstance(drew, DuringTurn) and drew.player == t.player:  # its own draw: only a riichi can follow
+                    C["dora_draw_to_discard_checked"] += 1
+                    between = tokens[drew.encoding_idx: t.encoding_idx]
+                    if list(so.dora) != list(drew.stateObj.dora) or any(_event(x) == EventStateTypes.NEW_DORA for x in between):
+                        C["dora_draw_to_discard"] += 1
                 # a declaration discard is a sample, a later riichi discard is not: decided from the tokens (the
                 # seat's own reach right before), never from is_riichi_declaration, which is checked against it
                 prev = tokens[t.encoding_idx - 1] if t.encoding_idx else 0
@@ -1096,6 +1180,12 @@ def failed_gates(C) -> dict:
     if C["xml_agari"] != C["xml_tsumo"] + C["xml_ron"] - 3 * C["xml_ron3"]:
         bad["agari_coverage"] = (f"xml_agari={C['xml_agari']} != xml_tsumo + xml_ron - 3 * xml_ron3="
                                  f"{C['xml_tsumo'] + C['xml_ron'] - 3 * C['xml_ron3']}")
+    if C["dora_vs_agari_checked"] != C["xml_agari"]:  # every <AGARI>'s doraHai was compared
+        bad["dora_vs_agari_coverage"] = f"{C['dora_vs_agari_checked']} != xml_agari={C['xml_agari']}"
+    if C["open_kan_dora_deferred"] != C["xml_open_kan_dora"]:
+        bad["open_kan_dora_deferred"] = f"{C['open_kan_dora_deferred']} != xml `T DORA D`={C['xml_open_kan_dora']}"
+    if C["dora_draw_to_discard_checked"] == 0:
+        bad["dora_draw_to_discard_checked"] = 0
     if C["legal_chi_samples"] + C["legal_pon_samples"] != C["lab_chi"] + C["lab_pon"]:
         bad["legal_call_coverage"] = (f"{C['legal_chi_samples']} + {C['legal_pon_samples']} != "
                                       f"lab_chi + lab_pon={C['lab_chi'] + C['lab_pon']}")
@@ -1117,6 +1207,8 @@ def check(C):
         f"riichi offers {C['riichi_offers']} | options removed: "
         + " ".join(f"{r} {C['removed_' + r]}" for r in OPTION_RULES if r != "call_offer_in_chankan")
         + f" | post samples +{C['post_samples_gained']} -{C['post_samples_lost']} | "
+        f"dora: open kan deferred {C['open_kan_dora_deferred']}/{C['xml_open_kan_dora']} draw->discard checked "
+        f"{C['dora_draw_to_discard_checked']} == doraHai {C['dora_vs_agari_checked']} | "
         f"win: yaku == tenhou {C['yaku_checked']} furiten checked {C['furiten_checked']}; offers tsumo "
         f"{C['diag_tsumo_offered']} (declined {C['diag_tsumo_declined']}) ron {C['diag_ron_offered']} (declined "
         f"{C['diag_ron_declined']}); blocked tsumo no_yaku {C['diag_tsumo_blocked_no_yaku']}, ron "
@@ -1187,15 +1279,15 @@ def _executed_kinds(H) -> set:
 def _houtei_call_candidate(H) -> bool:
     """A responder not in riichi who holds a pon / chi shape for the last discard."""
     for halfturns in H:
-        for t in halfturns:
-            if not isinstance(t, PostTurn):
+        for i, t in enumerate(halfturns):
+            if not isinstance(t, PostTurn) or not isinstance(halfturns[i - 1], DiscardTurn):
                 continue
             for p, rs in t.responder_states.items():
                 if rs.remaining_tsumo or rs.reaches[p]:
                     continue
                 hands = np.zeros((4, 37), dtype=np.float32)
                 hands[p] = rs.hand_tensor
-                tile = TILE2IDX[next(d.discarded_tile for d in halfturns if isinstance(d, DiscardTurn) and d.encoding_idx + 1 == t.encoding_idx)]
+                tile = TILE2IDX[halfturns[i - 1].discarded_tile]
                 if decision_mask(t.player, hands, tile[0], len(tile) == 2)[p]:
                     return True
     return False
@@ -1264,11 +1356,11 @@ def _option_fixtures() -> dict:
 
     def dead_end(H, T):
         for halfturns in H:
-            for t in (t for t in halfturns if isinstance(t, PostTurn)):
+            for i, t in ((i, t) for i, t in enumerate(halfturns) if isinstance(t, PostTurn)):
                 for p, rs in t.responder_states.items():
                     hands = np.zeros((4, 37), dtype=np.float32)
                     hands[p] = rs.hand_tensor
-                    disc = next((d for d in halfturns if isinstance(d, DiscardTurn) and d.encoding_idx + 1 == t.encoding_idx), None)
+                    disc = halfturns[i - 1] if isinstance(halfturns[i - 1], DiscardTurn) else None
                     if disc is None or rs.reaches[p] or not rs.remaining_tsumo:
                         continue
                     tile = TILE2IDX[disc.discarded_tile]
@@ -1364,9 +1456,11 @@ def self_test():
     red_kan_dora = _named_game(RED_KAN_DORA_LOG)
     chankan_ippatsu = _named_game(CHANKAN_IPPATSU_LOG)
     early_ankan = _named_game(EARLY_ANKAN_LOG)
+    open_kan, open_kan_ron = _named_game(OPEN_KAN_LOG), _named_game(OPEN_KAN_RON_LOG)
+    kan_games = [_named_game(g) for g in (PENDING_FLIP_TSUMO_LOG, OPEN_KAN_THEN_ANKAN_LOG)]
     option_games = _option_fixtures()
-    check(run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan] + sorted(set(option_games.values())),
-              TransformerTensorProcessor()))
+    check(run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan, open_kan, open_kan_ron] + kan_games
+              + sorted(set(option_games.values())), TransformerTensorProcessor()))
 
     def expect_failure(name, gate, corrupt, game=f):
         """corrupt(H, T, tp) edits the parse in place; it may return a context manager that stays active while the
@@ -1507,6 +1601,43 @@ def self_test():
                     so.remaining_tiles_pov[34 + s] += 1
                     n += 1
         found(n, "a red-five kan-dora indicator (a DORA event, not INIT)")
+
+    def open_kan_discards(H, T):  # (DiscardTurn, the indicator flipped right after it) of every open-kan discard
+        for halfturns, tokens in zip(H, T):
+            for i, t in enumerate(halfturns):
+                if isinstance(t, DiscardTurn) and t.encoding_idx < len(tokens) and _event(tokens[t.encoding_idx]) == EventStateTypes.NEW_DORA:
+                    yield t, next(iter(halfturns[i + 1].responder_states.values())).dora[-1]
+
+    def open_kan_dora_seen(with_dora):  # the old XML order: the kan player's discard state already has the indicator
+        def corrupt(H, T, tp):
+            n = 0
+            for t, tile in open_kan_discards(H, T):
+                so = t.stateObj
+                if with_dora:
+                    so.dora = so.dora + [tile]
+                so.remaining_tiles_pov = so.remaining_tiles_pov.copy()
+                so.remaining_tiles_pov[TILE2IDX[tile]] -= 1
+                n += 1
+            found(n, "an open-kan discard")
+        return corrupt
+
+    def open_kan_token_seen(H, T, tp):  # the old history cut: the discard sample's prefix holds the indicator token
+        n = 0
+        for t, _ in open_kan_discards(H, T):
+            t.encoding_idx += 1
+            n += 1
+        found(n, "an open-kan discard")
+
+    def ron_misses_kan_dora(H, T, tp):  # the ron winner's state lacks the indicator flipped after the kan discard
+        for halfturns, tokens in zip(H, T):
+            disc, last = halfturns[-2:] if len(halfturns) > 1 else (None, None)
+            if not (isinstance(disc, DiscardTurn) and isinstance(last, PostTurn) and disc in [t for t, _ in open_kan_discards([halfturns], [tokens])]):
+                continue
+            for p, rs in last.responder_states.items():
+                if any(d.executed for d in last.decisions[p][DECISION_AGARI_IDX]):
+                    rs.dora = rs.dora[:-1]
+                    return
+        found(0, "a ron on an open-kan discard")
 
     # ---- built tensors
     def zero_ron_targets(H, T, tp):  # parser labels intact, built targets lose every ron
@@ -2000,6 +2131,14 @@ def self_test():
     expect_failure("double riichi by the old cycles/menzen test after an ankan", "double_riichi_mismatch",
                    old_double_riichi_rule, game=early_ankan)
     expect_failure("red kan-dora indicator left in the red slot", "red_pov_mismatch", red_kan_dora_kept, game=red_kan_dora)
+    expect_failure("open-kan indicator in the kan player's discard state", ("state_xml_dora", "pov_xml_mismatch",
+                   "dora_draw_to_discard"), open_kan_dora_seen(with_dora=True), game=open_kan)
+    expect_failure("open-kan indicator in the discard state's unseen counts only", "pov_xml_mismatch",
+                   open_kan_dora_seen(with_dora=False), game=open_kan)
+    expect_failure("open-kan indicator token in the discard history", "dora_draw_to_discard", open_kan_token_seen,
+                   game=open_kan)
+    expect_failure("ron winner misses the open-kan indicator", "dora_vs_agari", ron_misses_kan_dora, game=open_kan_ron)
+    expect_failure("a win left out of the doraHai check", "dora_vs_agari_coverage", unlabel_ron, game=open_kan_ron)
     expect_failure("zeroed ron targets", "tensor_ron", zero_ron_targets)
     expect_failure("zeroed riichi targets", "tensor_riichi", zero_riichi_targets, game=riichi_game)
     expect_failure("chi target moved to another chi", "post_target_mismatch", other_chi_target, game=_game_with(has_chi_choice))

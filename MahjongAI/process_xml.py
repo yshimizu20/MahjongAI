@@ -140,6 +140,12 @@ def process(file_path: str, verbose: bool = False):
         safe_tiles = np.zeros((4, 37), dtype=np.float32)  # safe_tiles[q]: tiles that cannot deal into q's riichi
         rinshan_pending = False  # True from a kan until the rinshan draw that follows it
         last_draw_rinshan = False  # the latest draw was a rinshan draw
+        # Tenhou flips an ankan indicator at once, a daiminkan / kakan one only after the kan player's discard
+        # (or just before his next rinshan draw), 「明槓/加槓は後めくり」. The XML writes the open-kan DORA
+        # early, `N T DORA D`; the parser holds it back so the discard sample cannot see it.
+        open_kan_owner = None  # the seat of a daiminkan / kakan, until its rinshan draw
+        open_kan_drawer = None  # the seat that drew an open kan's rinshan tile; None again at the next N or discard
+        hidden_dora = None  # that kan's indicator (136-id) while it is still face down
         furiten = FuritenTracker()
         for p in range(4):
             furiten.set_hand(p, hand_tensors[p][:34])
@@ -192,6 +198,16 @@ def process(file_path: str, verbose: bool = False):
                 safe_tiles=safe_tiles.copy(),
             )
 
+        def reveal_dora(tile: int) -> None:
+            """Flip indicator `tile` (136-id): every later snapshot sees it, no earlier one does."""
+            nonlocal doras
+            tile_idx = TILE2IDX[tile]  # a red five decrements its kind AND its red slot, as at INIT
+            doras = doras[:] + [tile]  # rebind, never append: earlier snapshots share the old list
+            remaining_tiles[tile_idx] -= 1
+            for pov in remaining_tiles_pov:
+                pov[tile_idx] -= 1
+            encoding_tokens.append(new_dora2idx(tile_idx[0]))  # the token stays on the kind index
+
         if verbose:
             print(f"Scores: {scores}")
             print(f"Parent: {parent}")
@@ -207,12 +223,11 @@ def process(file_path: str, verbose: bool = False):
 
             if eventtype == "DORA":
                 tile = int(event["attr"]["hai"])
-                tile_idx = TILE2IDX[tile]  # a red five decrements its kind AND its red slot, as at INIT
-                doras = doras[:] + [tile]
-                remaining_tiles[tile_idx] -= 1
-                for pov in remaining_tiles_pov:
-                    pov[tile_idx] -= 1
-                encoding_tokens.append(new_dora2idx(tile_idx[0]))  # the token stays on the kind index
+                if open_kan_drawer is not None:  # `N T DORA D`: flipped only after the discard
+                    assert hidden_dora is None, f"two hidden kan indicators: {hidden_dora}, {tile}"
+                    hidden_dora = tile
+                else:  # ankan, or an open kan's indicator flipped before the next rinshan draw
+                    reveal_dora(tile)
 
             elif eventtype == "REACH":
                 assert curr_halfturn is not None
@@ -251,11 +266,14 @@ def process(file_path: str, verbose: bool = False):
 
             elif eventtype == "N":
                 assert curr_halfturn is not None
+                assert hidden_dora is None, f"kan indicator {hidden_dora} still hidden at a call"
                 acquired = None
                 last_draw = None
 
                 naki = Naki(int(event["attr"]["m"]))
                 player = int(event["attr"]["who"])
+                open_kan_drawer = None  # a 2nd kan: Tenhou flips the 1st kan's indicator before this rinshan draw
+                open_kan_owner = player if naki.is_minkan() or naki.is_kakan() else None
                 first_go_around_uninterrupted = False  # any call, an ankan included, ends double-riichi eligibility
                 from_who = naki.from_who()
                 cycles += (player - from_who) % 4
@@ -362,9 +380,13 @@ def process(file_path: str, verbose: bool = False):
             elif eventtype[0] in ["T", "U", "V", "W"]:
                 assert acquired is None
                 assert pending_call is None, f"a draw before the discard that follows {pending_call!r}"
+                assert hidden_dora is None, f"kan indicator {hidden_dora} still hidden at a draw"
                 curr_halfturn = None
 
                 player = ["T", "U", "V", "W"].index(eventtype[0])
+                assert open_kan_owner in (None, player), f"open kan by {open_kan_owner}, rinshan draw by {player}"
+                open_kan_drawer = open_kan_owner
+                open_kan_owner = None
                 cycles += 1
                 acquired = int(eventtype[1:])
                 tile_idx = TILE2IDX[acquired]
@@ -475,9 +497,11 @@ def process(file_path: str, verbose: bool = False):
                 tile_idx = TILE2IDX[tile]
                 assert hands[player, tile] == 1.0
 
+                assert open_kan_drawer in (None, player), f"open kan by {open_kan_drawer}, discard by {player}"
+                assert (open_kan_drawer is None) == (hidden_dora is None), "an open kan's discard without its DORA"
                 half_turn = DiscardTurn(
                     player=player,
-                    stateObj=make_state(player),  # fresh: a DORA (after a kan) or REACH event can sit between the draw and this discard
+                    stateObj=make_state(player),  # fresh: a REACH event can sit between the draw and this discard
                     discarded_tile=tile,
                     encoding_idx=len(encoding_tokens),
                     is_riichi_declaration=riichi_declaring,
@@ -486,6 +510,13 @@ def process(file_path: str, verbose: bool = False):
                 riichi_declaring = False
                 pending_call = None
                 halfturns.append(half_turn)
+
+                # an open kan's indicator flips now: the discarder did not see it, every responder does.
+                # Its token goes before the discard token, so the answered discard stays the last token.
+                if hidden_dora is not None:
+                    reveal_dora(hidden_dora)
+                    hidden_dora = None
+                open_kan_drawer = None
 
                 hands[player, tile] = 0.0
                 hand_tensors[player][tile_idx] -= 1.0
@@ -554,6 +585,7 @@ def process(file_path: str, verbose: bool = False):
                 acquired = None
 
             elif eventtype == "AGARI" or eventtype == "RYUUKYOKU":
+                assert hidden_dora is None, f"kan indicator {hidden_dora} still hidden at the end of the round"
                 result_idx = event_idx + 1
                 break
 
