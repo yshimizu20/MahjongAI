@@ -24,6 +24,7 @@ YAOCHU_TENSOR[[0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33, 34]] = 1.0
 DECISION_AGARI_IDX = 0
 DECISION_REACH_IDX = 1
 DECISION_NAKI_IDX = 2
+DECISION_ABORT_IDX = 3  # DuringTurn only: kyuushu kyuuhai
 
 PAD_ID = 0
 

@@ -12,6 +12,7 @@ from MahjongAI.utils import legal
 from MahjongAI.draw import Naki
 from MahjongAI.state import StateObject
 from MahjongAI.decision import (
+    AbortDecision,
     NakiDecision,
     ReachDecision,
     decision_mask,
@@ -436,10 +437,16 @@ def process(file_path: str, verbose: bool = False):
                                 )
                             )
 
+                # check if kyuushu kyuuhai is possible
+                abort_decisions = []
+                if legal.kyuushu_legal(hand_tensors[player][:34], first_draw):
+                    abort_decisions.append(AbortDecision(player, executed=False))
+
                 during_decisions = [
                     agari_decisions,
                     reach_decisions,
                     naki_decisions,
+                    abort_decisions,
                 ]
 
                 stateObj = make_state(player)
@@ -574,6 +581,8 @@ def process(file_path: str, verbose: bool = False):
                 result.append(RyukyokuResult(list(map(int, event["attr"]["sc"].split(",")))))
                 if event["attr"].get("type") == "ron3":
                     _mark_ron3_executed(halfturns)
+                elif event["attr"].get("type") == "yao9":
+                    _mark_yao9_executed(halfturns, event["attr"])
 
         if verbose:
             print(f"len(turns): {len(turns)}")
@@ -622,6 +631,25 @@ def _mark_ron3_executed(halfturns: list) -> None:
             last.decisions[p][DECISION_AGARI_IDX][0].executed = True
             marked += 1
     assert marked == 3, f"ron3 marked {marked} rons on {last!r}"
+
+
+def _mark_yao9_executed(halfturns: list, attr: dict) -> None:
+    """Label a kyuushu kyuuhai abort (<RYUUKYOKU type="yao9" haiN="...">): the aborting seat N is the only one
+    whose hand is shown, it aborts right after its draw, so the FINAL halfturn is that seat's DuringTurn with one
+    abort offer, and the 14 shown tiles are that DuringTurn's hand."""
+    seats = [p for p in range(4) if f"hai{p}" in attr]
+    assert len(seats) == 1, f"yao9 shows the hands of seats {seats}"
+    who = seats[0]
+    assert halfturns, "yao9 with no halfturns"
+    last = halfturns[-1]
+    assert isinstance(last, DuringTurn) and last.player == who, f"yao9 by {who}, last halfturn: {last!r}"
+    shown = np.bincount([int(t) // 4 for t in attr[f"hai{who}"].split(",")], minlength=34)
+    assert np.array_equal(shown, last.stateObj.hand_tensor[:34].astype(int)), (
+        f"yao9 by {who}: shown kinds {shown.tolist()} != hand {last.stateObj.hand_tensor[:34].tolist()}"
+    )
+    offered = last.decisions[DECISION_ABORT_IDX]
+    assert len(offered) == 1, f"yao9 by {who} matched {len(offered)} abort offers: {last!r}"
+    offered[0].executed = True
 
 
 def _get_rounds(file_path: str):

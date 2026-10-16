@@ -17,6 +17,7 @@ from MahjongAI.utils.constants import (
     DECISION_AGARI_IDX,
     DECISION_REACH_IDX,
     DECISION_NAKI_IDX,
+    DECISION_ABORT_IDX,
     TILE2IDX,
     MAX_SEQUENCE_LENGTH,
     EventStateTypes,
@@ -25,7 +26,8 @@ from MahjongAI.utils.legal import legal_discard_mask
 
 # Hyperparameters
 DISCARD_ACTION_DIM = 37
-DURING_TURN_ACTION_DIM = 71  # pass, agari (tsumo), riichi, ankan, kakan
+DURING_TURN_ACTION_DIM = 72  # 0 pass, 1 agari (tsumo), 2 riichi, 3-36 ankan, 37-70 kakan, 71 kyuushu abort
+DURING_ABORT_IDX = 71
 POST_TURN_ACTION_DIM = 154  # pass, agari (ron), naki
 MAX_ACTION_LEN = 150
 # x1 planes, all from the ACTOR's point of view, opponents in relative seat order
@@ -88,7 +90,7 @@ class EncoderConvModel(nn.Module):
         print(f"  {'Embedding: type (4→64):':<45}{count(te.type_embedding):>10,}")
         print(f"  {'Embedding: tile (37→64):':<45}{count(te.tile_embedding):>10,}")
         print(f"  {'Embedding: tsumogiri (1→64):':<45}{count(te.tsumogiri_embedding):>10,}")
-        print(f"  {'Embedding: during_naki (71→64):':<45}{count(te.during_naki_embedding):>10,}")
+        print(f"  {f'Embedding: during_naki ({DURING_TURN_ACTION_DIM}→64):':<45}{count(te.during_naki_embedding):>10,}")
         print(f"  {'Embedding: post_naki (154→64):':<45}{count(te.post_naki_embedding):>10,}")
         print(f"  {'Position/player coding (non-trainable):':<45}{'0':>10}")
         print(f"  {'TokenEmbedder subtotal:':<45}{count(te):>10,}")
@@ -805,7 +807,7 @@ class TransformerTensorProcessor:
             Tuple containing:
                 - embeddings: Tensor of shape (sum_N, 150)
                 - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
-                - filter_tensors: Tensor of shape (sum_N, 71)
+                - filter_tensors: Tensor of shape (sum_N, DURING_TURN_ACTION_DIM)
                 - y: Tensor of target labels
                 - padding_mask: Boolean tensor of shape (sum_N, 150), True = valid position
         """
@@ -842,7 +844,7 @@ class TransformerTensorProcessor:
             state_obj_tensors.append((x1, x2, x3))  # Each x1, x2, x3 is a tensor
 
             # Create filter_tensor
-            filter_tensor = torch.zeros(71, dtype=torch.float32)
+            filter_tensor = torch.zeros(DURING_TURN_ACTION_DIM, dtype=torch.float32)
             filter_tensor[0] = 1.0  # pass
 
             target = 0  # default to pass
@@ -870,11 +872,16 @@ class TransformerTensorProcessor:
                         if decision.executed:
                             target = idx
 
+                elif decision_idx == DECISION_ABORT_IDX:
+                    filter_tensor[DURING_ABORT_IDX] = 1.0
+                    if decision_type[0].executed:
+                        target = DURING_ABORT_IDX
+
                 else:
                     raise ValueError(f"Invalid decision_idx: {decision_idx}")
 
             y.append(target)
-            filter_tensors.append(filter_tensor)  # Shape: (71,)
+            filter_tensors.append(filter_tensor)  # Shape: (DURING_TURN_ACTION_DIM,)
 
         encoding_tokens_batch = torch.cat(X_embeddings, dim=0) if X_embeddings else torch.empty(0, 150, dtype=torch.int64)
 
@@ -889,13 +896,13 @@ class TransformerTensorProcessor:
             torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
         )
 
-        filter_tensors_2d = [ft.unsqueeze(0) for ft in filter_tensors]  # Each filter_tensor is now (1, 71)
+        filter_tensors_2d = [ft.unsqueeze(0) for ft in filter_tensors]  # Each filter_tensor is now (1, DURING_TURN_ACTION_DIM)
         action_mask_batch = (
-            torch.cat(filter_tensors_2d, dim=0) if filter_tensors_2d else torch.empty(0, 71)
+            torch.cat(filter_tensors_2d, dim=0) if filter_tensors_2d else torch.empty(0, DURING_TURN_ACTION_DIM)
         )
 
         assert len(action_mask_batch.shape) == 2
-        assert action_mask_batch.shape[1] == 71
+        assert action_mask_batch.shape[1] == DURING_TURN_ACTION_DIM
         if action_mask_batch.numel() > 0:
             assert torch.sum(action_mask_batch, dim=1).min() >= 2, "Each sample must have at least two allowed actions"
 
