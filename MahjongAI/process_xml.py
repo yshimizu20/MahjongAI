@@ -464,13 +464,8 @@ def process(file_path: str, verbose: bool = False):
                         assert not reaches[player], f"player {player} in riichi holds a pon"
                         color, number, *_ = meld.pattern_pon()
                         if hand_tensors[player][9 * color + number] == 1.0:
-                            naki_decisions.append(
-                                NakiDecision(
-                                    player,
-                                    Naki.from_kakan_info(9 * color + number, 0),  # TODO get accurate "which" value
-                                    executed=False,
-                                )
-                            )
+                            # meld is the seat's log pon, so the offered kakan is the exact log code
+                            naki_decisions.append(NakiDecision(player, Naki.kakan_of(meld), executed=False))
 
                 # check if kyuushu kyuuhai is possible
                 abort_decisions = []

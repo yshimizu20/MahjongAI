@@ -118,7 +118,7 @@ def test_pon_kuikae_plain_and_honor():
 
 @pytest.mark.parametrize(
     "call",
-    [Naki.from_minkan_info(4, 1, 0), Naki.from_kakan_info(13, 0), Naki.from_ankan_info(27)],
+    [Naki.from_minkan_info(4, 1, 0), Naki.kakan_of(Naki.from_pon_info(13, 0, False, 1)), Naki.from_ankan_info(27)],
 )
 def test_kan_has_no_kuikae(call):
     assert kuikae_forbidden_kinds(call) == set()
