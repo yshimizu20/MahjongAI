@@ -84,6 +84,9 @@ def process(file_path: str, verbose: bool = False):
         parent_tensor = np.zeros(4, dtype=np.float32)
         parent_tensor[int(parent)] = 1.0
         curr_round, honba, kyotaku, _, _, dora = list(map(int, kyoku_init_state["attr"]["seed"].split(",")))
+        if curr_round >= 12:
+            # 0 North rounds in 2.2M games (T-038): skip and count an unseen layout, never encode it
+            raise InvalidGameException("North round")
         doras = [dora]
         rounds_remaining = gameinfo.n_rounds() - int(curr_round)
         parent_rounds_remaining = [(rounds_remaining + i) // 4 for i in range(4)]
@@ -195,6 +198,7 @@ def process(file_path: str, verbose: bool = False):
                 parent_rounds_remaining=parent_rounds_remaining,
                 remaining_tsumo=remaining_tsumo,
                 player=p,
+                round_wind=round_wind_,
                 drawn_tile=list(last_draw[1]) if last_draw is not None and last_draw[0] == p else None,
                 safe_tiles=safe_tiles.copy(),
             )

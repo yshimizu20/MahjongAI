@@ -26,6 +26,7 @@ class StateObject:
         parent_rounds_remaining: List[int],
         remaining_tsumo: int,
         player: int,
+        round_wind: int,
         drawn_tile: Optional[List[int]] = None,
         safe_tiles: Optional[np.ndarray] = None,
     ):
@@ -48,6 +49,8 @@ class StateObject:
         self.parent_rounds_remaining = parent_rounds_remaining
         self.remaining_tsumo = remaining_tsumo
         self.player = player
+        # round wind (bakaze) as a tile kind: EAST / SOUTH / WEST (27 / 28 / 29), as in WinContext.round_wind
+        self.round_wind = round_wind
         # 37-index list of the tile `player` just drew (two entries for a red five); None after a call
         self.drawn_tile = drawn_tile
         # (4, 37): safe_tiles[q] = tiles that cannot deal into q; all zero until q declares riichi
