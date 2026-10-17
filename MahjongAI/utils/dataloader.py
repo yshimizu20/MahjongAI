@@ -18,11 +18,12 @@ class DataLoader:
     seed: shuffle the file list once with this seed (None keeps the sorted, date-ordered list).
     Games that fail to parse are counted in `skipped` (key "invalid:<reason>" or the exception's type name).
     expected_skips: None counts every skip and continues; a set of keys raises UnexpectedSkip on any other key.
+    logged_skips: keys whose skipped file is also reported through `log_func` (a parse error always is).
     last_batch_files: the files of the games in the batch last returned, in batch order.
     """
 
     def __init__(self, path: str, batch_size: int = 1, log_func: callable = print,
-                 days=None, exclude_days=None, seed=None, expected_skips=None):
+                 days=None, exclude_days=None, seed=None, expected_skips=None, logged_skips=()):
         self.path = path
         self.file_list = sorted(
             os.path.join(dirpath, fname)
@@ -45,6 +46,7 @@ class DataLoader:
         self.log_func = log_func
         self.skipped = Counter()
         self.expected_skips = None if expected_skips is None else frozenset(expected_skips)
+        self.logged_skips = frozenset(logged_skips)
         self.last_batch_files = []
 
     @staticmethod
@@ -85,6 +87,8 @@ class DataLoader:
 
     def _skip(self, filename: str, key: str, error: Exception):
         self.skipped[key] += 1
+        if key in self.logged_skips:
+            self.log_func(f"skipped {filename}: {key}")
         if self.expected_skips is not None and key not in self.expected_skips:
             raise UnexpectedSkip(f"unexpected skip {key!r} of {filename}: {str(error)[:200]}") from error
 

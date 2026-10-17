@@ -54,6 +54,7 @@ EXPECTED_SKIPS = frozenset(f"invalid:{r}" for r in (
     "Three players", "BYE", "Against human", "Red tiles", "Kansaki",
     "Own-turn action after own discard",  # T-046: 7 malformed Tenhou logs in 2.2M games, rejected on purpose
 ))
+LOGGED_SKIPS = frozenset({"invalid:Own-turn action after own discard"})  # rare: each one is logged with its file
 EVAL_EVERY_STEPS = 500
 SAVE_EVERY_STEPS = 500
 MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)
@@ -117,7 +118,8 @@ class ValSet:
 
     @classmethod
     def load(cls, log: RunLog) -> "ValSet":
-        loader = DataLoader(str(DATA_ROOT / VAL_YEAR), 1, log, days=VAL_DAYS, seed=VAL_SEED, expected_skips=EXPECTED_SKIPS)
+        loader = DataLoader(str(DATA_ROOT / VAL_YEAR), 1, log, days=VAL_DAYS, seed=VAL_SEED,
+                            expected_skips=EXPECTED_SKIPS, logged_skips=LOGGED_SKIPS)
         assert loader.file_list, f"no validation games for {VAL_YEAR} {VAL_DAYS}"
         log(f"Validation: first {VAL_GAMES} accepted games of {len(loader.file_list)} files "
             f"({VAL_YEAR} {VAL_DAYS[0]}..{VAL_DAYS[-1]}, seed {VAL_SEED})")
@@ -154,7 +156,8 @@ class ValSet:
 
 def fit_prior(log: RunLog) -> dict:
     """{head: bias} of the no-state prior, fitted on the first PRIOR_GAMES accepted 2021 games (loader seed PRIOR_SEED)."""
-    loader = DataLoader(str(DATA_ROOT / "2021"), 1, log, seed=PRIOR_SEED, expected_skips=EXPECTED_SKIPS)
+    loader = DataLoader(str(DATA_ROOT / "2021"), 1, log, seed=PRIOR_SEED, expected_skips=EXPECTED_SKIPS,
+                        logged_skips=LOGGED_SKIPS)
     log(f"Prior: fitting on the first {PRIOR_GAMES} accepted games of {len(loader.file_list)} 2021 files (seed {PRIOR_SEED})")
     processor = TransformerTensorProcessor()
     masks, labels = {h: [] for h in HEADS}, {h: [] for h in HEADS}
@@ -215,7 +218,15 @@ class Metrics:
         if not os.path.exists(self.path):
             return None, []
         with open(self.path) as f:
-            lines = [json.loads(line) for line in f if line.strip()]
+            raw = [line for line in f if line.strip()]
+        lines = []
+        for i, line in enumerate(raw):
+            try:
+                lines.append(json.loads(line))
+            except json.JSONDecodeError:
+                if i < len(raw) - 1 or not lines:
+                    raise
+                # a kill in the middle of an append leaves a partial LAST line: that row is lost, a resume re-runs it
         assert lines and lines[0]["type"] == "header", f"{self.path}: no header row"
         return lines[0], lines[1:]
 
@@ -289,7 +300,8 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     dataloaders = [
-        DataLoader(str(DATA_ROOT / str(yr)), batch_size, log, seed=DATA_SEED, expected_skips=EXPECTED_SKIPS)
+        DataLoader(str(DATA_ROOT / str(yr)), batch_size, log, seed=DATA_SEED, expected_skips=EXPECTED_SKIPS,
+                   logged_skips=LOGGED_SKIPS)
         for yr in TRAIN_YEARS
     ]
     cluster = DataLoaderCluster(dataloaders)
