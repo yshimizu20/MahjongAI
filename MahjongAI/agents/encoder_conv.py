@@ -23,6 +23,7 @@ from MahjongAI.utils.constants import (
     EventStateTypes,
 )
 from MahjongAI.utils.legal import legal_discard_mask
+from mahjong.constants import EAST, WEST
 
 # Hyperparameters
 DISCARD_ACTION_DIM = 37
@@ -35,6 +36,9 @@ MAX_ACTION_LEN = 150
 #   0 own hand, 1 unseen tile counts, 2 own discards, 3 drawn tile,
 #   4-6 opponents' discards, 7-9 tiles safe against each opponent's riichi (zero while not in riichi)
 N_X1_PLANES = 10
+# x3 scalars: remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8, then the round wind (bakaze) one-hot
+# E, S, W (no North slot: 0 North rounds in 2.2M games; process_xml rejects one, T-038)
+N_X3 = 7
 EMBD_SIZE = 64
 N_HEADS = 8
 N_LAYERS = 1
@@ -414,12 +418,12 @@ class StateNet(nn.Module):
         suits_features = 16
         honors_features = 16
         reds_features = 8
-        raw_x1_features = C * 37 * K
+        raw_x1_features = C * 37 * K  # 10 * 37 * 4 = 1480
 
         combined_features = suits_features + honors_features + reds_features + raw_x1_features
 
         # Main network to combine with x2 and x3
-        self.fc_main_1 = nn.Linear(combined_features + 7 * 4 + 4, EMBD_SIZE)
+        self.fc_main_1 = nn.Linear(combined_features + 7 * 4 + N_X3, EMBD_SIZE)  # 1520 + 28 + 7 = 1555
         self.fc_main_2 = nn.Linear(EMBD_SIZE, EMBD_SIZE)
         self.relu_fc_main = nn.ReLU()
 
@@ -434,7 +438,7 @@ class StateNet(nn.Module):
         # Extract Man (0-8), Pin (9-17), Sou (18-26)
         x1_suits = torch.stack(
             [x1[:, :, 0:9, :], x1[:, :, 9:18, :], x1[:, :, 18:27, :]], dim=1  # Man  # Pin  # Sou
-        )  # Shape: [B, S=3, C=3, R=9, K=4]
+        )  # Shape: [B, S=3, C=10, R=9, K=4]
 
         # Reshape to [B, S, C*K, R]
         x1_suits = x1_suits.permute(0, 1, 2, 4, 3).contiguous()  # [B, S, C, K, R]
@@ -457,8 +461,8 @@ class StateNet(nn.Module):
         suits_feat = torch.mean(suits_feat, dim=1)  # [B, 16]
 
         # --- 2. Process Honors (indices 27-33) ---
-        x1_honors = x1[:, :, 27:34, :]  # Shape: [B, C=3, H=7, K=4]
-        x1_honors = x1_honors.reshape(batch_size, -1)  # [B, C*H*K=84]
+        x1_honors = x1[:, :, 27:34, :]  # Shape: [B, C=10, H=7, K=4]
+        x1_honors = x1_honors.reshape(batch_size, -1)  # [B, C*H*K=280]
 
         honors_feat = self.honors_fc1(x1_honors)  # [B, 32]
         honors_feat = self.relu(honors_feat)
@@ -466,27 +470,27 @@ class StateNet(nn.Module):
         honors_feat = self.relu(honors_feat)
 
         # --- 3. Process Red Fives (indices 34-36) ---
-        x1_reds = x1[:, :, 34:37, :]  # Shape: [B, C=3, S=3, K=4]
-        x1_reds = x1_reds.reshape(batch_size, -1)  # [B, C*S*K=36]
+        x1_reds = x1[:, :, 34:37, :]  # Shape: [B, C=10, S=3, K=4]
+        x1_reds = x1_reds.reshape(batch_size, -1)  # [B, C*S*K=120]
 
         reds_feat = self.reds_fc(x1_reds)  # [B, 8]
         reds_feat = self.relu(reds_feat)
 
         # --- 4. Preserve raw x1 ---
-        raw_x1_flat = x1.view(batch_size, -1)  # [B, 3*37*4=444]
+        raw_x1_flat = x1.view(batch_size, -1)  # [B, 10*37*4=1480]
 
         # --- 5. Combine all features ---
         x1_combined = torch.cat(
-            [suits_feat, honors_feat, reds_feat, raw_x1_flat], dim=1  # [B, 16]  # [B, 16]  # [B, 8]  # [B, 444]
-        )  # [B, 484]
+            [suits_feat, honors_feat, reds_feat, raw_x1_flat], dim=1  # [B, 16]  # [B, 16]  # [B, 8]  # [B, 1480]
+        )  # [B, 1520]
 
         # Flatten x2
         x2_flat = x2.view(x2.size(0), -1)  # Shape: [batch_size, 28]
 
-        # x3 remains as [batch_size, 4]
+        # x3 remains as [batch_size, N_X3=7]
 
         # Concatenate all processed features
-        combined = torch.cat([x1_combined, x2_flat, x3], dim=1)  # Shape: [batch_size, 484 + 28 + 4 = 516]
+        combined = torch.cat([x1_combined, x2_flat, x3], dim=1)  # Shape: [batch_size, 1520 + 28 + 7 = 1555]
 
         # Pass through main Linear layer
         x = self.fc_main_1(combined)  # Shape: [batch_size, EMBD_SIZE]
@@ -699,7 +703,7 @@ class TransformerTensorProcessor:
         Returns:
             Tuple containing:
                 - embeddings: Tensor of shape (sum_N, 150)
-                - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
+                - state_obj_tensors: Tuple of tensors (sum_N, N_X1_PLANES, 37, 4), (sum_N, 7, 4), (sum_N, N_X3)
                 - filter_tensors: Tensor of shape (sum_N, 37)
                 - y: Tensor of target labels
                 - padding_mask: Boolean tensor of shape (sum_N, 150), True = valid position
@@ -762,7 +766,7 @@ class TransformerTensorProcessor:
         state_obj_tensor_batch = (
             (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, N_X1_PLANES, 37, 4)),
             (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
-            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, N_X3),
         )
 
         filter_tensors_2d = [ft.unsqueeze(0) for ft in filter_tensors]  # List of (1, 37)
@@ -806,7 +810,7 @@ class TransformerTensorProcessor:
         Returns:
             Tuple containing:
                 - embeddings: Tensor of shape (sum_N, 150)
-                - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
+                - state_obj_tensors: Tuple of tensors (sum_N, N_X1_PLANES, 37, 4), (sum_N, 7, 4), (sum_N, N_X3)
                 - filter_tensors: Tensor of shape (sum_N, DURING_TURN_ACTION_DIM)
                 - y: Tensor of target labels
                 - padding_mask: Boolean tensor of shape (sum_N, 150), True = valid position
@@ -893,7 +897,7 @@ class TransformerTensorProcessor:
         state_obj_tensor_batch = (
             (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, N_X1_PLANES, 37, 4)),
             (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
-            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, N_X3),
         )
 
         filter_tensors_2d = [ft.unsqueeze(0) for ft in filter_tensors]  # Each filter_tensor is now (1, DURING_TURN_ACTION_DIM)
@@ -961,7 +965,7 @@ class TransformerTensorProcessor:
         Returns:
             Tuple containing:
                 - embeddings: Tensor of shape (sum_N, 150)
-                - state_obj_tensors: Tuple of tensors (sum_N, 3, 37), (sum_N, 7, 4), (sum_N, 4)
+                - state_obj_tensors: Tuple of tensors (sum_N, N_X1_PLANES, 37, 4), (sum_N, 7, 4), (sum_N, N_X3)
                 - filter_tensors: Tensor of shape (sum_N, 154)
                 - y: Tensor of target labels
                 - padding_mask: Boolean tensor of shape (sum_N, 150), True = valid position
@@ -1042,7 +1046,7 @@ class TransformerTensorProcessor:
         state_obj_tensor_batch = (
             (torch.cat(x1_list, dim=0) if x1_list else torch.empty(0, N_X1_PLANES, 37, 4)),
             (torch.cat(x2_list, dim=0) if x2_list else torch.empty(0, 7, 4)),
-            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, 4),
+            torch.cat(x3_list, dim=0) if x3_list else torch.empty(0, N_X3),
         )
 
         filter_tensors_2d = [ft.unsqueeze(0) for ft in filter_tensors]  # Each filter_tensor is now (1, 154)
@@ -1082,7 +1086,8 @@ class TransformerTensorProcessor:
             x1: (1, N_X1_PLANES, 37, 4) thermometer planes (plane c, column j = 1 iff count > j)
             x2: (1, 7, 4) per-seat rows: scores/250, parent, parent_rounds_remaining/2, double_reaches,
                 reaches, ippatsu, is_menzen
-            x3: (1, 4): remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8
+            x3: (1, N_X3=7): remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8, then the round wind
+                (bakaze) one-hot E, S, W in slots 4-6
         Every input is O(1): fc_main_1 has no LayerNorm before its ReLU, and raw scores (~250) killed
         14-53% of its units in the unnormalised model.
         """
@@ -1128,10 +1133,12 @@ class TransformerTensorProcessor:
             dim=1,
         )  # (1, 7, 4)
 
-        x3 = torch.tensor(
-            [[stateObj.remaining_tsumo / 70.0, stateObj.kyotaku / 4.0, stateObj.honba / 8.0, stateObj.rounds_remaining / 8.0]],
-            dtype=torch.float32,
-        )  # (1, 4)
+        assert EAST <= stateObj.round_wind <= WEST, f"round_wind {stateObj.round_wind} is not East, South or West"
+        x3 = torch.zeros((1, N_X3), dtype=torch.float32)
+        x3[0, :4] = torch.tensor(
+            [stateObj.remaining_tsumo / 70.0, stateObj.kyotaku / 4.0, stateObj.honba / 8.0, stateObj.rounds_remaining / 8.0]
+        )
+        x3[0, 4 + stateObj.round_wind - EAST] = 1.0  # bakaze one-hot: 4 East, 5 South, 6 West
 
         return x1, x2, x3
 

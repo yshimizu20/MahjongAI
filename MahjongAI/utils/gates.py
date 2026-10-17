@@ -34,7 +34,7 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           and every during / post target == the executed action of its sample (exact index, not only the kind);
           discard targets == TILE2IDX (red five -> slot 34-36) and the plain-five slot is enabled only
           with a plain copy; EVERY input of every sample == its StateObject and history: all 10 x1 planes,
-          all 7 actor-first x2 rows, all 4 x3 scalars, the full rotated history prefix with zeros after it, and
+          all 7 actor-first x2 rows, all 7 x3 slots, the full rotated history prefix with zeros after it, and
           the padding mask; the post sample set follows the priority rule (executors always, pre-empted
           responders never); the last history token of a post sample is exactly the discard / kakan it
           answers; the tensor builder skipped nothing
@@ -76,6 +76,10 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           on iff the sample offers a win
   KYUUSHU executed kyuushu aborts == <RYUUKYOKU type="yao9"> (lab / tensor / xml counts), and per round the
           executed abort is exactly the yao9 seat on its latest draw (seat, draw number), none without a yao9
+  ROUND   the round-wind (bakaze) one-hot of every BUILT sample row of every head (x3 slots 4-6) == the round wind
+          read from the XML INIT seed (seed[0] // 4: 0 East, 1 South, 2 West), never from agari.round_wind or
+          the StateObject (round_wind_xml); every built row is checked (round_wind_coverage). A North round
+          (seed[0] >= 12) is rejected by the parser and counted (skipped_invalid_north, path printed)
 """
 import argparse
 import collections
@@ -89,6 +93,7 @@ from unittest import mock
 
 import numpy as np
 import torch
+from mahjong.constants import EAST
 
 from MahjongAI import process_xml
 from MahjongAI.process_xml import process, InvalidGameException, discard2idx, naki2idx, reach2idx, new_dora2idx
@@ -147,6 +152,9 @@ PENDING_FLIP_TSUMO_LOG = ("20210102", "2021010214gm-00a9-0000-7ed48ecb.log",  # 
                           r'<N [^>]*/><DORA hai="31"\s*/><[TUVW]\d+/><AGARI [^>]*doraHai="121,31"')
 OPEN_KAN_THEN_ANKAN_LOG = ("20210108", "2021010823gm-00a9-0000-725fdda5.log",  # daiminkan, ankan: both flip at once
                            r'<N [^>]*/><DORA hai="\d+"\s*/><DORA hai="\d+"\s*/><[TUVW]\d+/><[DEFG]\d+/>')
+# T-038 bakaze fixtures: a tonpuu game that reaches South (E1-E4, S1, S2), and a hanchan game that reaches West
+TONPUU_SOUTH_LOG = ("20210101", "2021010100gm-00e1-0000-4762443c.log", r'<GO type="225"[\s\S]*<INIT seed="[4-7],')
+HANCHAN_WEST_LOG = ("20210101", "2021010100gm-00a9-0000-0af99d68.log", r'<GO type="169"[\s\S]*<INIT seed="(8|9|10|11),')
 FULL_WALL = np.array([4] * 34 + [1] * 3)  # copies per 37-slot index (slots 34-36: the red fives)
 DEFAULT_DAYS = ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
                 "20210709", "20210815", "20210921", "20211030", "20211112", "20211225"]
@@ -177,6 +185,7 @@ ZERO_GATES = [
     "ron_offer_incomplete", "tsumo_offer_incomplete",
     "kyuushu_offer_not_first_draw", "kyuushu_offer_after_call", "kyuushu_offer_few_kinds", "kyuushu_label_mismatch",
     "state_xml_dora", "pov_xml_mismatch", "dora_draw_to_discard", "dora_vs_agari",
+    "round_wind_xml",
 ]
 OPTION_RULES = ["riichi_offer_low_points", "riichi_offer_few_draws", "riichi_offer_after_kan4", "riichi_okurikan_offer",
                 "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
@@ -350,7 +359,7 @@ def expected_inputs(so):
     so.player (0 = me, 1 = shimocha, 2 = toimen, 3 = kamicha). x1 planes: 0 own hand, 1 unseen counts, 2 own
     discards, 3 drawn tile, 4-6 opponents' discards, 7-9 tiles safe against each opponent. x2 rows: scores/250,
     dealer, dealer rounds left/2, double riichi, riichi, ippatsu, menzen. x3: remaining_tsumo/70, kyotaku/4,
-    honba/8, rounds_remaining/8."""
+    honba/8, rounds_remaining/8, then the round wind one-hot E, S, W (from so.round_wind)."""
     seats = [(so.player + d) % 4 for d in range(4)]
     drawn = np.zeros(37)
     if so.drawn_tile is not None:
@@ -362,6 +371,7 @@ def expected_inputs(so):
     x1 = torch.stack([thermometer(c) for c in planes])
     x2 = torch.tensor([[float(v[q]) / scale for q in seats] for v, scale in rows])
     x3 = torch.tensor([so.remaining_tsumo / 70.0, so.kyotaku / 4.0, so.honba / 8.0, so.rounds_remaining / 8.0])
+    x3 = torch.cat([x3, torch.eye(3)[so.round_wind - EAST]])
     return x1, x2, x3
 
 
@@ -427,7 +437,8 @@ def _attr(attrs, name):
 
 def xml_rounds(raw: str):
     """Per round, replayed from the XML alone, in log order: end ('agari' | 'exhaustive' | 'abortive'), the INIT
-    dora indicator, the seats of the riichi declarations (REACH step 1) in order, and the history tokens the
+    dora indicator, the six INIT seed ints (seed: round index, honba, kyotaku, dice, dice, indicator), the INIT
+    dealer (oya), the seats of the riichi declarations (REACH step 1) in order, and the history tokens the
     parser must emit: the INIT indicator, then DORA -> new dora, REACH step 1 -> reach, N -> call, D/E/F/G ->
     discard (tsumogiri iff it is the tile just drawn); nothing after the round's first AGARI / RYUUKYOKU. wins: per
     AGARI event, (who, fromWho, Tenhou yaku ids). yao9: (seat, that seat's draw count) of a kyuushu abort (the
@@ -436,9 +447,11 @@ def xml_rounds(raw: str):
     for m in XML_EVENT.finditer(raw):
         tag, attrs = m.group(1), m.group(2)
         if tag == "INIT":
-            dora = int(_attr(attrs, "seed").split(",")[5])
-            rounds.append({"end": None, "dora": dora, "reach": [], "tokens": [new_dora2idx(dora // 4)], "wins": [],
-                           "yao9": None, "draws": [0] * 4, "win_dora": []})
+            seed = [int(x) for x in _attr(attrs, "seed").split(",")]
+            dora = seed[5]
+            rounds.append({"end": None, "dora": dora, "seed": seed, "oya": int(_attr(attrs, "oya")), "reach": [],
+                           "tokens": [new_dora2idx(dora // 4)], "wins": [], "yao9": None, "draws": [0] * 4,
+                           "win_dora": []})
             acquired = None
             continue
         r = rounds[-1]
@@ -957,6 +970,21 @@ def check_kyuushu(halfturns, xr, C):
         C["kyuushu_label_mismatch"] += 1
 
 
+def check_round_wind(head, x3, xr, tonpuu, C):
+    """Bakaze slots 4-6 of EVERY built sample row of one head == the one-hot of the round wind read from the XML
+    INIT seed (seed[0] // 4: 0 East, 1 South, 2 West), never from agari.round_wind or the StateObject. A North round
+    or an x3 without the 3 slots fails every row. head: the head name (the self-test skips one head)."""
+    n, wind = x3.shape[0], xr["seed"][0] // 4
+    C["round_wind_checked"] += n
+    if tonpuu:
+        C["round_wind_tonpuu_samples"] += n
+    if wind > 2 or x3.shape[1] < 7:
+        C["round_wind_xml"] += n
+        return
+    C["round_wind_samples_" + "ESW"[wind]] += n
+    C["round_wind_xml"] += int((x3[:, 4:7] != torch.eye(3)[wind]).any(dim=1).sum().item())
+
+
 def count_game(path, H, T, C, tp):
     """Add every counter of one parsed game (H = halfturns per round, T = tokens per round) to C."""
     raw = open(path, "rb").read().decode("utf-8", "ignore")
@@ -970,6 +998,8 @@ def count_game(path, H, T, C, tp):
     for m in re.findall(r'<N who="\d" m="(\d+)"', raw):
         C["xml_" + kind_of(Naki(int(m)))] += 1
     C["xml_open_kan_dora"] += len(re.findall(OPEN_KAN_DORA_RE, raw))
+    go = re.search(r'<GO type="(\d+)"', raw)
+    tonpuu = go is not None and not int(go.group(1)) & 0x8  # GO bit 0x8 = hanchan (East + South)
     rounds = xml_rounds(raw)
     assert len(rounds) == len(H), f"{path}: {len(rounds)} rounds in XML, {len(H)} parsed"
     replays = xml_snapshots(raw)
@@ -1142,6 +1172,7 @@ def count_game(path, H, T, C, tp):
         C["tensor_skipped"] = sum(tp.skipped.values())
         C["discard_mask_empty"] = tp.skipped["discard_mask_empty"]
         for name, tt in zip(HEADS, (td, tdisc, tpost)):
+            check_round_wind(name, tt[1][2], xr, tonpuu, C)
             if len(tt[3]):
                 C[f"{name}_label_outside_mask"] += int((tt[2][np.arange(len(tt[3])), tt[3]] != 1).sum().item())
                 C[f"{name}_samples"] += len(tt[3])
@@ -1200,6 +1231,9 @@ def run(files, tp=None):
             H, T = process(f)
         except InvalidGameException as e:
             C["skipped_invalid"] += 1
+            if e.msg == "North round":  # 0 in 2.2M games: name the file, never hide it in skipped_invalid
+                C["skipped_invalid_north"] += 1
+                print(f"North round rejected: {f}")
             continue
         except Exception as e:
             C["parse_error"] += 1
@@ -1242,6 +1276,9 @@ def failed_gates(C) -> dict:
         bad["dora_vs_agari_coverage"] = f"{C['dora_vs_agari_checked']} != xml_agari={C['xml_agari']}"
     if C["open_kan_dora_deferred"] != C["xml_open_kan_dora"]:
         bad["open_kan_dora_deferred"] = f"{C['open_kan_dora_deferred']} != xml `T DORA D`={C['xml_open_kan_dora']}"
+    if C["round_wind_checked"] != sum(C[f"{h}_samples"] for h in HEADS):  # every built row had its bakaze checked
+        bad["round_wind_coverage"] = (f"{C['round_wind_checked']} != during + discard + post samples="
+                                      f"{sum(C[f'{h}_samples'] for h in HEADS)}")
     if C["dora_draw_to_discard_checked"] == 0:
         bad["dora_draw_to_discard_checked"] = 0
     if C["legal_chi_samples"] + C["legal_pon_samples"] != C["lab_chi"] + C["lab_pon"]:
@@ -1272,6 +1309,8 @@ def check(C):
         f"{C['diag_tsumo_offered']} (declined {C['diag_tsumo_declined']}) ron {C['diag_ron_offered']} (declined "
         f"{C['diag_ron_declined']}); blocked tsumo no_yaku {C['diag_tsumo_blocked_no_yaku']}, ron "
         + " ".join(f"{r} {C['diag_ron_blocked_' + r]}" for r in FURITEN + ("no_yaku",))
+        + f" | bakaze E/S/W {C['round_wind_samples_E']}/{C['round_wind_samples_S']}/{C['round_wind_samples_W']} "
+        f"(tonpuu {C['round_wind_tonpuu_samples']}) == checked {C['round_wind_checked']}"
     )
 
 
@@ -1519,12 +1558,18 @@ def self_test():
     kan_games = [_named_game(g) for g in (PENDING_FLIP_TSUMO_LOG, OPEN_KAN_THEN_ANKAN_LOG)]
     option_games = _option_fixtures()
     kyuushu_games = [_named_game(YAO9_LOG), _named_game(KYUUSHU_AFTER_CALL_LOG)]  # an abort, a decline, 9 kinds after a call
-    check(run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan, open_kan, open_kan_ron] + kan_games
-              + sorted(set(option_games.values())) + kyuushu_games, TransformerTensorProcessor()))
+    tonpuu, west = _named_game(TONPUU_SOUTH_LOG), _named_game(HANCHAN_WEST_LOG)
+    clean = run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan, open_kan, open_kan_ron] + kan_games
+                + sorted(set(option_games.values())) + kyuushu_games + [tonpuu, west], TransformerTensorProcessor())
+    check(clean)
+    for k in ("round_wind_samples_E", "round_wind_samples_S", "round_wind_samples_W", "round_wind_tonpuu_samples"):
+        if not clean[k]:  # the bakaze gate saw every wind and a tonpuu game, or it proves nothing about them
+            raise SystemExit(f"self-test FAILED: the clean pool has no {k}")
 
-    def expect_failure(name, gate, corrupt, game=f):
+    def expect_failure(name, gate, corrupt, game=f, absent=()):
         """corrupt(H, T, tp) edits the parse in place; it may return a context manager that stays active while the
-        game is counted. gate: one gate name or a tuple of names, every one of which must fail."""
+        game is counted. gate: one gate name or a tuple of names, every one of which must fail. absent: gates that
+        must NOT fail (the corruption is invisible to them)."""
         gates = (gate,) if isinstance(gate, str) else gate
         baseline = failed_gates(_count(game))
         if baseline:
@@ -1540,7 +1585,11 @@ def self_test():
         missed = [g for g in gates if g not in bad]
         if missed:
             raise SystemExit(f"self-test FAILED: {name} did not fail gate(s) {missed} (failed: {bad or 'none'})")
-        print(f"self-test OK: {name} -> " + ", ".join(f"{g}={bad[g]}" for g in gates))
+        caught = [g for g in absent if g in bad]
+        if caught:
+            raise SystemExit(f"self-test FAILED: {name} also failed {caught}, which must not see it (failed: {bad})")
+        print(f"self-test OK: {name} -> " + ", ".join(f"{g}={bad[g]}" for g in gates)
+              + "".join(f", {g} passes" for g in absent))
 
     def found(n, what):
         if not n:
@@ -1746,8 +1795,24 @@ def self_test():
     def zero_score_row(H, T, tp):  # x2 row 0 (scores) zeroed
         _patch_inputs(tp, lambda x1, x2, x3: x2[:, 0].zero_())
 
-    def zero_scalars(H, T, tp):
-        _patch_inputs(tp, lambda x1, x2, x3: x3.zero_())
+    def zero_scalars(H, T, tp):  # the 4 scalar slots only: the bakaze slots must not be what trips the gate
+        _patch_inputs(tp, lambda x1, x2, x3: x3[:, :4].zero_())
+
+    # ---- round wind (T-038)
+    def rolled_bakaze(H, T, tp):  # (A) the converter's one-hot rolled by one slot: E->S, S->W, W->E
+        _patch_inputs(tp, lambda x1, x2, x3: x3[:, 4:7].copy_(x3[:, 4:7].roll(1, dims=1)))
+
+    def parser_wind_east(H, T, tp):  # (B) the parser stores East for every round: input == StateObject still holds
+        for so in _states(H):
+            so.round_wind = EAST
+
+    def hanchan_wind_formula(H, T, tp):  # (C) the wind derived as if every game were hanchan (tonpuu E1-E4 -> South)
+        for so in _states(H):
+            so.round_wind = EAST + (8 - so.rounds_remaining) // 4
+
+    def post_wind_unchecked(H, T, tp):  # (D) check_round_wind skipped for the post head
+        orig = check_round_wind
+        return mock.patch(f"{__name__}.check_round_wind", lambda head, *a: None if head == "post" else orig(head, *a))
 
     def truncate_history(H, T, tp):  # post histories keep only the answered token
         def edit(td, tdisc, tpost):
@@ -2278,6 +2343,12 @@ def self_test():
     expect_failure("zeroed unseen-count plane", "x1_plane_mismatch", zero_unseen_plane)
     expect_failure("zeroed score row", "x2_row_mismatch", zero_score_row)
     expect_failure("zeroed x3 scalars", "x3_scalar_mismatch", zero_scalars)
+    expect_failure("bakaze one-hot rolled by one slot", ("round_wind_xml", "x3_scalar_mismatch"), rolled_bakaze,
+                   game=tonpuu)
+    expect_failure("parser stores East in every round", "round_wind_xml", parser_wind_east, game=west,
+                   absent=("x3_scalar_mismatch",))
+    expect_failure("tonpuu wind by the hanchan formula", "round_wind_xml", hanchan_wind_formula, game=tonpuu)
+    expect_failure("bakaze of the post head unchecked", "round_wind_coverage", post_wind_unchecked, game=tonpuu)
     expect_failure("post history truncated to the answered token", "history_prefix_mismatch", truncate_history)
     expect_failure("padding mask all valid", "padding_mask_mismatch", full_padding_mask)
     expect_failure("post sample answers the token before its event", "post_history_last_token", stale_answered_token)
