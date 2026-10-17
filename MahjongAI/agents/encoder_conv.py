@@ -1014,11 +1014,6 @@ class TransformerTensorProcessor:
                         if decision_type[0].executed:
                             result = 1
 
-                    elif decision_idx == DECISION_REACH_IDX:
-                        decision_mask[2] = 1.0
-                        if decision_type[0].executed:
-                            result = 2
-
                     elif decision_idx == DECISION_NAKI_IDX:
                         for meld_decision in decision_type:
                             idx = meld_decision.naki.get_post_turn_filter_idx()

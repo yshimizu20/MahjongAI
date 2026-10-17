@@ -1,5 +1,14 @@
 # Transformer-Conv Model Architecture
 
+> **Status: archived, not trained.** Since T-013 this model is not a `supervised_learning.py` choice: its `forward`
+> returns `{head: (logits, loss)}` tuples, not the per-head output the trainer reads, and it reads the old inputs
+> (x1 with 3 planes, x3 with 4 scalars, the discarder's state for post-turn responders, no kyuushu abort action).
+> The trained model is `MahjongAI/agents/encoder_conv.py` (201,311 parameters, measured; it has no architecture
+> doc): 10 x1 planes in relative seats, 7 x3 scalars (the round wind added in T-038), each responder's own state.
+> To revive this model: port it to the per-head output and the current inputs, then in
+> `MahjongAI/supervised_learning.py` add it to `valid_models` and give `train()` its import, constructor branch and
+> batch size (today `train()` raises `NotImplementedError` for every model but `encoder_conv`).
+
 ## Overview
 
 The `TransformerConvModel` is a hybrid deep learning architecture that combines **Transformer** self-attention mechanisms with **Convolutional Neural Networks (CNNs)** to predict player actions in Japanese Mahjong (Riichi Mahjong). This model processes both sequential game history and spatial tile relationships to make informed decisions about discarding tiles, calling riichi, making melds (chi, pon, kan), and declaring wins.
@@ -8,10 +17,11 @@ The `TransformerConvModel` is a hybrid deep learning architecture that combines 
 
 - **Task**: Supervised learning for Mahjong action prediction
 - **Input**: Game event history (up to 150 events) + current game state
-- **Output**: Probability distribution over legal actions for three decision types:
+- **Output**: Masked logits (actions outside this model's mask at -1e9) and a cross-entropy loss, for three decision types:
   - **Discard decisions**: Which tile to discard (37 possible tiles)
   - **During-turn decisions**: Pass, tsumo, riichi, ankan, or kakan (71 actions)
-  - **Post-turn decisions**: Pass, ron, chi, pon, or minkan (154 actions)
+  - **Post-turn decisions**: Pass, ron, chi, pon, or minkan (154 actions); also chankan ron after a kakan
+  - The counts are output slots, not counts of legal choices
 
 ### High-Level Architecture
 
@@ -31,7 +41,7 @@ graph TB
     end
     
     subgraph DecoderModule [Decoder Module]
-        StateNet[StateNet CNN<br/>Conv2d Layers + FC]
+        StateNet[StateNet<br/>Suit Conv1d + Honor/Red MLP + FC]
         DecoderBlocks[Decoder Blocks<br/>Cross-Attention + FFN]
         LayerNorm[Layer Normalization]
         StateNet --> DecoderBlocks
@@ -52,7 +62,7 @@ graph TB
 
 ### Model Statistics
 
-- **Total Parameters**: ~0.7M parameters
+- **Total Parameters**: 193,150 (measured, `TransformerConvModel()`)
 - **Embedding Dimension**: 64
 - **Attention Heads**: 8 (head size: 8)
 - **Transformer Layers**: 1 (configurable via `N_LAYERS`)
@@ -145,7 +155,7 @@ hand_tensor = (torch.arange(4) < count.unsqueeze(1)).float()
 #### **x2: Game Metadata Tensor** `(batch_size, 7, 4)`
 
 Seven features for each of the 4 players:
-1. **Scores**: Current point totals
+1. **Scores**: Current point totals in raw Tenhou units, hundreds of points (25,000 points = 250)
 2. **Parent tensor**: One-hot indicator of dealer
 3. **Parent rounds remaining**: Rounds left as dealer
 4. **Double reaches**: Double riichi status (1 or 0)
@@ -221,7 +231,7 @@ graph TB
 
 **Embedding Details:**
 
-1. **Event Type Embedding** (4 non-EMPTY types): Embeds the `EventTypes` field (bits 10-12). For tokens where EventTypes == EMPTY, the embedding is not applied (vector = 0). For non-EMPTY EventTypes in {DISCARD, NAKI, RIICHI, NEW_DORA}, we index the 4-slot embedding table with (EventTypes - 1).
+1. **Event Type Embedding** (4 non-EMPTY types): Embeds the `EventTypes` field (bits 10-12). The embedding is applied only when the event state type (bits 13-15) is not EMPTY (else the vector is 0). It indexes the 4-slot embedding table with (EventTypes - 1), clamped at 0.
 2. **Tile Embedding** (37 tiles): Learned representation for each tile type
 3. **Tsumogiri Embedding**: Indicates if a discard was from the draw
 4. **During Naki Embedding** (71 actions): For ankan/kakan decisions
@@ -243,12 +253,13 @@ angle = player_idx * (2π / 4)
 PlayerEnc(player, 2i) = sin(angle / 10000^(2i/d))
 PlayerEnc(player, 2i+1) = cos(angle / 10000^(2i/d))
 ```
-Maintains rotational symmetry for the 4-player game.
+The player index is the token's absolute seat (bits 8-9), not a seat relative to the acting player.
 
 **Conditional Embedding Application:**
 
 Each embedding is only applied when relevant (controlled by masking):
 - Type embedding: Applied for all non-EMPTY events
+- Position encoding: Applied for all non-EMPTY events
 - Tile embedding: Applied for DISCARD and NEW_DORA events
 - Player embedding: Applied for DISCARD, DURING, and POST events
 - Tsumogiri embedding: Applied for DISCARD events with tsumogiri=1
@@ -361,7 +372,7 @@ graph TB
 This design ensures that convolution captures true Mahjong patterns:
 - Adjacency in the convolution corresponds to rank adjacency (e.g., 4-man is adjacent to 5-man, not to 1-pin)
 - Suit boundaries are respected, preventing spurious cross-suit correlations
-- Translation invariance applies within suits (same rank pattern in Man/Pin/Sou)
+- The same filters apply to all three suits (the same rank pattern in Man/Pin/Sou gives the same features)
 
 ### StateNet Processing Steps
 
@@ -498,9 +509,9 @@ graph TB
     end
     
     subgraph Outputs [Final Outputs]
-        DiscardLogits[Discard Logits<br/>37 legal actions]
-        DuringLogits[During Logits<br/>71 legal actions]
-        PostLogits[Post Logits<br/>154 legal actions]
+        DiscardLogits[Discard Logits<br/>37 slots]
+        DuringLogits[During Logits<br/>71 slots]
+        PostLogits[Post Logits<br/>154 slots]
     end
     
     DecoderOutput --> DiscardHead
@@ -520,7 +531,12 @@ graph TB
 
 Predicts which tile to discard from hand. Actions correspond to the 37 tile types (0-36).
 
-**Action mask**: Based on `hand_tensor` - can only discard tiles in hand (clipped to max 1.0).
+**Action mask**: Based on `hand_tensor` - any tile in hand (clipped to max 1.0). This legacy mask ignores kuikae
+and the riichi restrictions, and a red five counts in both its plain and its red slot, so a hand with only the red
+five also allows the plain five. The live model uses `utils/legal.py` (`legal_discard_mask`).
+
+**Target**: `TILE2IDX[tile][0]`, the plain kind: a red five discard targets its plain five slot, so slots 34-36 never
+get a positive target.
 
 #### During Head (71 actions)
 
@@ -535,14 +551,14 @@ Predicts actions during the player's own turn after drawing a tile:
 
 #### Post Head (154 actions)
 
-Predicts actions after another player's discard:
+Predicts actions after another player's discard, or after a kakan (chankan ron only):
 - **0**: Pass
 - **1**: Agari (ron - win on discard)
 - **2-82**: Chi (sequential meld) - 63 basic patterns + 18 red five variants
 - **83-119**: Pon (triple meld) - 27 basic + 3 red five variants + 7 honor tiles
 - **120-153**: Minkan (open kan) - 34 tile types
 
-**Action mask**: Constructed from legal meld decisions based on hand tiles and the discarded tile.
+**Action mask**: Constructed from the parser's offered decisions (ron, chi, pon, minkan) for the responder.
 
 ### Action Masking and Loss
 
@@ -551,14 +567,14 @@ Predicts actions after another player's discard:
 # Mask out invalid actions (set logits to -inf)
 logits = logits.masked_fill(action_mask == 0, -1e9)
 
-# Cross-entropy loss over legal actions only
+# Cross-entropy loss over the masked action space
 loss = F.cross_entropy(logits, target_action, reduction='mean')
 ```
 
 This ensures:
-1. Model only predicts legal moves
-2. Loss is computed only over valid action space
-3. Invalid actions have near-zero probability after softmax
+1. The model only predicts actions its mask allows (the mask is not the full rule set, see the Discard Head)
+2. Loss is computed only over the masked action space
+3. Masked actions have near-zero probability after softmax
 
 ## Training Process
 
@@ -617,16 +633,21 @@ Training data consists of three types of `HalfTurn` objects:
 1. **DuringTurn**: Player's own turn after drawing
    - Contains: `player`, `stateObj`, `decisions[][]`, `encoding_idx`
    - Decisions: List of lists for [agari, riichi, naki]
-   - One executed decision marked as `executed=True`
+   - At most one executed decision marked as `executed=True` (none = pass)
 
 2. **DiscardTurn**: Player discarding a tile
    - Contains: `player`, `stateObj`, `discarded_tile`, `encoding_idx`
-   - Target: Index of the discarded tile (0-36)
+   - Target: the discarded tile's plain kind (0-33; a red five targets its plain five)
 
-3. **PostTurn**: After another player's discard
+3. **PostTurn**: After another player's discard, or after a kakan (chankan)
    - Contains: `player`, `stateObj`, `decisions[][][]`, `encoding_idx`
    - Decisions: 3D list [player][decision_type][options]
-   - Multiple players may have decisions, but only one executes
+   - Multiple players may have decisions; usually at most one executes, but a double / triple ron marks every
+     ronning responder. This model stops after the first executed responder (seat order after the discarder)
+   - This model reads `stateObj` (the discarder's state) for every responder
+
+**The current parser has changed since this model:** a `DuringTurn` has a fourth decision list (kyuushu abort);
+an offered abort makes this model raise `ValueError`, and a `PostTurn` carries `responder_states`, each responder's own state.
 
 ### Batch Construction
 
@@ -640,7 +661,7 @@ For each turn type, the processor:
 
 2. **Converts state object**: Transform `StateObject` → `(x1, x2, x3)` tensors
 
-3. **Creates action mask**: Binary tensor indicating legal actions
+3. **Creates action mask**: Binary tensor of the actions the model allows
 
 4. **Extracts target**: Index of the action that was actually taken
 
@@ -654,6 +675,7 @@ For each turn type, the processor:
 for halfturns_batch, encoding_tokens_batch in dataloader:
     # Process and separate by turn type
     tensors_during, tensors_discard, tensors_post = prepare_batches(...)
+    results = {}
     
     for tensors, head in [(tensors_during, 'during'), 
                           (tensors_discard, 'discard'), 
@@ -666,17 +688,21 @@ for halfturns_batch, encoding_tokens_batch in dataloader:
             idx = torch.randperm(len(tensors[0]))[:sample_size]
             tensors = sample_tensors(tensors, idx)
         
-        # Unpack
-        encoding_tokens, state_obj, action_mask, targets = tensors
+        # Unpack (the padding mask is True at valid positions)
+        encoding_tokens, state_obj, action_mask, targets, padding_mask = tensors
         
         # Forward pass
-        enc_out = encoder(encoding_tokens)
-        logits, loss = decoder(enc_out, state_obj, action_mask, targets, head)
-        
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+        enc_out = encoder(encoding_tokens, padding_mask)
+        logits, loss = decoder(enc_out, state_obj, action_mask, targets, head, padding_mask)
+        results[head] = (logits, loss)
+    
+    # Backward pass: one step on the sum of the head losses
+    optimizer.zero_grad()
+    sum(loss for _, loss in results.values()).backward()
+    optimizer.step()
 ```
+Everything above the backward pass is `TransformerConvModel.forward` (it returns `results`); the backward pass is
+the caller's.
 
 ### Loss Function
 
@@ -686,7 +712,7 @@ loss = F.cross_entropy(logits, target_action, reduction='mean')
 ```
 
 Where:
-- `logits`: (B, num_actions) - masked logits for legal actions only
+- `logits`: (B, num_actions) - logits with the masked-out actions at -1e9
 - `target_action`: (B,) - index of the executed action
 - Reduction: Mean loss across batch
 
@@ -709,22 +735,19 @@ Where:
 
 **Benefits**:
 - Single 16-bit integer encodes multiple fields
-- Reduces sequence storage by ~4× vs separate fields
 - Fast bitwise operations for decoding
 - Easy to extend with additional bit fields
 
 **Tradeoff**: Requires careful bit manipulation and debugging
 
-### 3. Relative Player Encoding
-
-**Motivation**: Mahjong is rotationally symmetric - seat position shouldn't affect strategy
+### 3. Player Encoding (absolute seats)
 
 **Implementation**:
 - Circular sinusoidal encoding for 4 players
-- Maintains consistent relationships (player 0 is always "self")
-- Model learns relative positions, not absolute seats
-
-**Benefit**: Better generalization across different seating positions
+- The index is the absolute seat in the token's `who` bits (`archive/transformer_conv.py`, `player_idx = (tokens >> 8) & 3`):
+  the same history reads differently for the same play from another seat
+- Not done here: seats relative to the acting player. `encoder_conv.py` rewrites the `who` bits so that seat 0 is the
+  actor (`_relative_seats`); `archive/transformer_conv_ordered.py` subtracts the player index
 
 ### 4. Key-Padding Attention Masking
 
@@ -732,7 +755,7 @@ Where:
 
 **Implementation**:
 - Generate a boolean padding mask from `encoding_idx`: `mask[i] = (i < encoding_idx)` where `True` = valid position
-- Apply mask in attention: `attn_scores.masked_fill(~mask, -inf)` before softmax
+- Apply mask in attention: `F.scaled_dot_product_attention` with the boolean mask (a masked score is -inf before softmax); `nan_to_num` sets any NaN to 0, a defensive guard for a row with no valid position
 - Zero out encoder outputs at padded positions after transformer blocks to prevent signal leakage through bias terms and LayerNorm
 - Pass the same mask to decoder cross-attention to prevent attending to padded encoder positions
 
@@ -746,16 +769,16 @@ Where:
 
 ### 5. Action Masking
 
-**Motivation**: Enforce legal moves and focus learning on valid actions
+**Motivation**: Keep the model to the offered actions and focus learning on them
 
 **Implementation**:
-- Binary mask generated from game rules
-- Invalid actions masked with -1e9 before softmax
-- Loss computed only over legal action distribution
+- Binary mask from the parser's decisions (during / post) and from the hand (discard)
+- Masked actions set to -1e9 before softmax
+- Loss computed only over the masked action distribution
 
-**Benefits**:
-- Guarantees legal outputs
-- Faster convergence (no wasted capacity on illegal moves)
+**Benefits and limits**:
+- Outputs stay inside the mask; the discard mask is not the full rule set (see the Discard Head)
+- No capacity spent on masked actions
 - More interpretable predictions
 
 ### 6. Three Separate Output Heads
@@ -764,12 +787,14 @@ Where:
 
 **Alternative approaches**:
 - Single unified output (wasteful - 37+71+154=262 dims always)
-- Multi-task with shared layers (less specialized)
+
+This model is multi-task with shared layers: the encoder, StateNet and decoder are shared, and only the last linear
+layer is per head.
 
 **Benefits of separate heads**:
-- Specialized weights for each decision type
-- No interference between task types
-- Clearer training signal
+- Specialized output weights for each decision type
+- Each head's logits cover only its own action space
+- The heads still interfere through the shared layers: every head's loss updates them
 
 ### 7. Pre-Normalization Architecture
 
@@ -795,15 +820,15 @@ x = x + SelfAttention(LayerNorm(x))  # Not LayerNorm(x + SelfAttention(x))
 **Why two conv layers?**
 - Layer 1: Detects basic tile combinations
 - Layer 2: Combines layer 1 patterns into higher-level features
-- Empirically 2 layers sufficient for Mahjong patterns
+- Not tuned: no layer-count comparison was run in this repo
 
 ### 9. Single Transformer Layer
 
 **Motivation**: Balance between capacity and overfitting
 
-**Observation**:
+**Rationale** (not measured in this repo):
 - Mahjong decisions often depend on recent events
-- Single layer sufficient for ~150 event sequence
+- A single layer is assumed sufficient for a ~150 event sequence
 - More layers risk overfitting on limited training data
 
 **Configurable**: Can increase `N_LAYERS` for larger datasets
@@ -861,61 +886,70 @@ DROPOUT_RATIO = 0.2            # Dropout probability
 
 ### Parameter Count Breakdown
 
-```
-Encoder:
-  - event_type_embedding:  4 × 64 = 256  # 4 non-EMPTY EventTypes
-  - tile_embedding:       37 × 64 = 2,368
-  - tsumogiri_embedding:   1 × 64 = 64
-  - during_naki_embedding: 71 × 64 = 4,544
-  - post_naki_embedding:  154 × 64 = 9,856
-  - transformer_blocks:   ~150K (QKV projections, FFN)
-  
-StateNet:
-  - suit_conv1d_1:        12 × 16 × 3 = 576 (+ 16 bias)
-  - suit_conv1d_2:        16 × 16 × 3 = 768 (+ 16 bias)
-  - honors_fc1:           84 × 32 = 2,688 (+ 32 bias)
-  - honors_fc2:           32 × 16 = 512 (+ 16 bias)
-  - reds_fc:              36 × 8 = 288 (+ 8 bias)
-  - fc_main_1:            516 × 64 = 33,024 (+ 64 bias)
-  - fc_main_2:            64 × 64 = 4,096 (+ 64 bias)
-  
-Decoder:
-  - decoder_blocks:       ~150K (QKV projections, FFN)
-  - layer_norm:           64 × 2 = 128 (weight + bias)
-  - discard_head:         64 × 37 = 2,368 (+ 37 bias)
-  - during_head:          64 × 71 = 4,544 (+ 71 bias)
-  - post_head:            64 × 154 = 9,856 (+ 154 bias)
+Measured with `sum(p.numel() for p in module.parameters())` on `TransformerConvModel()` (weights + biases):
 
-Total: ~0.7M parameters
+```
+Encoder:                                    67,072
+  - type_embedding:         4 × 64       =     256   # 4 non-EMPTY EventTypes
+  - tile_embedding:        37 × 64       =   2,368
+  - tsumogiri_embedding:    1 × 64       =      64
+  - during_naki_embedding: 71 × 64       =   4,544
+  - post_naki_embedding:  154 × 64       =   9,856   # embeddings 17,088
+  - EncoderBlock × 1:                       49,984
+      self-attention (Q, K, V, proj 64 × 64 + 64 each) 16,640
+      feed-forward (64 → 256 → 64)                     33,088
+      LayerNorm × 2                                       256
+
+Decoder:                                   126,078
+  - StateNet:                               42,168
+      suit_conv1d_1   12 × 16 × 3 + 16 =    592
+      suit_conv1d_2   16 × 16 × 3 + 16 =    784
+      honors_fc1      84 × 32 + 32     =  2,720
+      honors_fc2      32 × 16 + 16     =    528
+      reds_fc         36 × 8 + 8       =    296
+      fc_main_1      516 × 64 + 64     = 33,088
+      fc_main_2       64 × 64 + 64     =  4,160
+  - DecoderBlock × 1:                       66,752
+      cross-attention 1                    16,640
+      cross-attention 2                    16,640
+      feed-forward (64 → 256 → 64)         33,088
+      LayerNorm × 3                           384
+  - ln_f + heads:                           17,158
+      ln_f            64 × 2           =    128
+      discard_head    64 × 37 + 37     =  2,405
+      during_head     64 × 71 + 71     =  4,615
+      post_head       64 × 154 + 154   = 10,010
+
+Total: 193,150 parameters (all trainable; position / player codings are buffers)
 ```
 
 ## Usage Example
 
 ```python
 import torch
-from MahjongAI.agents.transformer_conv import TransformerConvModel
+from MahjongAI.agents.archive.transformer_conv import TransformerConvModel
 
 # Initialize model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = TransformerConvModel().to(device)
 
 # Print parameter count
-print(f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params")
+print(sum(p.numel() for p in model.parameters()))  # 193150
 
 # Training mode
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 model.train()
-for logits, loss in model(all_halfturns_list, all_encoding_tokens_list, sample=True):
-    # logits: (B, num_actions) - varies by head
-    # loss: scalar tensor
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
+results = model(all_halfturns_list, all_encoding_tokens_list, sample=True)  # {head: (logits, loss)}
+# logits: (B, num_actions) masked logits, varies by head; loss: scalar tensor; a head without samples is absent
+optimizer.zero_grad()
+sum(loss for _, loss in results.values()).backward()
+optimizer.step()
 
 # Inference mode (would require additional inference wrapper)
 model.eval()
 with torch.no_grad():
     # Process single game state
-    # Returns action probabilities
+    # Returns masked logits (softmax gives action probabilities)
     pass
 ```
 
@@ -945,29 +979,14 @@ The suit-aware architecture respects tile semantics:
 **This is a breaking architectural change.** Models trained with the old flat Conv2d architecture are **not compatible** with this suit-aware version.
 
 To use this architecture:
-1. Train a new model from scratch using the updated `transformer_conv.py`
+1. Train a new model from scratch using `archive/transformer_conv.py` (after the port in the status note above)
 2. Compare performance against baseline on held-out test data
 3. Expected improvements: Better generalization on chi/sequence detection
 
 ### Retraining Guide
 
-```bash
-# Backup old model if exists
-mv path/to/trained_model.pth path/to/trained_model_old_architecture.pth
-
-# Train new suit-aware model
-python MahjongAI/supervised_learning.py \
-    --model transformer_conv \
-    --epochs 100 \
-    --batch_size 256 \
-    --learning_rate 0.001 \
-    --save_path models/transformer_conv_suit_aware.pth
-
-# To prepare a baseline: checkout the commit before the suit-aware change, train, restore
-git checkout <commit_before_suit_aware> -- MahjongAI/agents/transformer_conv.py
-python MahjongAI/supervised_learning.py --model transformer_conv --save_path models/transformer_conv_baseline.pth
-git checkout HEAD -- MahjongAI/agents/transformer_conv.py
-```
+The training CLI is `python -m MahjongAI.supervised_learning encoder_conv <max_steps> [--run-dir ...]`; it trains
+only `encoder_conv`. To train this model, port it first and wire it into `train()` (status note at the top).
 
 **Key metrics to compare** (evaluate both on the same held-out test set):
 - Overall accuracy: Discard / during / post decision accuracy
@@ -977,7 +996,7 @@ git checkout HEAD -- MahjongAI/agents/transformer_conv.py
 **Breaking changes summary:**
 - Model checkpoint incompatibility: old trained models cannot be loaded
 - StateNet interface is unchanged (same x1/x2/x3 input/output shapes), so the data pipeline needs no changes
-- Total parameter count remains similar (~0.7M)
+- Total parameter count: 193,150 (measured)
 - Training hyperparameters can remain the same
 
 ### Implementation Notes
@@ -988,7 +1007,8 @@ git checkout HEAD -- MahjongAI/agents/transformer_conv.py
 - Can be increased to 5 or 7 for a wider receptive field if needed
 
 **Pooling Choice (global mean pooling over ranks)**
-- Translation invariant: rank pattern 5-6-7 treated same as 1-2-3
+- Not exactly translation invariant: zero padding treats the rank edges differently, and the raw x1 path keeps
+  absolute ranks, so 1-2-3 and 5-6-7 need not give the same features
 - Could use max pooling or attention pooling for different inductive bias
 
 **Suit Aggregation (mean across 3 suits)**
@@ -1005,16 +1025,16 @@ This repository contains multiple model variants:
 
 | Model | File | Key Differences |
 |-------|------|-----------------|
-| **TransformerConv** | `transformer_conv.py` | Suit-aware hybrid model (this document) |
-| Transformer | `transformer.py` | No CNN - direct state tensor processing |
-| TransformerConvLarge | `transformer_conv_large.py` | Larger embedding dimensions and more layers |
-| TransformerConvOrdered | `transformer_conv_ordered.py` | Ordered player encoding, different masking |
+| **EncoderConv** (live) | `encoder_conv.py` | The trained model: 201,311 parameters, current inputs, per-head output |
+| **TransformerConv** | `archive/transformer_conv.py` | Suit-aware hybrid model (this document) |
+| Transformer | `archive/transformer.py` | StateNet: Conv1d over the flat 37 tile indices (3 → 8 → 16 channels) + FC |
+| TransformerConvLarge | `archive/transformer_conv_large.py` | StateNet: Conv2d 3×3 over the flat (37, 4) tile tensor; layer count a constructor argument |
+| TransformerConvOrdered | `archive/transformer_conv_ordered.py` | Player index relative to the acting player; StateNet Conv2d over the flat tile tensor |
 
 The **TransformerConv** model balances:
 - Architectural complexity (suit-aware CNN+Transformer)
-- Model size (~0.7M params)
+- Model size (193,150 parameters)
 - Training efficiency (single layer)
-- Generalization (relative player encoding)
 - **Semantic alignment** (convolution respects Mahjong tile structure)
 
 ## References and Further Reading
@@ -1031,9 +1051,9 @@ The **TransformerConv** model balances:
 
 ### Implementation Details
 - **PyTorch**: All models implemented in PyTorch
-- **Supervised Learning**: Trained on expert game records (haifu)
+- **Supervised Learning**: Written for expert game records (haifu); this model was not trained in the current pipeline
 - **Data Processing**: `process_xml.py` converts XML game logs to training data
 
 ---
 
-**Note**: This documentation describes the architecture as of the current implementation. For the most up-to-date code, refer to `transformer_conv.py` in the repository.
+**Note**: This documentation describes the architecture as of the current implementation. For the most up-to-date code, refer to `MahjongAI/agents/archive/transformer_conv.py`.

@@ -1,3 +1,4 @@
+import hashlib
 import os
 import random
 from collections import Counter
@@ -10,12 +11,47 @@ class UnexpectedSkip(RuntimeError):
     the game, so a run that saves its state and resumes does not meet it again."""
 
 
+def epoch_order(files: list, seed, epoch: int) -> list:
+    """The read order of `files` (pass them sorted) in epoch `epoch`: shuffled by random.Random(seed) in epoch 0
+    (the pre-T-045 order) and by random.Random(f"{seed}/epoch{epoch}") from epoch 1 on. A str seed is hashed with
+    SHA-512, so the order is the same in every process. seed=None keeps the sorted, date-ordered list."""
+    files = list(files)
+    if seed is not None:
+        random.Random(seed if epoch == 0 else f"{seed}/epoch{epoch}").shuffle(files)
+    return files
+
+
+def expected_accepted_left(left: int, accepted: int, skipped: int) -> float:
+    """A loader's expected accepted games left: its files left times its run acceptance rate, smoothed so a loader
+    that has read nothing yet counts at 0.5. The cluster draws each batch's loader with this weight."""
+    return left * (accepted + 1) / (accepted + skipped + 2)
+
+
+def draw_index(weights: list, seed, k: int) -> int:
+    """Draw k: an index drawn with probability weights[i] / sum(weights), from random.Random(f"{seed}/draw{k}").
+    Stateless, so a resume continues the sequence from k alone. A zero weight is never drawn."""
+    total = sum(weights)
+    assert total > 0, f"no positive weight in {weights}"
+    r = random.Random(f"{seed}/draw{k}").random() * total
+    cumulative, last = 0.0, None
+    for i, w in enumerate(weights):
+        if w > 0:
+            cumulative += w
+            last = i
+            if r < cumulative:
+                return i
+    return last  # r rounded up to the total
+
+
 class DataLoader:
     """Yields batches of parsed games from every `*.log` under `path`.
 
     Layout assumed: <path>/<day>/<day>_<nn>/<game>.log, so a game's day is its second parent directory.
     days / exclude_days: keep only, or drop, the games of those day directories (the train/val split).
-    seed: shuffle the file list once with this seed (None keeps the sorted, date-ordered list).
+    seed: the read order of each epoch, `epoch_order` (None keeps the sorted, date-ordered list).
+    file_list: the current epoch's read order (`file_list[current_index - 1]` is the last file read).
+    epoch: epochs started before this one; `next_epoch()` starts the next one with a new order of the same files.
+    accepted: games returned in batches, whole run (with `skipped`, the cluster's estimate of the acceptance rate).
     Games that fail to parse are counted in `skipped` (key "invalid:<reason>" or the exception's type name).
     expected_skips: None counts every skip and continues; a set of keys raises UnexpectedSkip on any other key.
     logged_skips: keys whose skipped file is also reported through `log_func` (a parse error always is).
@@ -39,9 +75,10 @@ class DataLoader:
         if exclude_days is not None:
             drop = set(exclude_days)
             self.file_list = [f for f in self.file_list if self.day_of(f) not in drop]
-        if seed is not None:
-            random.Random(seed).shuffle(self.file_list)
+        self.file_list = epoch_order(self.file_list, seed, 0)
         self.seed = seed
+        self.epoch = 0
+        self.accepted = 0
         self.current_index = 0
         self.batch_size = batch_size
         self.batch_count = 0
@@ -95,6 +132,7 @@ class DataLoader:
             files.append(filename)
 
         self.last_batch_files = files
+        self.accepted += len(files)
         return all_halfturns_list, all_encoding_tokens_list
 
     def _skip(self, filename: str, key: str, error: Exception):
@@ -104,40 +142,76 @@ class DataLoader:
         if self.expected_skips is not None and key not in self.expected_skips:
             raise UnexpectedSkip(f"unexpected skip {key!r} of {filename}: {str(error)[:200]}") from error
 
-    def reset(self):
-        """Resets the dataloader's current index for re-iteration."""
+    def left(self) -> int:
+        """Files not read yet in this epoch, plus the pending good games of a cut batch."""
+        return len(self.file_list) - self.current_index + len(self.pending)
+
+    def next_epoch(self):
+        """Starts the next epoch: the same files (re-sorted, no new walk of the disk) in that epoch's order."""
+        assert not self.pending, f"next_epoch() with pending games {self.pending}: they would be lost"
+        self.epoch += 1
         self.current_index = 0
-        self.pending = []
+        self.file_list = epoch_order(sorted(self.file_list), self.seed, self.epoch)
+
+    def order_sha256(self) -> str:
+        """Hash of the current read order (paths relative to `path`)."""
+        h = hashlib.sha256()
+        for f in self.file_list:
+            h.update(os.path.relpath(f, self.path).encode() + b"\n")
+        return h.hexdigest()
 
     def state_dict(self) -> dict:
         return {"current_index": self.current_index, "seed": self.seed, "n_files": len(self.file_list),
-                "skipped": dict(self.skipped), "pending": [os.path.relpath(f, self.path) for f in self.pending]}
+                "skipped": dict(self.skipped), "pending": [os.path.relpath(f, self.path) for f in self.pending],
+                "epoch": self.epoch, "accepted": self.accepted, "order_sha256": self.order_sha256()}
 
     def load_state_dict(self, state: dict):
+        """Restores a state_dict() onto a loader built with the same arguments. Epoch 0 keeps this loader's order
+        (a caller may have set file_list); a later epoch rebuilds that epoch's order. A state written before T-045
+        (no "epoch" / "accepted" / "order_sha256") loads as epoch 0, accepted 0, with no order check."""
         assert state["seed"] == self.seed and state["n_files"] == len(self.file_list), (
             f"checkpoint loader state {state} does not match this loader (seed={self.seed}, n_files={len(self.file_list)})"
         )
+        epoch = state.get("epoch", 0)
+        if epoch >= 1:
+            self.file_list = epoch_order(sorted(self.file_list), self.seed, epoch)
+        if "order_sha256" in state:
+            assert state["order_sha256"] == self.order_sha256(), (
+                f"checkpoint loader order {state['order_sha256']} != this loader's epoch-{epoch} order "
+                f"{self.order_sha256()}: the files or their order changed"
+            )
+        self.epoch = epoch
+        self.accepted = state.get("accepted", 0)
         self.current_index = state["current_index"]
         self.skipped = Counter(state.get("skipped", {}))  # counts of the games before the checkpoint
         self.pending = [os.path.join(self.path, f) for f in state.get("pending", [])]
 
     def __repr__(self):
-        return f"DataLoader(path={self.path}, batch_size={self.batch_size}, n_files={len(self.file_list)}, seed={self.seed})"
+        return (f"DataLoader(path={self.path}, batch_size={self.batch_size}, n_files={len(self.file_list)}, "
+                f"seed={self.seed}, epoch={self.epoch})")
 
 
 class DataLoaderCluster:
-    """Cycles through a list of DataLoaders indefinitely.
+    """Yields batches from a list of DataLoaders (one per year) indefinitely, the years mixed.
 
-    When a DataLoader is exhausted, it is reset and the cluster advances
-    to the next one. When all DataLoaders are exhausted, it wraps back
-    to the first, so __next__ never raises StopIteration — unless every
-    single DataLoader is empty, in which case a RuntimeError is raised
-    immediately to avoid an infinite spin.
+    Each batch comes from one loader, drawn by `draw_index` with weight `expected_accepted_left`, so every
+    loader's share of the accepted games left stays about constant and the loaders finish an epoch together.
+    A loader with nothing left is never drawn. With one loader no draw is made.
+    When every loader has nothing left, every loader starts its next epoch (a new order) and so does the cluster.
+    If every file list is empty, __next__ raises RuntimeError instead of spinning.
+    A batch can be empty (every game of it skipped); it is returned as is.
+    idx: the loader of the batch last returned. draws: draws made so far (the counter of the next draw's seed).
     """
 
-    def __init__(self, dataloaders: list):
+    def __init__(self, dataloaders: list, seed=0):
+        assert dataloaders, "DataLoaderCluster needs at least one DataLoader"
+        assert len({dl.batch_size for dl in dataloaders}) == 1, (
+            f"loaders of one cluster need one batch_size: {[dl.batch_size for dl in dataloaders]}")
         self.dataloaders = dataloaders
+        self.seed = seed
         self.idx = 0
+        self.draws = 0
+        self.epoch = 0
         # Warn early if any loader found no files.
         for dl in dataloaders:
             if not dl.file_list:
@@ -147,9 +221,20 @@ class DataLoaderCluster:
         return self
 
     def state_dict(self) -> dict:
-        return {"idx": self.idx, "loaders": [dl.state_dict() for dl in self.dataloaders]}
+        return {"seed": self.seed, "idx": self.idx, "draws": self.draws, "epoch": self.epoch,
+                "loaders": [dl.state_dict() for dl in self.dataloaders]}
 
     def load_state_dict(self, state: dict):
+        """A state written before T-045 (no "draws") loads only for one loader: its position keeps its meaning."""
+        assert len(state["loaders"]) == len(self.dataloaders), (
+            f"checkpoint has {len(state['loaders'])} loaders, this cluster {len(self.dataloaders)}")
+        if "draws" in state:
+            assert state["seed"] == self.seed, f"checkpoint cluster seed {state['seed']} != {self.seed}"
+            self.draws, self.epoch = state["draws"], state["epoch"]
+        else:
+            assert len(self.dataloaders) == 1, (
+                "a pre-T-045 cluster state of several loaders (year by year) has no position in the mixed order")
+            self.draws, self.epoch = 0, 0
         self.idx = state["idx"]
         for dl, s in zip(self.dataloaders, state["loaders"]):
             dl.load_state_dict(s)
@@ -163,18 +248,20 @@ class DataLoaderCluster:
         return self.dataloaders[self.idx].last_batch_files
 
     def __next__(self):
-        # An exhausted loader is reset and the NEXT loader is tried; with one loader that is the same
-        # loader again, so allow len + 1 attempts. The cluster is empty only if every loader raises
-        # StopIteration on a fresh pass.
-        attempts = 0
-        while attempts <= len(self.dataloaders):
-            try:
-                return next(self.dataloaders[self.idx])
-            except StopIteration:
-                self.dataloaders[self.idx].reset()
-                self.idx = (self.idx + 1) % len(self.dataloaders)
-                attempts += 1
-        raise RuntimeError(
-            "DataLoaderCluster: all dataloaders are empty. "
-            "Check that your data paths exist and contain .log files."
-        )
+        if not any(dl.file_list for dl in self.dataloaders):
+            raise RuntimeError(
+                "DataLoaderCluster: all dataloaders are empty. "
+                "Check that your data paths exist and contain .log files."
+            )
+        if all(dl.left() == 0 for dl in self.dataloaders):
+            for dl in self.dataloaders:
+                dl.next_epoch()
+            self.epoch += 1
+        if len(self.dataloaders) == 1:
+            self.idx = 0
+        else:
+            weights = [expected_accepted_left(dl.left(), dl.accepted, sum(dl.skipped.values()))
+                       for dl in self.dataloaders]
+            self.idx = draw_index(weights, self.seed, self.draws)
+            self.draws += 1
+        return next(self.dataloaders[self.idx])

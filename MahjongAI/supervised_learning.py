@@ -36,7 +36,9 @@ DATA_ROOT = _PACKAGE_DIR / "data" / "processed"
 HEADS = ("during", "discard", "post")
 learning_rate = 1e-3
 TRAIN_YEARS = (2021,)
-DATA_SEED = 0  # training file order; the loader position is in the checkpoint, so a resume continues where it stopped
+# file order, year interleave and per-epoch reshuffle; the loader position is in the checkpoint, so a resume
+# continues where it stopped
+DATA_SEED = 0
 MODEL_SEED = 0  # torch.manual_seed before the model is built
 TORCH_THREADS = 10
 VAL_YEAR = "2022"  # time-forward validation: the week after the training year
@@ -263,7 +265,9 @@ class Metrics:
 
 
 def train_files_sha256(cluster: DataLoaderCluster) -> str:
-    """Hash of every training file path (relative to its loader root), in loader order."""
+    """Hash of every training file path (relative to its loader root), in loader order. Called on fresh loaders,
+    before a checkpoint's loader state is loaded, so it hashes the epoch-0 order: the run identity, whatever epoch
+    a resume continues in."""
     h = hashlib.sha256()
     for dl in cluster.dataloaders:
         for f in dl.file_list:
@@ -310,7 +314,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
                    logged_skips=LOGGED_SKIPS)
         for yr in TRAIN_YEARS
     ]
-    cluster = DataLoaderCluster(dataloaders)
+    cluster = DataLoaderCluster(dataloaders, seed=DATA_SEED)
     val = ValSet.load(log)
     train_ids = {os.path.basename(f) for dl in dataloaders for f in dl.file_list}
     assert not train_ids & set(val.ids), f"train and validation games overlap: {sorted(train_ids & set(val.ids))[:5]}"
@@ -520,7 +524,8 @@ def parse_expect_prior_ce(text: str):
 if __name__ == "__main__":
     valid_models = [
         "encoder_conv",
-        # transformer_conv.py is archived: it returns (logits, loss) tuples and reads the old inputs (plan T-013)
+        # transformer_conv is archived (agents/archive/transformer_conv.py): it returns (logits, loss) tuples and
+        # reads the old inputs (plan T-013)
     ]
 
     parser = argparse.ArgumentParser(description="Train a MahjongAI model.")
