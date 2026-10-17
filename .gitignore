@@ -171,3 +171,9 @@ saved_models/
 
 # test fixtures are real Tenhou logs: keep them tracked despite *.log above
 !MahjongAI/tests/data/**/*.log
+
+# macOS Finder metadata
+.DS_Store
+
+# Local task tracking (not versioned)
+task/
