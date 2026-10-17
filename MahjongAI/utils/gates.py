@@ -125,6 +125,7 @@ import os
 import random
 import re
 import sys
+import types
 from unittest import mock
 
 import numpy as np
@@ -276,8 +277,9 @@ GATE_ONLY = {
 # T-041: gate names no corruption can fail, each with its reason. Empty: every gate has a corruption. The self-test
 # reports an entry that a corruption covers, or that failed_gates cannot return.
 UNTESTED_GATES = {}
-# the module globals the self-test's spy replaces (left out of gate_fingerprint)
-WATCHED = ("count_game", "process")
+# the module globals the self-test's spy replaces (left out of gate_fingerprint): every entry point a corruption's
+# counters pass through (the parse, the per-game count, the index check run() / _count / row 32 call directly)
+WATCHED = ("count_game", "process", "index_checks")
 Snap = collections.namedtuple("Snap", ["hands", "melds", "draws_left", "scores", "reaches", "last_draw", "actor", "tile",
                                        "window", "own_draws", "called", "doras", "seen", "wall_out", "ids", "discards",
                                        "honba", "kyotaku", "oya", "seed0", "n_rounds", "rinshan", "n_tokens"])
@@ -1688,9 +1690,10 @@ def run(files, tp=None):
 def failed_gates(C) -> dict:
     """{gate: offending value} for every gate that fails; empty when all pass.
     Contract (T-041; gate_names() reads the gate names off this function by probing it, and test_gates.py enforces
-    the contract on its AST): every gate is `counter expression != counter expression` (integer coefficients below
-    500 in size), `C[x] != 0` / a truth test on C[x], or `C[x] == 0`. The only numeric literal a comparison may hold
-    is 0, and the only comparison operators are ==, != (and `in` on names)."""
+    the contract on its AST): every write of a gate name sits under ONE guard (an `if`, or a dict comprehension's
+    single `if`; no nesting, no else, no `and`), and the guard is `lin == lin`, `lin != lin`, a truth test on C[x], or
+    an `or` of these. lin: C[x] reads (no C.get) joined by + / -, times int literals (effective coefficient below 500
+    in size), sum() over a generator of such; a literal side is exactly 0. `if "<k>" in bad` may only rewrite bad[k]."""
     bad = {}
     if C["games"] == 0:
         bad["games"] = "no game parsed"
@@ -1828,24 +1831,46 @@ def gate_fingerprint() -> dict:
     """{module.attribute: (id, shallow copy of a dict / list / set / tuple value)} of every global of the gate code
     (this module, win_oracles, legal_oracles), WATCHED left out. A patch of a gate function or oracle, or an edit of a
     module-level table, changes it; a patch of the parser, the builder, a parse object or the mahjong library does
-    not. Shallow: a mutation inside an oracle object (a class attribute, an instance) is not seen."""
+    not. A table imported from the library (YAKU_ID_TO_TENHOU_ID) is the library's object, shared with the parser:
+    its id is kept (a rebinding is gate code) but not its contents (an edit is a library patch). Shallow: a mutation
+    inside an oracle object (a class attribute, an instance) is not seen."""
     me = sys.modules[__name__]
+    library = {id(v) for name, m in list(sys.modules.items()) if m is not None and name.split(".")[0] == "mahjong"
+               for v in vars(m).values()}
     out = {}
     for mod in (me, win_oracles, legal_oracles):
         for k, v in vars(mod).items():
             if k.startswith("__") or (mod is me and k in WATCHED):
                 continue
-            out[f"{mod.__name__}.{k}"] = (id(v), copy.copy(v) if isinstance(v, (dict, list, set, tuple)) else None)
+            own = isinstance(v, (dict, list, set, tuple)) and id(v) not in library
+            out[f"{mod.__name__}.{k}"] = (id(v), copy.copy(v) if own else None)
     return out
+
+
+class _WatchedModule(types.ModuleType):
+    """The gate modules' class while watch_gate_code runs: a rebinding of any module global (mock.patch.object,
+    setattr, del) marks the run gate-side at once, even when the patch is undone before the next comparison."""
+    touched = []
+
+    def __setattr__(self, k, v):
+        if k != "__class__":  # watch_gate_code's own restore
+            _WatchedModule.touched.append(k)
+        super().__setattr__(k, v)
+
+    def __delattr__(self, k):
+        _WatchedModule.touched.append(k)
+        super().__delattr__(k)
 
 
 @contextlib.contextmanager
 def watch_gate_code():
-    """T-041 (b): decide at run time whether a corruption patches gate code. While active, count_game and process run
-    behind a spy that compares gate_fingerprint() with its value at entry at EVERY call; yields (check, touched):
-    check() compares once more on demand (a corruption with no count call), touched is non-empty once any comparison
-    differed. Limits: a gate patch entered and left entirely inside one count_game / process call is not seen, nor
-    is a mutation inside an oracle object (gate_fingerprint is shallow)."""
+    """T-041 (b): decide at run time whether a corruption patches gate code. While active, (1) a rebinding of any
+    global of the gate code (this module, win_oracles, legal_oracles; a patched function, a replaced WATCHED entry
+    point, a swapped table) marks the run gate-side when it happens, and (2) the WATCHED entry points (process,
+    count_game, index_checks) run behind a spy that compares gate_fingerprint() with its value at entry at EVERY call
+    (an in-place table edit). Yields (check, touched): check() compares once more on demand (a corruption with no
+    such call), touched is non-empty once either route fired. Limits: an in-place table edit made and undone inside
+    one WATCHED call is not seen, nor is a mutation inside an oracle object (gate_fingerprint is shallow)."""
     me = sys.modules[__name__]
     f0, touched = gate_fingerprint(), []
 
@@ -1862,9 +1887,16 @@ def watch_gate_code():
     saved = {k: getattr(me, k) for k in WATCHED}
     for k, fn in saved.items():
         setattr(me, k, spy(fn))
+    mods = (me, win_oracles, legal_oracles)
+    _WatchedModule.touched = touched
+    for mod in mods:
+        mod.__class__ = _WatchedModule
     try:
         yield check, touched
     finally:
+        _WatchedModule.touched = []
+        for mod in mods:
+            mod.__class__ = types.ModuleType
         for k, fn in saved.items():
             setattr(me, k, fn)
 
@@ -2188,8 +2220,8 @@ def self_test():
         game is counted. gate: one gate name or a tuple of names, every one of which must fail. absent: gates that
         must NOT fail (the corruption is invisible to them). fields: state_xml_<field> counters that must be > 0
         (the named STATE fields drifted). The side of the corruption (T-041) is decided by watch_gate_code, never
-        by hand: 'gate' when gate code differed at any count / parse call or right after corrupt returned (inside
-        its context), else 'parser'; record() files it for every named gate."""
+        by hand: 'gate' when gate code differed at any WATCHED call (parse, count, index check) or right after
+        corrupt returned (inside its context), else 'parser'; record() files it for every named gate."""
         gates = (gate,) if isinstance(gate, str) else gate
         baseline = failed_gates(clean_count(game))
         if baseline:
@@ -3636,7 +3668,8 @@ def resolve_days(year, days, seed, root) -> list:
         return list(DEFAULT_POOL[year])
     year_dir = os.path.join(root, year)
     found = sorted(d for d in (os.listdir(year_dir) if os.path.isdir(year_dir) else [])
-                   if len(d) == 8 and d.isdigit() and d.startswith(year))
+                   if len(d) == 8 and d.isdigit() and d.startswith(year)
+                   and os.path.isdir(os.path.join(year_dir, d)))
     if not found:
         raise SystemExit(f"--year {year}: no day directory under {year_dir}")
     return sorted(random.Random(seed).sample(found, min(OUTSIDE_POOL_DAYS, len(found))))
