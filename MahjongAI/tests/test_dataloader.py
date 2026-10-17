@@ -248,6 +248,8 @@ def test_cluster_epochs_mix_the_loaders_and_resume():
     idx0 = [i for epoch, _, i, fs in rows if epoch == 0 and fs]
     assert idx0 != sorted(idx0), f"epoch 0 read the loaders one after the other: {idx0}"
     assert skips_at_end == {0: 1, 1: 2}  # the rejected file once per epoch
+    assert [dl.accepted for dl in cluster.dataloaders] == [
+        sum(len(fs) for _, _, i, fs in rows if i == k) for k in (0, 1)]  # games returned, whole run
 
     # resume mid epoch 1 (its order is rebuilt on load) through a weights_only checkpoint
     cluster = make()
