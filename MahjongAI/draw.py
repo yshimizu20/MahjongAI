@@ -14,10 +14,11 @@ class Naki(Draw):
 
     A LOG code (`Naki(m)` from the XML) names the real 136-id tiles. An OFFERED code (built by a `from_*_info`
     constructor or `kakan_of` for a call the parser offers, `offered=True`) is exact in what the model and the gates
-    read: the kind, the action index, the called position, from_who, and whether a red five is taken from the hand
-    or called. It does NOT name which plain copy of a kind leaves the hand (the 37-count hand tensors cannot say);
-    only a kakan built by `kakan_of` from a log pon is the exact log code. So an offered code is never applied to a
-    hand: `get_exposed` raises on it; apply the executed call's log code instead.
+    read: the kind, the action index, from_who, and whether a red five is taken from the hand or called (a chi also
+    keeps its called position; a pon's called position bits can differ from the log's). It does NOT name which plain
+    copy of a kind leaves the hand (the 37-count hand tensors cannot say); only a kakan built by `kakan_of` from a
+    log pon is the exact log code. So an offered code is never applied to a hand: `get_exposed` raises on it; apply
+    the executed call's log code instead.
     """
 
     @staticmethod

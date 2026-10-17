@@ -85,9 +85,10 @@ def test_multi_shape_chi():
 
 def test_only_the_shimocha_gets_chi():
     hand = [8, 12, 20, 24]
-    offers = _offers({0: hand, 1: hand, 2: hand, 3: hand}, 17)
+    offers = _offers({0: hand + [18, 19], 1: hand, 2: hand, 3: hand}, 17)
     assert _indices(offers[1]) == [10, 12, 14]
-    assert offers[0] == offers[2] == offers[3] == []  # the discarder gets nothing, the others have no pair
+    # the discarder gets nothing although it holds a 5m pair; the others have no pair
+    assert offers[0] == offers[2] == offers[3] == []
 
 
 def test_red_daiminkan_calls_the_red_five():
