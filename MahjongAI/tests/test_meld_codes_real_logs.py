@@ -93,7 +93,7 @@ def replay_melds(raw):
 
 def test_log_melds_replay():
     files = sorted(glob.glob(os.path.join(GATE_GAMES, "**", "*.log"), recursive=True))
-    assert len(files) == 41, len(files)
+    assert len(files) == 47, len(files)  # 41 + the 6 T-043 / T-044 fixtures
     kinds, anomalies = collections.Counter(), {}
     for f in files:
         k, a = replay_melds(open(f, "rb").read().decode("utf-8", "ignore"))
