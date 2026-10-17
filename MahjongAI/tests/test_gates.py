@@ -342,6 +342,18 @@ def test_wind_ids_by_library(seat, rnd, expected):  # pon West + 123m 789p 456s 
     assert lib == expected and exists
 
 
+def test_every_wind_id_by_library():  # every SeatWind* / RoundWind* class through the library's own id map
+    bad = []
+    for pon_wind in (E, S, W, N):
+        for seat in (E, S, W, N):
+            for rnd in (E, S, W, N):  # North round: never played on Tenhou, but the library maps it to 17
+                expected = ({10 + seat - E} if pon_wind == seat else set()) | ({14 + rnd - E} if pon_wind == rnd else set())
+                exists, lib = _both("23m 1m 789p 456s 99s", 0, False, (pon_wind,), seat, rnd)
+                if lib != expected or exists != bool(expected):
+                    bad.append((pon_wind, seat, rnd, sorted(lib), exists))
+    assert not bad, bad
+
+
 def test_chinroutou_through_both_adapters():  # Tenhou id 44: no hand in the library differential hit it
     concealed = np.bincount(_kinds("111p 999p 11s"), minlength=34)
     melds = [Naki.from_pon_info(0, 0, False, 1), Naki.from_pon_info(8, 0, False, 1)]  # pon 1m, pon 9m
