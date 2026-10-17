@@ -37,7 +37,8 @@ class GateResult:
     passed: bool
 
     def line(self) -> str:
-        return (f"{self.gate}: {'PASS' if self.passed else 'FAIL'} | Δ {self.delta:+.4f} (need >= {self.margin:.2f}) | "
+        need = f" (need >= {self.margin:.2f})" if self.gate.startswith("G1") else ""
+        return (f"{self.gate}: {'PASS' if self.passed else 'FAIL'} | Δ {self.delta:+.4f}{need} | "
                 f"bootstrap 2.5% {self.q025:+.4f} (need > 0) | n {self.n}")
 
 

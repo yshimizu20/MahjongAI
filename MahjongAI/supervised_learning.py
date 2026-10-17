@@ -203,6 +203,11 @@ def baseline_header(val: ValSet, bias: dict) -> dict:
     return out
 
 
+def _flat(ref) -> list:
+    """Per-game rows of a header reference (a {head: rows} dict or a rows list), heads in HEADS order."""
+    return [r for h in HEADS for r in ref[h]] if isinstance(ref, dict) else list(ref)
+
+
 def pooled(rows, nll_col=2):
     """Sum-ratio mean over per-game rows [id, n, value, ...]: Σ value / Σ n."""
     n = sum(r[1] for r in rows)
@@ -322,7 +327,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     def identity(c: dict) -> dict:  # total_steps may change on a resume (a run extended past its budget)
         return {k: v for k, v in c.items() if k != "total_steps"}
 
-    current_step, rows = 0, []
+    current_step, rows, header = 0, [], None
     train_sums = {h: [0.0, 0] for h in HEADS}  # train-mode batch loss x n, n; since the last eval row
     latest_step, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
     if latest_checkpoint:
@@ -358,6 +363,13 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
         bias = fit_prior(log)
 
     baselines = baseline_header(val, bias)
+    if header is not None:  # a resume: the rows to come must be paired with the same per-game references
+        changed = {k: sorted({a[0] for a, b in zip(_flat(header[k]), _flat(baselines[k])) if a != b})
+                   for k in ("uniform", "prior", "shanten_greedy")}
+        assert not any(changed.values()), (
+            f"validation references differ from the {metrics.path} header (games {changed}): the val tensors changed "
+            "since the run started (parser / tensor fix?); restart from step 0 with a new run dir")
+        log("resume check: per-game uniform / prior / shanten-greedy references equal the header's")
     prior_ce = {h: pooled(baselines["prior"][h]) for h in HEADS}
     uniform_ce = {h: pooled(baselines["uniform"][h]) for h in HEADS}
     sg = baselines["shanten_greedy"]
