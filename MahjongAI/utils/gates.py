@@ -53,7 +53,8 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           (xml_rounds, one replay per round, melds decoded by legal_oracles.decode_meld, never Naki): the 37-slot
           hand, every seat's melds, the drawn tile, the live draws left, the scores, the riichi seats, the menzen
           flags, every seat's discard planes (sutehai, both slots of a red five), the dealer, honba, kyotaku,
-          rounds_remaining, parent_rounds_remaining, the state's player, the turn's own player (state_xml_turn_player)
+          rounds_remaining, parent_rounds_remaining (both counted from the regular schedule [seed0, n_rounds): 0 in
+          an extension round, T-039), the state's player, the turn's own player (state_xml_turn_player)
           and its history length (encoding_idx).
           One counter per field (state_xml_<field>). The option, win and action oracles below read only that replay.
   ACTIONS every executed during / post action of the parser == the XML answer at the same decision point (the
@@ -99,6 +100,12 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           the StateObject (round_wind_xml); every built row is checked (round_wind_coverage). A North round
           (seed[0] >= 12) is rejected by the parser and counted (skipped_invalid_north, path printed)
   T-046   a kan / riichi right after the actor's own discard: rejected (skipped_invalid_after_own_discard, path)
+  T-043   a seat with AUTO_PLAY_RUN_ORACLE consecutive tsumogiri discards outside riichi (no call, riichi, win, yao9
+          or ron3 of its own in between, across rounds; auto_play_runs): the game is rejected
+          (skipped_invalid_auto_played, path printed); an accepted game with one fails auto_played_accepted
+  T-044   a game with a <BYE>: only the rounds that end before the first BYE are kept (kept_xml); every XML count,
+          the replay and the round-count assert see the kept part only (bye_truncated_games); no round kept:
+          rejected "BYE" (skipped_invalid_bye)
 """
 import argparse
 import collections
@@ -179,6 +186,19 @@ HANCHAN_WEST_LOG = ("20210101", "2021010100gm-00a9-0000-0af99d68.log", r'<GO typ
 AFTER_OWN_DISCARD_LOGS = [("20220106", "2022010616gm-00a9-0000-d4d83e3e.log", r'<U88/><E88/><N who="1" m="34834"'),
                           ("20200719", "2020071919gm-00a9-0000-a0a61b0b.log", r'<V124/><F82/><N who="2" m="31744"'),
                           ("20220512", "2022051222gm-00a9-0000-b02c0edb.log", r'<W100/><G100/><REACH who="3" step="1"/>')]
+# T-043 auto-played seats, T-044 BYE games (day, file, regex). NO_BYE: Tenhou writes no <BYE> for an auto-played seat
+NO_BYE = r'\A(?![\s\S]*<BYE\b)'
+AUTO_PLAYED_LOGS = [  # a seat with a tsumogiri run >= 25 outside riichi: rejected "Auto-played seat"
+    ("20210626", "2021062619gm-00e1-0000-e519db09.log",  # seat 0 absent all game: 37 discards, all tsumogiri
+     r'\A(?![\s\S]*(<BYE\b|<N who="0"|<REACH who="0"|<AGARI [^>]*who="0"))'),
+    ("20210921", "2021092113gm-00e1-0000-901f5028.log", NO_BYE),  # seat 1 late join: a run of 26, then 2 actions
+    ("20210401", "2021040122gm-00a9-0000-d25d23cd.log", NO_BYE)]  # seat 1 idle mid-game: a run of exactly 25
+RUN_24_LOG = ("20210201", "2021020100gm-00e1-0000-4e2b8f59.log", NO_BYE)  # longest run 24 (seat 2): accepted
+BYE_MID_LOG = ("20211120", "2021112020gm-00a9-0000-8c7c1c3f.log", r'<[TUVW]\d+/><BYE who="\d"')  # BYE in round 3
+BYE_BETWEEN_LOG = ("20211221", "2021122100gm-00a9-0000-8ea24988.log",  # BYE between rounds 2 and 3
+                   r'<AGARI [^>]*/><BYE who="\d" /><INIT ')
+BYE_ZERO_LOG = ("20210101", "2021010100gm-00a9-0000-1500bf1f.log", r'<BYE who="\d"')  # BYE in round 1: 0 kept
+AUTO_PLAY_RUN_ORACLE = 25  # T-043, restated (never process_xml.AUTO_PLAY_RUN)
 # T-040 fixtures (day, file, round / regex): the decision-point binding and the meld decoder
 PON_MOVED = ("20210101", "2021010100gm-00a9-0000-01e8ec31.log", 5)  # seat 2's pon 84: executed at halfturn 140, offered at 98
 RED_PON = ("20210101", "2021010100gm-00a9-0000-05d6c581.log", None)  # an executed red-from-hand pon (index 110-112)
@@ -218,6 +238,7 @@ ZERO_GATES = [
     "call_offer_without_tiles", "no_yaku_block_mismatch", "win_offer_yaku_mismatch", "yaku_exists_vs_library",
     "yaku_library_vs_tenhou", "yaku_exists_vs_tenhou", "yaku_oracle_error", "ba_vs_state", "replay_ba_mismatch",
     "pass_bit_off", "mask_not_binary", "action_xml_mismatch",
+    "auto_played_accepted",
 ]
 OPTION_RULES = ["riichi_offer_low_points", "riichi_offer_few_draws", "riichi_offer_after_kan4", "riichi_okurikan_offer",
                 "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
@@ -534,8 +555,7 @@ def xml_rounds(raw: str):
     step 2: an N -> its post index for its seat, each ron AGARI -> ron for its winner (a double ron is two), a ron3
     RYUUKYOKU -> ron for all three non-discarders.
     Oracle self-checks (raise AssertionError): every id an N takes is in its owner's concealed ids; a chi / pon /
-    daiminkan calls the last discard, from the seat its from_rel names; a kakan's pon exists; in a regular round
-    (seed0 < n_rounds), (rounds_remaining + i) // 4 == the rounds of [seed0, n_rounds) dealt by seat i (j % 4 == i)."""
+    daiminkan calls the last discard, from the seat its from_rel names; a kakan's pon exists."""
     go = re.search(r'<GO type="(\d+)"', raw)
     n_rounds = 4 if go is not None and not int(go.group(1)) & 0x8 else 8
     rounds, st, r = [], None, None
@@ -591,10 +611,6 @@ def xml_rounds(raw: str):
                 for tile in map(int, _attr(attrs, f"hai{q}").split(",")):
                     give(q, tile)
                     count("wall_out", tile)
-            if seed[0] < n_rounds:  # "dealer turns left, the current one included", per seat
-                rr = n_rounds - seed[0]
-                assert [(rr + i) // 4 for i in range(4)] == [sum(1 for j in range(seed[0], n_rounds) if j % 4 == i)
-                                                             for i in range(4)], f"replay: parent rounds of {seed}"
             continue
         if tag == "AGARI":
             if r["end"] not in (None, "agari"):  # a double ron is two AGARI events
@@ -784,11 +800,11 @@ def snap_menzen(snap, q) -> bool:
 def check_state_xml(so, snap, seat, eidx, C):
     """so (the state of `seat`, history length eidx) == the XML replay: hand, melds, drawn tile, draws left, scores,
     riichi, menzen, every seat's discard presence (sutehai), the dealer one-hot, honba, kyotaku, rounds_remaining,
-    the dealer rounds left per seat (the current, unclamped definition, extension rounds included: T-039 changes gate
-    and parser together), the state's player and its history length. seat: the snap's actor for a during / discard
-    state, the responder for a post state."""
+    the dealer rounds left per seat (by counting the regular schedule [seed0, n_rounds), the current round included:
+    empty, so all 0, in an extension round; T-039), the state's player and its history length. seat: the snap's
+    actor for a during / discard state, the responder for a post state."""
     drawn = list(id_slots(snap.last_draw[1])) if snap.last_draw is not None and snap.last_draw[0] == seat else None
-    rr = snap.n_rounds - snap.seed0
+    regular = range(snap.seed0, snap.n_rounds)  # the regular rounds left, the current one included
     fields = {
         "hand": np.array_equal(np.asarray(so.hand_tensor), snap.hands[seat]),
         "melds": all(sorted(m.naki_code for m in so.melds[q]) == sorted(x.code for x in snap.melds[q]) for q in range(4)),
@@ -801,8 +817,9 @@ def check_state_xml(so, snap, seat, eidx, C):
         "dealer": np.asarray(so.parent_tensor).tolist() == [float(q == snap.oya) for q in range(4)],
         "honba": so.honba == snap.honba,
         "kyotaku": so.kyotaku == snap.kyotaku,
-        "rounds_remaining": so.rounds_remaining == rr,
-        "parent_rounds": np.asarray(so.parent_rounds_remaining).tolist() == [(rr + i) // 4 for i in range(4)],
+        "rounds_remaining": so.rounds_remaining == len(regular),
+        "parent_rounds": np.asarray(so.parent_rounds_remaining).tolist() == [sum(1 for j in regular if j % 4 == i)
+                                                                              for i in range(4)],
         "player": so.player == seat,
         "history_len": eidx == snap.n_tokens,
     }
@@ -1295,9 +1312,64 @@ def check_round_wind(head, x3, xr, tonpuu, C):
     C["round_wind_xml"] += int((x3[:, 4:7] != torch.eye(3)[wind]).any(dim=1).sum().item())
 
 
+def kept_xml(raw: str):
+    """(the kept part of the XML, truncated) under T-044: cut at the first <BYE; if the last <INIT before the cut has
+    no <AGARI / <RYUUKYOKU after it, or the text after the <BYE (<BYE> / <UN> tags skipped) starts with <AGARI (the
+    second AGARI of a double ron), cut at that <INIT too. truncated: the game has a <BYE. No <BYE: (raw, False)."""
+    b = raw.find("<BYE")
+    if b < 0:
+        return raw, False
+    cut = raw[:b]
+    last_init = cut.rfind("<INIT")
+    split = re.match(r"(?:\s*<(?:BYE|UN)\b[^>]*>)*\s*<AGARI\b", raw[b:]) is not None  # whitespace between tags too
+    if last_init >= 0 and (split or not re.search(r"<(AGARI|RYUUKYOKU)\b", cut[last_init:])):
+        cut = cut[:last_init]
+    return cut, True
+
+
+def auto_play_runs(raw: str) -> list:
+    """Per seat, the longest run of consecutive tsumogiri discards (the tile just drawn) outside riichi, counted across
+    rounds; a call (N), a riichi declaration (REACH step 1), a win (AGARI who) and a yao9 / ron3 RYUUKYOKU (the seats
+    whose hai<q> it shows) of that seat end it, as does any discard of another tile. Discards after the seat's REACH
+    step 1 are not counted. The T-043 rule restated on the XML events alone."""
+    best, run = [0] * 4, [0] * 4
+    drawn, in_riichi = [None] * 4, [False] * 4
+    for m in XML_EVENT.finditer(raw):
+        tag, attrs = m.group(1), m.group(2)
+        if tag == "INIT":
+            drawn, in_riichi = [None] * 4, [False] * 4
+        elif tag in ("DORA", "REACH", "N", "AGARI", "RYUUKYOKU"):
+            if tag == "REACH" and _attr(attrs, "step") == "1":
+                q = int(_attr(attrs, "who"))
+                run[q], in_riichi[q] = 0, True
+            elif tag == "N":
+                q = int(_attr(attrs, "who"))
+                run[q], drawn[q] = 0, None
+            elif tag == "AGARI":
+                run[int(_attr(attrs, "who"))] = 0
+            elif tag == "RYUUKYOKU" and re.search(r'\btype="(yao9|ron3)"', attrs):
+                for q in range(4):
+                    if re.search(rf'\bhai{q}="', attrs):
+                        run[q] = 0
+        elif tag[0] in "TUVW":
+            drawn["TUVW".index(tag[0])] = int(tag[1:])
+        else:
+            q = "DEFG".index(tag[0])
+            tsumogiri = int(tag[1:]) == drawn[q]
+            drawn[q] = None
+            if not in_riichi[q]:
+                run[q] = run[q] + 1 if tsumogiri else 0
+                best[q] = max(best[q], run[q])
+    return best
+
+
 def count_game(path, H, T, C, tp):
-    """Add every counter of one parsed game (H = halfturns per round, T = tokens per round) to C."""
-    raw = open(path, "rb").read().decode("utf-8", "ignore")
+    """Add every counter of one parsed game (H = halfturns per round, T = tokens per round) to C. A game with a <BYE>
+    is counted on its kept part only (kept_xml, T-044)."""
+    raw, truncated = kept_xml(open(path, "rb").read().decode("utf-8", "ignore"))
+    C["bye_truncated_games"] += int(truncated)
+    if max(auto_play_runs(raw)) >= AUTO_PLAY_RUN_ORACLE:  # T-043: the parser must have rejected this game
+        C["auto_played_accepted"] += 1
     ag = re.findall(r'<AGARI [^>]*?who="(\d)"[^>]*?fromWho="(\d)"', raw)
     C["xml_tsumo"] += sum(1 for w, fw in ag if w == fw)
     C["xml_ron"] += sum(1 for w, fw in ag if w != fw)
@@ -1563,6 +1635,11 @@ def run(files, tp=None):
             elif e.msg == "Own-turn action after own discard":  # 7 Tenhou logs in 2.2M games (T-046): name each
                 C["skipped_invalid_after_own_discard"] += 1
                 print(f"Own-turn action after own discard rejected: {f}")
+            elif e.msg == "Auto-played seat":  # T-043: ~100 games a year, name each
+                C["skipped_invalid_auto_played"] += 1
+                print(f"Auto-played seat rejected: {f}")
+            elif e.msg == "BYE":  # T-044: no round ended before the first BYE (~4,300 games a year): a counter only
+                C["skipped_invalid_bye"] += 1
             continue
         except Exception as e:
             C["parse_error"] += 1
@@ -1657,7 +1734,8 @@ def check(C):
         f"{C['yaku_anchor_checked']}/{C['xml_agari']} | ba {C['ba_checked']}/{C['xml_agari']} replay "
         f"{C['replay_ba_checked']}/{C['xml_ryuukyoku']} | actions at their XML point "
         + " ".join(f"{k} {C['action_xml_checked_' + k]}" for k in LABELLED)
-        + f" | extension-round states {C['diag_extension_round_states']}"
+        + f" | extension-round states {C['diag_extension_round_states']} | BYE-truncated games "
+        f"{C['bye_truncated_games']}"
     )
 
 
@@ -1919,8 +1997,11 @@ def self_test():
     option_games = _option_fixtures()
     kyuushu_games = [_named_game(YAO9_LOG), _named_game(KYUUSHU_AFTER_CALL_LOG)]  # an abort, a decline, 9 kinds after a call
     tonpuu, west = _named_game(TONPUU_SOUTH_LOG), _named_game(HANCHAN_WEST_LOG)
+    bye_games = [_named_game(BYE_MID_LOG), _named_game(BYE_BETWEEN_LOG)]  # T-044: 2 rounds kept each
+    run_24 = _named_game(RUN_24_LOG)  # T-043: the longest run is one below the threshold
     clean = run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan, open_kan, open_kan_ron] + kan_games
-                + sorted(set(option_games.values())) + kyuushu_games + [tonpuu, west], TransformerTensorProcessor())
+                + sorted(set(option_games.values())) + kyuushu_games + [tonpuu, west] + bye_games + [run_24],
+                TransformerTensorProcessor())
     check(clean)
     for k in ("round_wind_samples_E", "round_wind_samples_S", "round_wind_samples_W", "round_wind_tonpuu_samples"):
         if not clean[k]:  # the bakaze gate saw every wind and a tonpuu game, or it proves nothing about them
@@ -1933,6 +2014,27 @@ def self_test():
                          f"{clean['skipped_invalid_after_own_discard']}")
     print("self-test OK: own-turn action after own discard -> skipped_invalid_after_own_discard=3, parse_error=0 "
           "(clean 0)")
+    # T-044: the BYE games pass every gate on their kept part; T-043: the run-24 game is accepted
+    got = tuple(clean[k] for k in ("bye_truncated_games", "skipped_invalid_auto_played", "skipped_invalid_bye"))
+    if got != (2, 0, 0):
+        raise SystemExit(f"self-test FAILED: clean pool (bye_truncated_games, skipped_invalid_auto_played, "
+                         f"skipped_invalid_bye) {got} != (2, 0, 0)")
+    print("self-test OK: clean pool with 2 BYE-truncated games and a run-24 game -> every gate passes")
+    # T-043: an auto-played seat is rejected and named; with the parser's rule switched off, the gate catches it
+    autos = [_named_game(g) for g in AUTO_PLAYED_LOGS]
+    bad = run(autos)
+    got = tuple(bad[k] for k in ("games", "skipped_invalid", "skipped_invalid_auto_played", "parse_error"))
+    if got != (0, 3, 3, 0):
+        raise SystemExit(f"self-test FAILED: auto-played seat: (games, skipped_invalid, auto_played, parse_error) "
+                         f"{got} != (0, 3, 3, 0)")
+    print("self-test OK: auto-played seat -> skipped_invalid_auto_played=3, parse_error=0 (clean 0)")
+    with mock.patch.object(process_xml, "_auto_played_seat", lambda rounds: None):
+        C = run(autos)
+    failed = failed_gates(C)
+    if C["games"] != 3 or set(failed) != {"auto_played_accepted"}:
+        raise SystemExit(f"self-test FAILED: parser without the auto-play rule: games {C['games']}, failed {failed} "
+                         f"(expected 3 games failing auto_played_accepted only)")
+    print(f"self-test OK: parser without the auto-play rule -> auto_played_accepted={failed['auto_played_accepted']}")
 
     def expect_failure(name, gate, corrupt, game=f, absent=(), fields=()):
         """corrupt(H, T, tp) edits the parse in place; it may return a context manager that stays active while the
@@ -2465,6 +2567,12 @@ def self_test():
                     stack.enter_context(patcher)
                 return run([game], tp)
         return corrupt
+
+    # T-039: the old, unclamped rounds left; the tonpuu fixture's South 2 (seed 5) gives -1 and parents [-1, 0, 0, 0]
+    expect_failure("unclamped rounds_remaining", "state_xml_mismatch",
+                   rerun(tonpuu, mock.patch.object(process_xml.GameInfo, "rounds_remaining",
+                                                   lambda self, r: self.n_rounds() - r)),
+                   game=tonpuu, fields=("rounds_remaining", "parent_rounds"))
 
     def win_context_with(**forced):  # every WinContext the parser builds, with some flags forced
         return mock.patch.object(process_xml, "WinContext", lambda **kw: agari.WinContext(**{**kw, **forced}))
@@ -3057,7 +3165,7 @@ def self_test():
     def stick_game():  # a pool game with a RYUUKYOKU after a REACH step 2 in the same round
         for path in sorted(glob.glob(os.path.join(DATA_ROOT, "2021", "20210101", "*", "*.log")))[:60]:
             raw = open(path, "rb").read().decode("utf-8", "ignore")
-            if any(k != r["seed"][2] for r in xml_rounds(raw) for _, k, _ in r["ryuukyoku_ba"]):
+            if any(k != r["seed"][2] for r in xml_rounds(kept_xml(raw)[0]) for _, k, _ in r["ryuukyoku_ba"]):
                 return path
         raise SystemExit("self-test needs a RYUUKYOKU after a riichi in the 2021-01-01 pool")
 

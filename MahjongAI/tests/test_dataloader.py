@@ -42,6 +42,19 @@ def test_expected_skip_is_counted_and_logged():
     assert restored.skipped == loader.skipped and restored.current_index == loader.current_index
 
 
+def test_auto_played_skip_is_expected_and_logged():
+    """T-043: the new reject reason is an expected skip, counted and logged with its file."""
+    day, name, _ = gates.AUTO_PLAYED_LOGS[0]
+    day_dir = os.path.join(GATE_GAMES, day[:4], day)
+    path = os.path.join(day_dir, f"{day}_00", name)
+    lines = []
+    loader = DataLoader(day_dir, 1, lines.append, expected_skips=EXPECTED_SKIPS, logged_skips=LOGGED_SKIPS)
+    assert loader.file_list == [path]
+    _drain(loader)  # an UnexpectedSkip would raise here
+    assert loader.skipped["invalid:Auto-played seat"] == 1
+    assert f"skipped {path}: invalid:Auto-played seat" in lines
+
+
 def test_unexpected_skip_raises_past_the_game():
     loader = DataLoader(DAY_DIR, 1, lambda *_: None, expected_skips=EXPECTED_SKIPS - {KEY})
     with pytest.raises(UnexpectedSkip, match="Own-turn action after own discard"):

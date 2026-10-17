@@ -36,8 +36,8 @@ MAX_ACTION_LEN = 150
 #   0 own hand, 1 unseen tile counts, 2 own discards, 3 drawn tile,
 #   4-6 opponents' discards, 7-9 tiles safe against each opponent's riichi (zero while not in riichi)
 N_X1_PLANES = 10
-# x3 scalars: remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8, then the round wind (bakaze) one-hot
-# E, S, W (no North slot: 0 North rounds in 2.2M games; process_xml rejects one, T-038)
+# x3 scalars: remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8 (0 in an extension round), then the round
+# wind (bakaze) one-hot E, S, W (no North slot: 0 North rounds in 2.2M games; process_xml rejects one, T-038)
 N_X3 = 7
 EMBD_SIZE = 64
 N_HEADS = 8
@@ -1079,10 +1079,10 @@ class TransformerTensorProcessor:
 
         Returns:
             x1: (1, N_X1_PLANES, 37, 4) thermometer planes (plane c, column j = 1 iff count > j)
-            x2: (1, 7, 4) per-seat rows: scores/250, parent, parent_rounds_remaining/2, double_reaches,
-                reaches, ippatsu, is_menzen
-            x3: (1, N_X3=7): remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8, then the round wind
-                (bakaze) one-hot E, S, W in slots 4-6
+            x2: (1, 7, 4) per-seat rows: scores/250, parent, parent_rounds_remaining/2 (0 in an extension round),
+                double_reaches, reaches, ippatsu, is_menzen
+            x3: (1, N_X3=7): remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8 (0 in an extension round),
+                then the round wind (bakaze) one-hot E, S, W in slots 4-6
         Every input is O(1): fc_main_1 has no LayerNorm before its ReLU, and raw scores (~250) killed
         14-53% of its units in the unnormalised model.
         """
