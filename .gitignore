@@ -177,3 +177,6 @@ saved_models/
 
 # Local task tracking (not versioned)
 task/
+
+# training runs (plan T-005): train.log, metrics.jsonl, checkpoints
+runs/
