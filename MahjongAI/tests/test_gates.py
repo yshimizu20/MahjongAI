@@ -8,11 +8,16 @@ import ast
 import collections
 import os
 import random
+from unittest import mock
 
 import numpy as np
 import pytest
 
+from mahjong.hand_calculating import yaku_config
+
+from MahjongAI import process_xml
 from MahjongAI.draw import Naki
+from MahjongAI.process_xml import process
 from MahjongAI.utils import agari, gates, legal_oracles, win_oracles
 from MahjongAI.utils.legal_oracles import Meld
 
@@ -33,7 +38,7 @@ BANNED_IN_ORACLES = {"Naki", "legal", "agari", "gameinfo"} | TOKEN_BUILDERS
 # gates.py functions that read the PARSER's objects or patch the parser: the only ones allowed the banned names
 PARSER_SIDE = {"index_checks", "_option_fixtures", "self_test"}
 # the runner helpers parse a game: the parser's entry point is the one parser name they may hold
-RUNNER = {"run", "_count", "_first_valid_game", "_game_with", "_parsed_fixture"}
+RUNNER = {"run", "_count", "_first_valid_game", "_game_with", "_parsed_fixture", "main"}
 RUNNER_ORIGINS = {"MahjongAI.process_xml.process", "MahjongAI.process_xml.InvalidGameException"}
 # Naki's own decoders: an oracle decodes the raw naki_code with legal_oracles.decode_meld instead
 NAKI_DECODERS = {"get_exposed", "pattern_chi", "pattern_pon", "pattern_kakan", "pattern_minkan", "pattern_ankan"}
@@ -362,3 +367,269 @@ def test_chinroutou_through_both_adapters():  # Tenhou id 44: no hand in the lib
     assert win_oracles.parser_yaku_ids(("Chinroutou",)) == {44}
     exists, lib = _both("111p 999p 11s", 18, False, (0, 8), S, E)
     assert lib == {44} and exists
+
+
+# ---- T-041: every gate name is read off failed_gates and proven able to fail
+
+def test_gate_names(monkeypatch):
+    names = gates.gate_names()
+    assert set(gates.ZERO_GATES) <= names
+    for k in gates.LABELLED:
+        assert {f"lab_{k}", f"tensor_{k}", f"action_xml_coverage_{k}"} <= names, k
+    for h in gates.HEADS:
+        assert {f"{h}_samples", f"{h}_label_outside_mask"} <= names, h
+    assert {"games", "dora_draw_to_discard_checked", "win_yaku_coverage", "agari_coverage"} <= names
+    assert set(gates.GATE_ONLY) <= names and not gates.UNTESTED_GATES
+    monkeypatch.setattr(gates, "ZERO_GATES", gates.ZERO_GATES + ["t041_new_gate"])
+    assert "t041_new_gate" in gates.gate_names()
+
+
+def _linear_violations(node, coef=1):
+    """Why `node` is not a linear counter expression: C[...] leaves joined by + / -, unary -, an int literal times an
+    expression, sum() over a generator of such; the product of the literals on the path to each C[...] (the effective
+    coefficient) below 500 in size. Empty list = linear."""
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == "C":
+        return [] if abs(coef) < 500 else [f"coefficient {coef}"]
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return _linear_violations(node.operand, -coef)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+        return _linear_violations(node.left, coef) + _linear_violations(node.right, coef)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        for lit, expr in ((node.left, node.right), (node.right, node.left)):
+            if isinstance(lit, ast.Constant) and type(lit.value) is int:
+                return _linear_violations(expr, coef * lit.value)
+        return ["product of two expressions"]
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "sum" and not node.keywords
+            and len(node.args) == 1 and isinstance(node.args[0], ast.GeneratorExp)):
+        return _linear_violations(node.args[0].elt, coef)
+    return [f"not linear: {ast.unparse(node)}"]
+
+
+def _test_violations(test):
+    """Why a gate test breaks the contract: allowed are `lin == lin` / `lin != lin` (one operator; a literal side is
+    exactly the int 0), a truth test on C[...], and `or` of allowed tests. `and`, `not`, `<`, other literals fail."""
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        return [v for t in test.values for v in _test_violations(t)]
+    if isinstance(test, ast.Subscript):
+        return _linear_violations(test)
+    if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], (ast.Eq, ast.NotEq)):
+        out = []
+        for side in (test.left, test.comparators[0]):
+            if isinstance(side, ast.Constant):
+                if not (type(side.value) is int and side.value == 0):
+                    out.append(f"literal {side.value!r}")
+            else:
+                out += _linear_violations(side)
+        return out
+    return [f"test form: {ast.unparse(test)}"]
+
+
+def _contract_violations(fn):
+    """(line, reason) for every way the failed_gates function `fn` breaks the contract its probe needs: every write of
+    a gate name (`bad[k] = ...`, `bad.update(<dict comprehension>)`) sits under at most one guard, and the guard (an
+    `if` test, or the comprehension's single `if`) passes _test_violations. One exception: under `if "<k>" in bad`
+    the body may only rewrite bad["<k>"] (no new name). No while / if-else / conditional expression on a write."""
+    out = []
+
+    def writes(stmt):
+        if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                                                and t.value.id == "bad" for t in stmt.targets):
+            return [("set", stmt.targets[0].slice)]
+        if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                and ast.unparse(stmt.value.func) == "bad.update"):
+            return [("update", stmt.value.args[0] if stmt.value.args else None)]
+        return []
+
+    def visit(stmts, guards):
+        for st in stmts:
+            for kind, what in writes(st):
+                if kind == "update":
+                    if not isinstance(what, ast.DictComp) or len(what.generators) != 1:
+                        out.append((st.lineno, "bad.update without one dict comprehension"))
+                        continue
+                    ifs = what.generators[0].ifs
+                    if guards or len(ifs) != 1:
+                        out.append((st.lineno, "a comprehension write needs exactly one guard"))
+                    else:
+                        out.extend([(st.lineno, v) for v in _test_violations(ifs[0])])
+                elif len(guards) > 1:
+                    out.append((st.lineno, "nested guards"))
+                elif guards and guards[0][0] == "in":
+                    if not (isinstance(what, ast.Constant) and what.value == guards[0][1]):
+                        out.append((st.lineno, "a new name under an `in bad` guard"))
+                elif guards:
+                    out.extend([(st.lineno, v) for v in _test_violations(guards[0][1])])
+            if isinstance(st, ast.If):
+                t = st.test
+                if (isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.In)
+                        and isinstance(t.left, ast.Constant) and ast.unparse(t.comparators[0]) == "bad"):
+                    g = ("in", t.left.value)
+                else:
+                    g = ("test", t)
+                visit(st.body, guards + [g])
+                if st.orelse:
+                    out.append((st.lineno, "if-else"))
+            elif isinstance(st, ast.While):
+                out.append((st.lineno, "while"))
+            elif isinstance(st, (ast.For, ast.With)):
+                visit(st.body, guards)
+        for node in (n for st in stmts for n in ast.walk(st)):
+            if isinstance(node, ast.IfExp):
+                out.append((node.lineno, "conditional expression"))
+                break
+
+    visit(fn.body, [])
+    return sorted(set(out), key=str)
+
+
+GATE_TEMPLATE = "def failed_gates(C):\n    bad = {{}}\n    if {}:\n        bad['g'] = 1\n    return bad"
+
+
+def test_failed_gates_contract():
+    fn = next(n for n in _tree(gates).body if isinstance(n, ast.FunctionDef) and n.name == "failed_gates")
+    assert not _contract_violations(fn)
+    clean = ("C['x'] != C['y'] + 3 * C['z']", "C['x'] == 0 or C['y'] != 0", "C['x']", "-C['x'] != sum(C[h] for h in H)")
+    for test in clean:
+        assert not _contract_violations(ast.parse(GATE_TEMPLATE.format(test)).body[0]), test
+    dirty = ("C['x'] == 1", "C['x'] > 0", "C['x'] != 600 * C['y']", "C['x'] % 2 != 0", "C['x'] != 0 and C['y'] == 0",
+             "C['x'] == C['y'] and C['x'] != 0", "C['x'] == +1", "C['x'] == True", "10 * 100 * C['x'] != C['y']",
+             "C.get('x', 0) != 0", "not C['x']", "C['x'] * C['y'] != 0", "C['x'] != C['y'] != 0")
+    for test in dirty:  # the check can fail: each escapes the probes or breaks the contract
+        assert _contract_violations(ast.parse(GATE_TEMPLATE.format(test)).body[0]), test
+    nested = ("def failed_gates(C):\n    bad = {}\n    if C['x'] != 0:\n"
+              "        if C['y'] == 0:\n            bad['g'] = 1")
+    two_ifs = "def failed_gates(C):\n    bad = {}\n    bad.update({k: 1 for k in K if C[k] != 0 if C['y'] == 0})"
+    new_name = "def failed_gates(C):\n    bad = {}\n    if 'a' in bad:\n        bad['b'] = 1"
+    for src in (nested, two_ifs, new_name):
+        assert _contract_violations(ast.parse(src).body[0]), src
+
+
+def test_gate_coverage_gaps():
+    names, gate_only = {"a", "b", "g"}, {"g": "oracle only"}
+    full = {"a": {"parser"}, "b": {"parser", "gate"}, "g": {"gate"}}
+    assert gates.gate_coverage_gaps(names, full, gate_only, {}) == []
+    assert gates.gate_coverage_gaps(names | {"new"}, full, gate_only, {}) == [
+        "new: parser gate with no parser-side corruption"]
+    assert gates.gate_coverage_gaps(names, {**full, "a": {"gate"}}, gate_only, {}) == [
+        "a: parser gate with no parser-side corruption (gate-code corruptions only)"]
+    assert gates.gate_coverage_gaps(names, {"a": {"parser"}, "b": {"parser"}}, gate_only, {}) == [
+        "g: gate-only check with no corruption"]
+    assert gates.gate_coverage_gaps(names | {"u"}, full, gate_only, {"u": "cannot fail"}) == []
+    assert gates.gate_coverage_gaps(names, full, gate_only, {"a": "cannot fail"}) == [
+        "a: in UNTESTED_GATES but a corruption fails it (drop the entry)"]
+    assert gates.gate_coverage_gaps(names, full, {**gate_only, "old": "gone"}, {"gone": "x"}) == [
+        "gone: stale UNTESTED_GATES entry (failed_gates cannot return it)",
+        "old: stale GATE_ONLY entry (failed_gates cannot return it)"]
+    assert "g: on both GATE_ONLY and UNTESTED_GATES" in gates.gate_coverage_gaps(names, full, gate_only, {"g": "x"})
+
+
+def test_gate_fingerprint():
+    f0 = gates.gate_fingerprint()
+    with mock.patch.object(gates, "snap_kans", lambda snap: (4, 1)):
+        assert gates.gate_fingerprint() != f0
+    with mock.patch.dict(win_oracles.TENHOU_YAKU_ID, {"Suuankou": 41, "SuuankouTanki": 40}):
+        assert gates.gate_fingerprint() != f0
+    assert gates.gate_fingerprint() == f0
+    # a table imported from the library is the library's object (shared with the parser): an edit is a library
+    # patch, a rebinding of the gate module's name is gate code
+    with mock.patch.dict(yaku_config.YAKU_ID_TO_TENHOU_ID, {9999: 1}):
+        assert win_oracles.YAKU_ID_TO_TENHOU_ID is yaku_config.YAKU_ID_TO_TENHOU_ID
+        assert gates.gate_fingerprint() == f0
+    with mock.patch.object(win_oracles, "YAKU_ID_TO_TENHOU_ID", dict(yaku_config.YAKU_ID_TO_TENHOU_ID)):
+        assert gates.gate_fingerprint() != f0
+    with mock.patch.object(process_xml, "_is_houtei", lambda *a: False):
+        assert gates.gate_fingerprint() == f0
+    with mock.patch.object(Naki, "get_post_turn_filter_idx", lambda self: 0):
+        assert gates.gate_fingerprint() == f0
+    H, T = process(gates.SAMPLE_LOG)
+    H[0][0].stateObj.honba, T[0][0] = 99, T[0][0] ^ 1
+    assert gates.gate_fingerprint() == f0
+
+
+def test_watch_gate_code(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gates, "count_game", lambda *a: calls.append(a))
+    dummy = gates.count_game
+    with gates.watch_gate_code() as (check, touched):
+        gates.count_game(1)
+        assert not touched  # nothing patched: a parser-side corruption
+        with mock.patch.object(gates, "xml_rounds", lambda raw: []):
+            gates.count_game(2)  # the spy compares at every count call
+        assert touched
+    assert gates.count_game is dummy and calls == [(1,), (2,)]
+    with gates.watch_gate_code() as (check, touched):
+        with mock.patch.object(win_oracles, "has_yaku", lambda *a: False):
+            check()  # no count call: the on-demand comparison
+    assert touched
+    # a patch undone before any comparison: seen when it rebinds the global (Codex round 2, findings 2 and 3)
+    with gates.watch_gate_code() as (check, touched):
+        with mock.patch.object(gates, "index_checks", lambda C: C.update(index_collisions=1)):
+            gates.index_checks(collections.Counter())  # a gate-code stand-in called directly, gone before check()
+        check()
+    assert touched
+    with gates.watch_gate_code() as (check, touched):
+        spied = gates.count_game
+        with mock.patch.object(gates, "count_game", lambda *a: spied(*a)):  # a count_game wrapper
+            gates.count_game(3)
+        check()
+    assert touched
+    with gates.watch_gate_code() as (check, touched):  # the parser, a Naki method, the library: not gate code
+        with mock.patch.object(process_xml, "_is_houtei", lambda *a: False), \
+                mock.patch.object(Naki, "get_post_turn_filter_idx", lambda self: 0), \
+                mock.patch.dict(yaku_config.YAKU_ID_TO_TENHOU_ID, {9999: 1}):
+            gates.count_game(4)
+            gates.index_checks(collections.Counter())
+        check()
+    assert not touched
+    assert type(gates) is type(win_oracles) is type(legal_oracles) is type(os)  # the module class is restored
+
+
+# ---- T-042: per-year default days; the CLI path on the fixture tree
+
+def test_resolve_days(monkeypatch):
+    val_week = [f"202201{d:02d}" for d in range(1, 8)]
+    assert gates.resolve_days("2022", None, 0, GATE_GAMES) == val_week  # the T-042 crash: --year 2022, no --days
+    every = gates.resolve_days(None, None, 0, GATE_GAMES)
+    assert every == gates.DEFAULT_POOL["2021"] + val_week and {"20211230", "20211231"} <= set(every)
+    assert gates.resolve_days("2021", ["20210101", "20210102"], 0, GATE_GAMES) == ["20210101", "20210102"]
+    with pytest.raises(SystemExit, match="20220101"):
+        gates.resolve_days("2021", ["20220101"], 0, GATE_GAMES)
+    with pytest.raises(SystemExit, match="2021011"):
+        gates.resolve_days(None, ["2021011"], 0, GATE_GAMES)
+    assert gates.resolve_days("2020", None, 0, GATE_GAMES) == ["20200719"] == gates.resolve_days("2020", None, 5, GATE_GAMES)
+    with pytest.raises(SystemExit, match="2019"):
+        gates.resolve_days("2019", None, 0, GATE_GAMES)
+    monkeypatch.setattr(gates, "DEFAULT_POOL", {"2022": val_week})  # 2021 outside the pool: 17 fixture day dirs
+    days = sorted(os.listdir(os.path.join(GATE_GAMES, "2021")))
+    got = gates.resolve_days("2021", None, 3, GATE_GAMES)
+    assert len(days) > gates.OUTSIDE_POOL_DAYS and len(got) == gates.OUTSIDE_POOL_DAYS == len(set(got))
+    assert set(got) <= set(days) and got == sorted(got) == gates.resolve_days("2021", None, 3, GATE_GAMES)
+
+
+def test_resolve_days_reads_day_directories_only(tmp_path):
+    (tmp_path / "2019").mkdir()
+    (tmp_path / "2019" / "20190101").write_text("")  # an 8-digit regular file is no day
+    with pytest.raises(SystemExit, match="no day directory"):
+        gates.resolve_days("2019", None, 0, str(tmp_path))
+    (tmp_path / "2019" / "20190102").mkdir()
+    assert gates.resolve_days("2019", None, 0, str(tmp_path)) == ["20190102"]
+
+
+def test_select_files():
+    files = gates.select_files(gates.resolve_days("2022", None, 0, GATE_GAMES), GATE_GAMES)
+    assert files and all(os.path.relpath(f, GATE_GAMES).split(os.sep)[1] == "20220106" for f in files)
+    files = gates.select_files(gates.resolve_days(None, None, 0, GATE_GAMES), GATE_GAMES)
+    assert {os.path.relpath(f, GATE_GAMES).split(os.sep)[0] for f in files} == {"2021", "2022"}  # both pool years
+    with pytest.raises(SystemExit, match="20190101"):
+        gates.select_files(["20190101"], GATE_GAMES)
+
+
+def test_default_pool_2022_is_the_val_week():
+    from MahjongAI.supervised_learning import VAL_DAYS
+    assert gates.DEFAULT_POOL["2022"] == list(VAL_DAYS)
+
+
+def test_main_cli(monkeypatch, capsys):
+    monkeypatch.setattr(gates, "DATA_ROOT", GATE_GAMES)
+    gates.main(["--year", "2021", "--days", "20210101", "--games", "2"])
+    assert "GATES OK" in capsys.readouterr().out
