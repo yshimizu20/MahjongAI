@@ -389,6 +389,19 @@ class EncoderBlock(nn.Module):
         return x
 
 
+def conv1d_k3_rank_major(x: torch.Tensor, conv: nn.Conv1d) -> torch.Tensor:
+    """conv(x.transpose(1, 2)).transpose(1, 2) for a Conv1d(kernel 3, padding 1, stride 1), on rank-major input:
+    x [N, R, Cin] -> [N, R, Cout]. The 3 shifted rank slices side by side, then one matmul with conv's own weight and
+    bias (the module stays the parameter holder, so the state_dict is unchanged)."""
+    assert conv.kernel_size == (3,) and conv.padding == (1,) and conv.stride == (1,) and conv.dilation == (1,)
+    assert conv.groups == 1
+    R = x.shape[1]
+    xp = F.pad(x, (0, 0, 1, 1))  # [N, R + 2, Cin]: a zero rank at both ends
+    cols = torch.cat([xp[:, t:t + R] for t in range(3)], dim=2)  # [N, R, 3*Cin], column t*Cin + c = x[:, r + t - 1, c]
+    weight = conv.weight.permute(0, 2, 1).reshape(conv.out_channels, -1)  # [Cout, 3*Cin], the same column order
+    return F.linear(cols, weight, conv.bias)
+
+
 class StateNet(nn.Module):
     def __init__(self):
         super(StateNet, self).__init__()
@@ -436,26 +449,17 @@ class StateNet(nn.Module):
         C, K = N_X1_PLANES, 4
 
         # --- 1. Process Suits (indices 0-26) ---
-        # Extract Man (0-8), Pin (9-17), Sou (18-26)
-        x1_suits = torch.stack(
-            [x1[:, :, 0:9, :], x1[:, :, 9:18, :], x1[:, :, 18:27, :]], dim=1  # Man  # Pin  # Sou
-        )  # Shape: [B, S=3, C=10, R=9, K=4]
+        # Man (0-8), Pin (9-17), Sou (18-26), suits merged into the batch and rank-major: [B*3, R=9, C*K], channel
+        # c*K + k (the Conv1d channel order). Each Conv1d(k=3, pad=1) runs as one matmul over 3 shifted rank slices
+        # with its own weights (T-011: the stock CPU Conv1d backward is slow); the state_dict is unchanged.
+        x1_suits = x1[:, :, :27, :].reshape(batch_size, C, 3, 9, K)  # [B, C, S, R, K]
+        x1_suits = x1_suits.permute(0, 2, 3, 1, 4).reshape(batch_size * 3, 9, C * K)  # [B*3, R, C*K]
 
-        # Reshape to [B, S, C*K, R]
-        x1_suits = x1_suits.permute(0, 1, 2, 4, 3).contiguous()  # [B, S, C, K, R]
-        x1_suits = x1_suits.view(batch_size, 3, C * K, 9)  # [B, S=3, C*K, R=9]
-
-        # Merge suits into batch for Conv1d: [B*S, C*K, R]
-        x1_suits = x1_suits.view(batch_size * 3, C * K, 9)  # [B*3, C*K, 9]
-
-        # Apply Conv1d over rank
-        suits_feat = self.suit_conv1d_1(x1_suits)  # [B*3, 16, 9]
-        suits_feat = self.relu(suits_feat)
-        suits_feat = self.suit_conv1d_2(suits_feat)  # [B*3, 16, 9]
-        suits_feat = self.relu(suits_feat)
+        suits_feat = self.relu(conv1d_k3_rank_major(x1_suits, self.suit_conv1d_1))  # [B*3, 9, 16]
+        suits_feat = self.relu(conv1d_k3_rank_major(suits_feat, self.suit_conv1d_2))  # [B*3, 9, 16]
 
         # Global pooling over rank dimension
-        suits_feat = torch.mean(suits_feat, dim=2)  # [B*3, 16]
+        suits_feat = torch.mean(suits_feat, dim=1)  # [B*3, 16]
 
         # Reshape back and aggregate over suits
         suits_feat = suits_feat.view(batch_size, 3, 16)  # [B, S=3, 16]
