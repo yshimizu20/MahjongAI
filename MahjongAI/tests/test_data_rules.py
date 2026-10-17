@@ -182,6 +182,8 @@ BYE_CASES = {  # name: (XML body, rounds kept; 0: rejected "BYE")
     "bye_after_agari": (ROUND_1 + BYE + _init(1) + _tsumogiri(0, 3) + AGARI, 1),
     "bye_inside_round": (ROUND_1 + _init(1) + _tsumogiri(0, 2) + BYE + _tsumogiri(0, 3) + AGARI, 1),
     "split_double_ron": (ROUND_1 + _init(1) + _tsumogiri(0, 2) + AGARI + BYE + UN + AGARI_2, 1),
+    "split_double_ron_spaced": (ROUND_1 + _init(1) + _tsumogiri(0, 2) + AGARI + "\n" + BYE + "\n" + UN + "\n" + AGARI_2,
+                                1),
     "bye_after_exhaustive": (ROUND_1 + _init(1) + _tsumogiri(0, 2) + EXHAUSTIVE + BYE + _init(2), 2),
     "bye_before_any_result": (_init(0) + _tsumogiri(0, 2) + BYE + _tsumogiri(0, 2) + AGARI, 0),
     "no_bye": (ROUND_1 + _init(1) + _tsumogiri(0, 2) + AGARI, 2),

@@ -1321,7 +1321,7 @@ def kept_xml(raw: str):
         return raw, False
     cut = raw[:b]
     last_init = cut.rfind("<INIT")
-    split = re.match(r"(?:<(?:BYE|UN)\b[^>]*>)*<AGARI\b", raw[b:]) is not None
+    split = re.match(r"(?:\s*<(?:BYE|UN)\b[^>]*>)*\s*<AGARI\b", raw[b:]) is not None  # whitespace between tags too
     if last_init >= 0 and (split or not re.search(r"<(AGARI|RYUUKYOKU)\b", cut[last_init:])):
         cut = cut[:last_init]
     return cut, True
