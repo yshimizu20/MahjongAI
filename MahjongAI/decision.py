@@ -333,7 +333,7 @@ def _five_mask(
                 decisions[p].append(NakiDecision(p, naki, False))
 
         if hand_tensor[tile_idx] == 3.0:
-            naki = Naki.from_minkan_info(tile_idx, (player - p) % 4, 1 if is_red else 0)
+            naki = Naki.from_minkan_info(tile_idx, (player - p) % 4, 0 if is_red else 1)  # which 0 = the red
             assert naki.is_minkan()
             decisions[p].append(NakiDecision(p, naki, False))
 

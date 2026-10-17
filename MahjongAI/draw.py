@@ -10,6 +10,17 @@ RED_CHI_VARIANT = {(2, 0): 0, (2, 1): 1, (3, 0): 2, (3, 2): 3, (4, 1): 4, (4, 2)
 
 
 class Naki(Draw):
+    """One Tenhou meld code (`<N m="...">`).
+
+    A LOG code (`Naki(m)` from the XML) names the real 136-id tiles. An OFFERED code (built by a `from_*_info`
+    constructor or `kakan_of` for a call the parser offers, `offered=True`) is exact in what the model and the gates
+    read: the kind, the action index, from_who, and whether a red five is taken from the hand or called (a chi also
+    keeps its called position; a pon's called position bits can differ from the log's). It does NOT name which plain
+    copy of a kind leaves the hand (the 37-count hand tensors cannot say); only a kakan built by `kakan_of` from a
+    log pon is the exact log code. So an offered code is never applied to a hand: `get_exposed` raises on it; apply
+    the executed call's log code instead.
+    """
+
     @staticmethod
     def from_chi_info(color: int, number: int, which: int, has_red: bool):
         pattern = (color * 7 + number) * 3 + which
@@ -18,7 +29,7 @@ class Naki(Draw):
             bit = 3 + (4 - number) * 2
             naki_code ^= 1 << bit
 
-        return Naki(naki_code, clean=False)
+        return Naki(naki_code, offered=True)
 
     @staticmethod
     def from_pon_info(tile: int, which: int, has_red: bool, from_who: int):
@@ -28,22 +39,16 @@ class Naki(Draw):
         naki_code = (from_who & 3) | 0x8 | (pattern << 9)
         if has_red:
             naki_code |= 3 << 5
-        # if which:
-        #     naki_code += 1 << 9
 
-        return Naki(naki_code, clean=False)
+        return Naki(naki_code, offered=True)
 
     @staticmethod
-    def from_kakan_info(tile: int, which: int):
-        # which = 1 if red was in the exposed pon else 0
-        assert which in [0, 1]
-        has_red = tile < 27 and tile % 9 == 4
-        pattern = tile * 3 + which
-        naki_code = 0x10 | (pattern << 9)
-        if not has_red or which:
-            naki_code |= 1 << 5
-
-        return Naki(naki_code, clean=False)
+    def kakan_of(pon: "Naki") -> "Naki":
+        """The kakan that extends `pon`: Tenhou keeps the pon's kind, called position, unused-copy bits (now the
+        added copy) and from_who, and swaps the pon bit (0x8) for the kakan bit (0x10). Exact (== the log code)
+        when `pon` is a log code; a synthetic pon gives a kakan with the same synthetic copies."""
+        assert pon.is_pon(), f"kakan_of needs a pon, got {pon!r}"
+        return Naki((pon.naki_code & ~0x8) | 0x10, offered=True)
 
     @staticmethod
     def from_minkan_info(tile: int, from_who: int, which: int):
@@ -52,71 +57,19 @@ class Naki(Draw):
         pattern = tile * 4 + which
         naki_code = (from_who & 3) | (pattern << 8)
 
-        return Naki(naki_code, clean=False)
+        return Naki(naki_code, offered=True)
 
     @staticmethod
     def from_ankan_info(tile: int):
         pattern = tile * 4
         naki_code = pattern << 8
 
-        return Naki(naki_code, clean=False)
+        return Naki(naki_code, offered=True)
 
-    def __init__(self, naki_code: int, clean: bool = True):
+    def __init__(self, naki_code: int, offered: bool = False):
+        """offered: True for a code the parser builds for an offered call (see the class docstring)."""
         self.naki_code = naki_code
-        self.convenient_naki_code = naki_code
-
-        if clean:
-            self.convenient_naki_code = self._clean()
-
-    def _clean(self):
-        if self.is_chi():
-            return self._clean_chi()
-        elif self.is_pon():
-            return self._clean_pon()
-        elif self.is_kakan():
-            return self._clean_kakan()
-        elif self.is_minkan():
-            return self._clean_minkan()
-        elif self.is_ankan():
-            return self._clean_ankan()
-        else:
-            raise ValueError("Invalid naki code")
-
-    def _clean_chi(self):
-        _, number, _, red, _, _ = self.pattern_chi()
-        code = self.naki_code & ~(0x18 | 0x60 | 0x180)
-        code |= 0x8 | 0x20 | 0x80
-        if red:
-            bit = 3 + (4 - number) * 2
-            code ^= 1 << bit
-        return code
-
-    def _clean_pon(self):
-        _, _, which, red, *_ = self.pattern_pon()
-        code = self.naki_code & ~(0x60)
-        if red:
-            code += 0x60
-            if which:
-                code -= (which - 1) << 9
-        return code
-
-    def _clean_kakan(self):
-        _, _, which, red, *_ = self.pattern_kakan()
-        code = self.naki_code & ~(0x60)
-        if not red or which:
-            code |= 0x20
-        return code
-
-    def _clean_minkan(self):
-        _, _, which, red, *_ = self.pattern_minkan()
-        code = self.naki_code
-        if not red or which:
-            code -= (which - 1) << 8
-        return code
-
-    def _clean_ankan(self):
-        code = self.naki_code & ~(3 << 8)
-        return code
+        self.offered = offered
 
     def from_who(self):
         return self.naki_code & 3
@@ -199,6 +152,10 @@ class Naki(Draw):
         return (color, number, which, has_red, exposed, acquired)
 
     def get_exposed(self):
+        """The 136-ids this meld takes from the hand and the called one. Log codes only (the class docstring)."""
+        if self.offered:
+            raise ValueError(f"{self!r} is an offered call: canonical tile copies, not the hand's; "
+                             "apply the executed log code")
         exposed, acquired = None, None
 
         if self.is_chi():
