@@ -22,7 +22,7 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           token; a discard by a player in riichi is the drawn tile; seat bits rotate so that the actor is seat 0
   SCALE   remaining_tsumo in [0, 70] and == 0 at an exhaustive draw; |x2|, |x3| <= 5 (normalised inputs;
           the whole 100,000-point pool on one seat is exactly 4.0)
-  HISTORY in every state a model head reads, double_reaches, ippatsu and safe_tiles of all four seats == the
+  HISTORY in every state a model head reads, double_reaches, ippatsu and safe_tiles (exact 0 / 1) of all four seats == the
           values rebuilt from its token history alone (history_facts): double riichi = a reach before any call
           and before the seat's own first discard; ippatsu = no call since the reach (the kakan a chankan
           responder answers still counts) and no second draw; safe = the seat's own discards and every discard
@@ -53,7 +53,8 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           (xml_rounds, one replay per round, melds decoded by legal_oracles.decode_meld, never Naki): the 37-slot
           hand, every seat's melds, the drawn tile, the live draws left, the scores, the riichi seats, the menzen
           flags, every seat's discard planes (sutehai, both slots of a red five), the dealer, honba, kyotaku,
-          rounds_remaining, parent_rounds_remaining, the state's player and its history length (encoding_idx).
+          rounds_remaining, parent_rounds_remaining, the state's player, the turn's own player (state_xml_turn_player)
+          and its history length (encoding_idx).
           One counter per field (state_xml_<field>). The option, win and action oracles below read only that replay.
   ACTIONS every executed during / post action of the parser == the XML answer at the same decision point (the
           next draw answer: riichi / ankan / kakan / tsumo / kyuushu; the post window: ron per <AGARI>, a call per
@@ -326,7 +327,10 @@ def check_history_fields(so, facts, discarding, C):
             C["double_riichi_mismatch"] += 1
         if so.ippatsu[q] != ippatsu:
             C["ippatsu_history_mismatch"] += 1
-        if set(np.flatnonzero(so.safe_tiles[q]).tolist()) != safe:
+        row = np.asarray(so.safe_tiles[q])
+        exact = np.zeros(row.shape)
+        exact[sorted(safe)] = 1.0
+        if not np.array_equal(row, exact):  # exact 0 / 1 values: a 2.0 would light two thermometer columns
             C["safe_plane_mismatch"] += 1
 
 
@@ -458,13 +462,15 @@ def expected_responders(t: PostTurn, calls=None):
     a non-executor only when no other responder executed something of higher priority than ANY action this
     responder was offered (ron 3 > pon/kan 2 > chi 1), because it may have chosen the weaker one and lost.
     This restates the rule of TransformerTensorProcessor._post_turn_responders, so it catches a regression
-    of that code, not a wrong rule; the XML-count gates (tensor_ron == xml_ron, ...) are the independent check.
+    of that code, not a wrong rule; the priority of a call comes from its post index (chi 2-82, pon / kan 83-153),
+    never from Naki.is_chi; the XML-count gates (tensor_ron == xml_ron, ...) are the independent check.
     calls: {seat: set of post call indices} in place of the parser's call offers (the executed call is kept)."""
     lowest, done, target = {}, {}, {}
     for p in range(4):
         decs = t.decisions[p]
         kinds = [(3, d.executed, 1) for d in decs[DECISION_AGARI_IDX]]
-        kinds += [(1 if d.naki.is_chi() else 2, d.executed, d.naki.get_post_turn_filter_idx()) for d in decs[DECISION_NAKI_IDX]]
+        idxs = [(d.executed, d.naki.get_post_turn_filter_idx()) for d in decs[DECISION_NAKI_IDX]]
+        kinds += [(1 if i < PON_IDX.start else 2, x, i) for x, i in idxs]  # priority from the index the model sees
         if calls is not None:
             executed = {i for _, x, i in kinds[len(decs[DECISION_AGARI_IDX]):] if x}
             kinds = kinds[:len(decs[DECISION_AGARI_IDX])] + [(1 if i < PON_IDX.start else 2, i in executed, i)
@@ -656,6 +662,8 @@ def xml_rounds(raw: str):
                 pon = next((x for x in st["melds"][who] if x.kind == "pon"
                             and legal_oracles.meld_kind(x) == legal_oracles.meld_kind(meld)), None)
                 assert pon is not None, f"replay: kakan {meld} by {who} without its pon"
+                assert pon.called == meld.called and set(pon.ids) | {meld.added} == set(meld.ids), (
+                    f"replay: kakan {meld} by {who} does not extend its pon {pon}")
                 st["melds"][who].remove(pon)
             st["melds"][who].append(meld)
             r["tokens"].append(tok_call(who, meld))
@@ -1333,6 +1341,9 @@ def count_game(path, H, T, C, tp):
             so, snap = t.stateObj, snaps[i]
             if snap is not None:
                 check_actions(t, snap, answers[i], C)
+                if t.player != snap.actor:  # the history rotation and the decider seat follow turn.player
+                    C["state_xml_mismatch"] += 1
+                    C["state_xml_turn_player"] += 1
             if isinstance(t, DuringTurn):
                 if snap is not None:
                     check_state_xml(so, snap, snap.actor, t.encoding_idx, C)
@@ -2977,6 +2988,30 @@ def self_test():
                    game=SAMPLE_LOG, fields=("player",))
     expect_failure("h2 riichi-offer DuringTurn encoding_idx 49 -> 1", "state_xml_mismatch", riichi_offer_history_cut,
                    game=SAMPLE_LOG, fields=("history_len",))
+
+    # (code review round 2) the turn's own player, exact safe values, call priority from the index
+    def during_player_moved(H, T, tp):  # sample round 6, halfturn 79: the DuringTurn of seat 3 claims seat 0
+        t = H[6][79]
+        found(isinstance(t, DuringTurn) and t.player == 3, "seat 3's DuringTurn at round 6 halfturn 79 of the sample log")
+        t.player = 0
+
+    def safe_doubled(so):
+        so.safe_tiles = np.asarray(so.safe_tiles) * 2.0
+
+    def preempted_chi_not_chi(H, T, tp):  # sample round 10, halfturn 61: seat 1's chi lost to seat 2's pon
+        t = H[10][61]
+        chis = [d for d in t.decisions[1][DECISION_NAKI_IDX] if d.naki.is_chi() and not d.executed]
+        found(isinstance(t, PostTurn) and chis and any(d.executed for d in t.decisions[2][DECISION_NAKI_IDX]),
+              "seat 1's pre-empted chi at round 10 halfturn 61 of the sample log")
+        for d in chis:  # the index stays the chi index; only the classification lies
+            idx = d.naki.get_post_turn_filter_idx()
+            d.naki.is_chi, d.naki.get_post_turn_filter_idx = (lambda: False), (lambda idx=idx: idx)
+
+    expect_failure("h3 DuringTurn.player 3 -> 0 (round 6, halfturn 79)", "state_xml_mismatch", during_player_moved,
+                   game=SAMPLE_LOG, fields=("turn_player",))
+    expect_failure("i1 safe_tiles values doubled", "safe_plane_mismatch", every_state(safe_doubled), game=SAMPLE_LOG)
+    expect_failure("i2 a pre-empted chi classified as a pon (index kept)", "post_sample_count_mismatch", preempted_chi_not_chi,
+                   game=SAMPLE_LOG)
 
     from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster
     dl = DataLoader(os.path.dirname(f), batch_size=1, log_func=lambda *_: None)

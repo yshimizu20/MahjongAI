@@ -41,31 +41,75 @@ def _tree(module):
     return ast.parse(open(module.__file__).read())
 
 
-def _imports(tree):
-    """(module, imported name) of every import statement anywhere in the tree."""
+def _origins(tree, module_name):
+    """{local name: dotted origin} of every import in the tree (aliases and relative imports resolved), plus every
+    origin imported anywhere, as (origin, lineno) pairs."""
+    package = module_name.rsplit(".", 1)[0].split(".")
+    bound, imported = {}, []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            yield from ((a.name, None) for a in node.names)
+            for a in node.names:
+                bound[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
+                imported.append((a.name, node.lineno))
         elif isinstance(node, ast.ImportFrom):
-            mod = node.module or ""
-            yield from ((mod, a.name) for a in node.names)
+            base = package[:len(package) - node.level + 1] if node.level else []
+            mod = ".".join(base + ([node.module] if node.module else []))
+            for a in node.names:
+                bound[a.asname or a.name] = f"{mod}.{a.name}"
+                imported.append((f"{mod}.{a.name}", node.lineno))
+    return bound, imported
+
+
+def _parser_origin(origin):
+    return (any(origin == m or origin.startswith(m + ".") for m in PARSER_MODULES)
+            or origin.rsplit(".", 1)[-1] in TOKEN_BUILDERS)
+
+
+def _dynamic_imports(tree):
+    return [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and (
+        (isinstance(n.func, ast.Name) and n.func.id == "__import__")
+        or (isinstance(n.func, ast.Attribute) and n.func.attr == "import_module"))]
+
+
+def _oracle_closure(functions):
+    """ORACLES plus every gates.py function they call, directly or through each other (parser-side ones excluded)."""
+    todo, seen = list(ORACLES), set()
+    while todo:
+        name = todo.pop()
+        if name in seen or name in PARSER_SIDE or name not in functions:
+            continue
+        seen.add(name)
+        todo += [n.id for n in ast.walk(functions[name]) if isinstance(n, ast.Name) and n.id in functions]
+    return seen
 
 
 def test_oracle_independence():
     for module in (legal_oracles, win_oracles):
-        hits = [(m, n) for m, n in _imports(_tree(module))
-                if m in PARSER_MODULES or f"{m}.{n}" in PARSER_MODULES or (m == "MahjongAI" and f"MahjongAI.{n}" in PARSER_MODULES)]
+        tree = _tree(module)
+        _, imported = _origins(tree, module.__name__)
+        hits = [(o, line) for o, line in imported if _parser_origin(o)]
         assert not hits, f"{module.__name__} imports parser code: {hits}"
+        assert not _dynamic_imports(tree), f"{module.__name__} imports dynamically at lines {_dynamic_imports(tree)}"
     tree = _tree(gates)
-    hits = [(m, n) for m, n in _imports(tree) if n in TOKEN_BUILDERS or m.split(".")[-1] in TOKEN_BUILDERS]
+    bound, imported = _origins(tree, gates.__name__)
+    hits = [(o, line) for o, line in imported if o.rsplit(".", 1)[-1] in TOKEN_BUILDERS]
     assert not hits, f"gates.py imports a parser builder: {hits}"
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     missing = (ORACLES | PARSER_SIDE) - set(functions)
     assert not missing, f"gates.py lost the functions {sorted(missing)}: update this test"
-    hits = {name: sorted({x.id for x in ast.walk(fn) if isinstance(x, ast.Name) and x.id in BANNED_IN_ORACLES})
+    # every function outside the parser side: none of the banned names, however they are reached
+    hits = {name: sorted({x.id for x in ast.walk(fn) if isinstance(x, ast.Name) and x.id in BANNED_IN_ORACLES}
+                         | {x.attr for x in ast.walk(fn) if isinstance(x, ast.Attribute) and x.attr in TOKEN_BUILDERS})
             for name, fn in functions.items() if name not in PARSER_SIDE}
     hits = {k: v for k, v in hits.items() if v}
     assert not hits, f"gate functions outside {sorted(PARSER_SIDE)} reference parser code: {hits}"
+    # the oracles and every helper they call: no name bound to parser code under any alias
+    closure = _oracle_closure(functions)
+    hits = {name: sorted({x.id for x in ast.walk(functions[name]) if isinstance(x, ast.Name)
+                          and _parser_origin(bound.get(x.id, ""))}) for name in closure}
+    hits = {k: v for k, v in hits.items() if v}
+    assert not hits, f"oracle functions (and their helpers) reach parser code: {hits}"
+    assert not _dynamic_imports(tree), f"gates.py imports dynamically at lines {_dynamic_imports(tree)}"
 
 
 def _every_meld_code():
@@ -98,8 +142,12 @@ def test_decode_meld_exhaustive():
         assert meld.kind == kind and meld.from_rel == nk.from_who() and meld.code == m, (m, meld)
         assert sorted(legal_oracles.taken_ids(meld)) == sorted(exposed), (m, meld, exposed)
         if kind == "kakan":
-            assert acquired is None and meld.added == exposed[0] and len(set(meld.ids)) == 4, (m, meld)
-            assert meld.called in meld.ids and meld.called != meld.added, (m, meld)
+            k = meld.added // 4
+            assert acquired is None and meld.added == exposed[0] and meld.ids == tuple(range(4 * k, 4 * k + 4)), (m, meld)
+            pon_code = (m & ~0x10) | 0x8  # the pon this kakan extends: same kind, called position and unused copy
+            pon, pon_acquired = legal_oracles.decode_meld(pon_code), Naki(pon_code).get_exposed()[1]
+            assert meld.called == pon.called == pon_acquired, (m, meld, pon)
+            assert set(pon.ids) | {meld.added} == set(meld.ids) and meld.added not in pon.ids, (m, meld, pon)
         else:
             assert meld.called == acquired and meld.added is None, (m, meld, acquired)
             assert sorted(meld.ids) == sorted(exposed + ([acquired] if acquired is not None else [])), (m, meld)
