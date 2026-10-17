@@ -1,8 +1,17 @@
 """Pre-training gate checks: the parsed data must agree with the XML ground truth and with itself.
 
-    python -m MahjongAI.utils.gates --games 150      # random games from DEFAULT_DAYS; every gate is an assert
+    python -m MahjongAI.utils.gates --games 150      # random games from every DEFAULT_POOL day (2021 and 2022)
+    python -m MahjongAI.utils.gates --year 2022      # that year's pool days (2022: the T-005 val week)
+    python -m MahjongAI.utils.gates --year 2019      # a year outside the pool: up to 12 of its day dirs (--seed)
+    python -m MahjongAI.utils.gates --year 2021 --days 20210101 20210102   # explicit days (of that year)
     python -m MahjongAI.utils.gates --test           # self-test: passes on a clean game, raises on corrupted ones
-Run from the directory that contains MahjongAI/ (python -I would drop it from sys.path).
+Run from the directory that contains MahjongAI/ (python -I would drop it from sys.path). Without --year the run
+samples the whole pool, both years (T-042; before it, the default was 12 days of 2021 only).
+
+The self-test proves that every gate name failed_gates can return fails under at least one corruption (T-041): a
+parser gate under a corruption of the parser, the builder or the parse itself; a GATE_ONLY check (its comparison
+holds no parser output) under any corruption. A corruption that patches gate code is detected at run time
+(gate_fingerprint, watch_gate_code), not labelled by hand. A new gate without a corruption fails the self-test.
 
 A clean run prints ONE line. A failing gate raises AssertionError with the offending counts.
 Gate groups (counted over every game, round, halfturn and built tensor):
@@ -154,6 +163,7 @@ KYUUSHU_AFTER_CALL_LOG = ("20210101", "2021010115gm-00a9-0000-52ecaf6b.log", YAO
 NINTH_KIND_DRAWN_ABORT_LOG = ("20210101", "2021010101gm-00a9-0000-004c8ef1.log", YAO9)  # round 1 seat 2: 8 kinds + the draw
 NINTH_KIND_DRAWN_DECLINED = ("20210101", "2021010102gm-00a9-0000-54704a83.log", 2)  # seat 3: 8 kinds + the draw, declined
 KYUUSHU_DECLINED = ("20210101", "2021010100gm-00a9-0000-c8ce9c2b.log", 4)  # seat 3 declines an offer
+KYUUSHU_LATER_NINE = ("20210101", "2021010100gm-00a9-0000-c8ce9c2b.log", 9)  # seat 2: 9 kinds on its 6th draw (T-041)
 # T-033 win fixtures. YAKU(i): an <AGARI> whose yaku list holds id i
 def YAKU(i): return rf'<AGARI [^>]*\byaku="(\d+,\d+,)*{i},'
 SEAT_WIND_HOUTEI_LOG = ("20210101", "2021010100gm-00a9-0000-1222e403.log", YAKU(12))  # Haku + seat W; Houtei + Tanyao
@@ -205,8 +215,14 @@ RED_PON = ("20210101", "2021010100gm-00a9-0000-05d6c581.log", None)  # an execut
 RED_CHI_LOG = ("20210101", "2021010100gm-00a9-0000-c7d5dc4b.log", r'<N who="0" m="56583"')  # chi 5-6-7s on 6s, red 5s
 DECLINED_MULTI_YAKU = (10, 185, 1)  # RIICHI_FURITEN_LOG: round, halfturn, seat of a declined Riichi-Sanshoku-Tanyao ron
 FULL_WALL = np.array([4] * 34 + [1] * 3)  # copies per 37-slot index (slots 34-36: the red fives)
-DEFAULT_DAYS = ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
-                "20210709", "20210815", "20210921", "20211030", "20211112", "20211225"]
+# T-042: the default days per year. 2021: 12 spread days + the T-013 val days 2021-12-30/31; 2022: the T-005 val
+# week (supervised_learning.VAL_DAYS, restated: gates.py does not import the training module; a test ties the two)
+DEFAULT_POOL = {
+    "2021": ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
+             "20210709", "20210815", "20210921", "20211030", "20211112", "20211225", "20211230", "20211231"],
+    "2022": [f"202201{d:02d}" for d in range(1, 8)],
+}
+OUTSIDE_POOL_DAYS = 12  # a year outside DEFAULT_POOL: at most this many of its day directories, seeded
 KINDS = ["chi", "pon", "minkan", "ankan", "kakan"]
 LABELLED = ["tsumo", "ron", "riichi", "kyuushu"] + KINDS  # lab_<k> (parser) == tensor_<k> (built targets) == xml_<k>
 HEADS = ["during", "discard", "post"]
@@ -244,6 +260,24 @@ OPTION_RULES = ["riichi_offer_low_points", "riichi_offer_few_draws", "riichi_off
                 "riichi_ankan_wait_change_offer", "kan_offer_no_draw", "kan_offer_over_cap", "call_offer_last_discard",
                 "call_offer_kan4_abort", "call_offer_in_chankan", "call_offer_no_legal_discard",
                 "kyuushu_offer_not_first_draw", "kyuushu_offer_after_call", "kyuushu_offer_few_kinds"]
+# T-041: the checks no parser defect can move. Their comparison holds no parser or builder output (only the XML
+# replay, the oracle routes on it, the raw XML), so only a fault of the oracle or of the gate loop fails them; for
+# these names a corruption that patches gate code is the right one, and it counts (gate_coverage_gaps).
+GATE_ONLY = {
+    "agari_coverage": "xml_rounds' AGARI count vs the raw regex counts",
+    "replay_ba_mismatch": "the replay's honba / kyotaku vs <RYUUKYOKU ba>",
+    "replay_ba_coverage": "the replay's RYUUKYOKU count vs the raw regex count",
+    "yaku_library_vs_tenhou": "the library route on the replay vs the <AGARI> yaku",
+    "yaku_exists_vs_tenhou": "has_yaku on the replay vs the <AGARI> yaku",
+    "yaku_anchor_coverage": "the anchor loop over the replay's wins vs the raw AGARI count",
+    "yaku_exists_vs_library": "has_yaku vs the library, both on the replay",
+    "yaku_oracle_error": "a library error on the replay",
+}
+# T-041: gate names no corruption can fail, each with its reason. Empty: every gate has a corruption. The self-test
+# reports an entry that a corruption covers, or that failed_gates cannot return.
+UNTESTED_GATES = {}
+# the module globals the self-test's spy replaces (left out of gate_fingerprint)
+WATCHED = ("count_game", "process")
 Snap = collections.namedtuple("Snap", ["hands", "melds", "draws_left", "scores", "reaches", "last_draw", "actor", "tile",
                                        "window", "own_draws", "called", "doras", "seen", "wall_out", "ids", "discards",
                                        "honba", "kyotaku", "oya", "seed0", "n_rounds", "rinshan", "n_tokens"])
@@ -1652,7 +1686,11 @@ def run(files, tp=None):
 
 
 def failed_gates(C) -> dict:
-    """{gate: offending value} for every gate that fails; empty when all pass."""
+    """{gate: offending value} for every gate that fails; empty when all pass.
+    Contract (T-041; gate_names() reads the gate names off this function by probing it, and test_gates.py enforces
+    the contract on its AST): every gate is `counter expression != counter expression` (integer coefficients below
+    500 in size), `C[x] != 0` / a truth test on C[x], or `C[x] == 0`. The only numeric literal a comparison may hold
+    is 0, and the only comparison operators are ==, != (and `in` on names)."""
     bad = {}
     if C["games"] == 0:
         bad["games"] = "no game parsed"
@@ -1737,6 +1775,98 @@ def check(C):
         + f" | extension-round states {C['diag_extension_round_states']} | BYE-truncated games "
         f"{C['bye_truncated_games']}"
     )
+
+
+class _ProbeCounter(collections.Counter):
+    """A counter whose n-th distinct key read (n = 0, 1, ...) holds 1000 ** (n + 1): distinct base-1000 digits, so
+    no linear combination with integer coefficients below 500 in size makes two sides of a `!=` equal."""
+
+    def __init__(self):
+        super().__init__()
+        self.rank = {}
+
+    def __missing__(self, key):
+        return 1000 ** (self.rank.setdefault(key, len(self.rank)) + 1)
+
+
+def gate_names() -> set:
+    """Every gate name failed_gates can return, read off failed_gates itself (no second list): the union of its
+    verdicts on an all-zero counter (the `== 0` gates) and on a _ProbeCounter (every `!=` / non-zero gate). Complete
+    under the contract in the failed_gates docstring."""
+    names = set(failed_gates(collections.Counter())) | set(failed_gates(_ProbeCounter()))
+    missing = set(ZERO_GATES) - names
+    assert not missing, f"gate_names: the probes miss the ZERO_GATES {sorted(missing)}"
+    return names
+
+
+def gate_coverage_gaps(names, sides, gate_only, untested) -> list:
+    """T-041 meta-check, sorted messages (empty = every gate is proven able to fail). names: gate_names(); sides:
+    {gate: set of 'parser' / 'gate'}, the sides of the corruptions that failed it; gate_only, untested: GATE_ONLY,
+    UNTESTED_GATES. Reported: a parser gate (neither list) with no parser-side corruption; a gate-only check with no
+    corruption at all; stale entries: a gate_only / untested name failed_gates cannot return, an untested name a
+    corruption covers, a name on both lists."""
+    gaps = []
+    for name in sorted(set(names) - set(gate_only) - set(untested)):
+        if "parser" not in sides.get(name, ()):
+            only = " (gate-code corruptions only)" if sides.get(name) else ""
+            gaps.append(f"{name}: parser gate with no parser-side corruption{only}")
+    for name in sorted(set(gate_only) & set(names)):
+        if not sides.get(name):
+            gaps.append(f"{name}: gate-only check with no corruption")
+    for label, listed in (("GATE_ONLY", gate_only), ("UNTESTED_GATES", untested)):
+        for name in sorted(set(listed) - set(names)):
+            gaps.append(f"{name}: stale {label} entry (failed_gates cannot return it)")
+    for name in sorted(set(untested) & set(names)):
+        if sides.get(name):
+            gaps.append(f"{name}: in UNTESTED_GATES but a corruption fails it (drop the entry)")
+    for name in sorted(set(gate_only) & set(untested)):
+        gaps.append(f"{name}: on both GATE_ONLY and UNTESTED_GATES")
+    return sorted(gaps)
+
+
+def gate_fingerprint() -> dict:
+    """{module.attribute: (id, shallow copy of a dict / list / set / tuple value)} of every global of the gate code
+    (this module, win_oracles, legal_oracles), WATCHED left out. A patch of a gate function or oracle, or an edit of a
+    module-level table, changes it; a patch of the parser, the builder, a parse object or the mahjong library does
+    not. Shallow: a mutation inside an oracle object (a class attribute, an instance) is not seen."""
+    me = sys.modules[__name__]
+    out = {}
+    for mod in (me, win_oracles, legal_oracles):
+        for k, v in vars(mod).items():
+            if k.startswith("__") or (mod is me and k in WATCHED):
+                continue
+            out[f"{mod.__name__}.{k}"] = (id(v), copy.copy(v) if isinstance(v, (dict, list, set, tuple)) else None)
+    return out
+
+
+@contextlib.contextmanager
+def watch_gate_code():
+    """T-041 (b): decide at run time whether a corruption patches gate code. While active, count_game and process run
+    behind a spy that compares gate_fingerprint() with its value at entry at EVERY call; yields (check, touched):
+    check() compares once more on demand (a corruption with no count call), touched is non-empty once any comparison
+    differed. Limits: a gate patch entered and left entirely inside one count_game / process call is not seen, nor
+    is a mutation inside an oracle object (gate_fingerprint is shallow)."""
+    me = sys.modules[__name__]
+    f0, touched = gate_fingerprint(), []
+
+    def check():
+        if not touched and gate_fingerprint() != f0:
+            touched.append(True)
+
+    def spy(fn):
+        def watched(*a, **kw):
+            check()
+            return fn(*a, **kw)
+        return watched
+
+    saved = {k: getattr(me, k) for k in WATCHED}
+    for k, fn in saved.items():
+        setattr(me, k, spy(fn))
+    try:
+        yield check, touched
+    finally:
+        for k, fn in saved.items():
+            setattr(me, k, fn)
 
 
 def _first_valid_game():
@@ -1986,7 +2116,20 @@ def legal_samples(H, T):
 
 def self_test():
     """Clean games pass every gate; each corruption, applied to a game that passes every gate, must fail its NAMED
-    gate (another gate failing as well is allowed). Also: a one-loader cluster rolls over at the epoch boundary."""
+    gate (another gate failing as well is allowed). Also: a one-loader cluster rolls over at the epoch boundary.
+    T-041 meta-check (last): every name of gate_names() failed under a corruption of the right side
+    (gate_coverage_gaps); one line `self-test OK: N gate names, ...` on success."""
+    sides = collections.defaultdict(set)  # gate -> the sides ('parser' / 'gate') of the corruptions that failed it
+    clean_counts = {}  # game path -> its clean counters (a game's clean baseline is counted once)
+
+    def record(gate, side):
+        sides[gate].add(side)
+
+    def clean_count(game):
+        if game not in clean_counts:
+            clean_counts[game] = _count(game)
+        return clean_counts[game]
+
     f = _first_valid_game()
     ron3 = _named_game(RON3_LOG)
     red_kan_dora = _named_game(RED_KAN_DORA_LOG)
@@ -2012,8 +2155,11 @@ def self_test():
         raise SystemExit(f"self-test FAILED: own-turn action after own discard: (games, skipped_invalid, after_own"
                          f"_discard, parse_error) {got} != (0, 3, 3, 0), clean "
                          f"{clean['skipped_invalid_after_own_discard']}")
+    if "games" not in failed_gates(bad):  # 3 real logs the parser rejects: no game parsed
+        raise SystemExit(f"self-test FAILED: 0 games parsed did not fail the games gate: {failed_gates(bad)}")
+    record("games", "parser")
     print("self-test OK: own-turn action after own discard -> skipped_invalid_after_own_discard=3, parse_error=0 "
-          "(clean 0)")
+          "(clean 0); games gate fails on 0 parsed games")
     # T-044: the BYE games pass every gate on their kept part; T-043: the run-24 game is accepted
     got = tuple(clean[k] for k in ("bye_truncated_games", "skipped_invalid_auto_played", "skipped_invalid_bye"))
     if got != (2, 0, 0):
@@ -2028,31 +2174,38 @@ def self_test():
         raise SystemExit(f"self-test FAILED: auto-played seat: (games, skipped_invalid, auto_played, parse_error) "
                          f"{got} != (0, 3, 3, 0)")
     print("self-test OK: auto-played seat -> skipped_invalid_auto_played=3, parse_error=0 (clean 0)")
-    with mock.patch.object(process_xml, "_auto_played_seat", lambda rounds: None):
+    with watch_gate_code() as (_, touched), mock.patch.object(process_xml, "_auto_played_seat", lambda rounds: None):
         C = run(autos)
     failed = failed_gates(C)
     if C["games"] != 3 or set(failed) != {"auto_played_accepted"}:
         raise SystemExit(f"self-test FAILED: parser without the auto-play rule: games {C['games']}, failed {failed} "
                          f"(expected 3 games failing auto_played_accepted only)")
+    record("auto_played_accepted", "gate" if touched else "parser")
     print(f"self-test OK: parser without the auto-play rule -> auto_played_accepted={failed['auto_played_accepted']}")
 
     def expect_failure(name, gate, corrupt, game=f, absent=(), fields=()):
         """corrupt(H, T, tp) edits the parse in place; it may return a context manager that stays active while the
         game is counted. gate: one gate name or a tuple of names, every one of which must fail. absent: gates that
         must NOT fail (the corruption is invisible to them). fields: state_xml_<field> counters that must be > 0
-        (the named STATE fields drifted)."""
+        (the named STATE fields drifted). The side of the corruption (T-041) is decided by watch_gate_code, never
+        by hand: 'gate' when gate code differed at any count / parse call or right after corrupt returned (inside
+        its context), else 'parser'; record() files it for every named gate."""
         gates = (gate,) if isinstance(gate, str) else gate
-        baseline = failed_gates(_count(game))
+        baseline = failed_gates(clean_count(game))
         if baseline:
             raise SystemExit(f"self-test FAILED: {name}: the clean game {game} already fails {baseline}")
         tp = TransformerTensorProcessor()
         H, T = process(game)
-        ret = corrupt(H, T, tp)  # a context manager kept active while the game is counted, or run()'s counters
-        if hasattr(ret, "__enter__"):
-            with ret:
-                C = _count(game, H, T, tp)
-        else:
-            C = ret if ret is not None else _count(game, H, T, tp)
+        with watch_gate_code() as (check_now, touched):
+            ret = corrupt(H, T, tp)  # a context manager kept active while the game is counted, or run()'s counters
+            if hasattr(ret, "__enter__"):
+                with ret:
+                    check_now()
+                    C = _count(game, H, T, tp)
+            else:
+                check_now()
+                C = ret if ret is not None else _count(game, H, T, tp)
+        side = "gate" if touched else "parser"
         bad = failed_gates(C)
         missed = [g for g in gates if g not in bad] + [f"state_xml_{x}" for x in fields if not C[f"state_xml_{x}"]]
         if missed:
@@ -2060,7 +2213,10 @@ def self_test():
         caught = [g for g in absent if g in bad]
         if caught:
             raise SystemExit(f"self-test FAILED: {name} also failed {caught}, which must not see it (failed: {bad})")
-        print(f"self-test OK: {name} -> " + ", ".join(f"{g}={bad[g]}" for g in gates)
+        for g in gates:
+            record(g, side)
+        print(f"self-test OK: {name}{' [gate code]' if side == 'gate' else ''} -> "
+              + ", ".join(f"{g}={bad[g]}" for g in gates)
               + "".join(f", state_xml_{x}={C[f'state_xml_{x}']}" for x in fields)
               + "".join(f", {g} passes" for g in absent))
 
@@ -2353,13 +2509,27 @@ def self_test():
                    reparse(riichi_offer_game, kans_on_table=at_draw(riichi_offer_game, DECISION_REACH_IDX, (4, 2))),
                    game=riichi_offer_game)
 
-    def replay_sees_kans(fake):  # the gate's replay believes `fake` kans are down: the counters must see real offers
-        return lambda H, T, tp: mock.patch.object(sys.modules[__name__], "snap_kans", lambda snap: fake)
+    def n_kans(so):  # kans on the table in a parser state (meld codes decoded as data)
+        return sum(1 for q in range(4) for m in decoded_melds(so, q) if m.kind in ("ankan", "minkan", "kakan"))
 
-    expect_failure("replay sees 4 kans (one owner): real kan offers counted", "kan_offer_over_cap",
-                   replay_sees_kans((4, 1)), game=g["kan_offer_unexecuted"])
-    expect_failure("replay sees suukaikan pending: real riichi offers counted", "riichi_offer_after_kan4",
-                   replay_sees_kans((4, 2)), game=g["riichi_offer_unexecuted"])
+    def offers_after_kan4(H, T, tp):  # the parser offers a riichi on the 4th kan's rinshan draw and a daiminkan on
+        # the kan player's discard after it (KAN4_ROUND: 4 kans by 2 players, suukaikan pending)
+        hs = H[KAN4_ROUND[2]]
+        rinshan = next((t for t in hs if isinstance(t, DuringTurn) and n_kans(t.stateObj) == 4), None)
+        found(rinshan is not None and not rinshan.decisions[DECISION_REACH_IDX], "the 4th kan's rinshan draw, no riichi offer")
+        rinshan.decisions[DECISION_REACH_IDX].append(ReachDecision(rinshan.player, executed=False))
+        i = hs.index(rinshan)
+        post = next((t for t in hs[i + 1:] if isinstance(t, PostTurn) and t.responder_states), None)
+        disc = hs[hs.index(post) - 1] if post is not None else None
+        found(isinstance(disc, DiscardTurn), "a discard after the 4th kan")
+        p = next(iter(post.responder_states))
+        kind = disc.discarded_tile // 4
+        post.decisions[p][DECISION_NAKI_IDX].append(
+            NakiDecision(p, Naki.from_minkan_info(kind, (post.player - p) % 4, 1), False))
+
+    expect_failure("parser offers a riichi and a daiminkan after the 4th kan by two players",
+                   ("kan_offer_over_cap", "riichi_offer_after_kan4", "post_mask_mismatch", "during_mask_mismatch"),
+                   offers_after_kan4, game=g["kan4"])
 
     def drop_executed_riichi_ankan(H, T, tp):  # after parsing: a legal, executed riichi ankan removed
         for t in (t for halfturns in H for t in halfturns if isinstance(t, DuringTurn) and t.stateObj.reaches[t.player]):
@@ -2526,14 +2696,15 @@ def self_test():
         _patch_mask(tp, first_sample_only(lambda turn, m: m.zero_()))
 
     def offer_riichi_off_tenpai(H, T, tp):  # a riichi offered on a hand with no tenpai-keeping discard
-        # the turn is picked with the gate's own oracle: this tests the gate's wiring, not the oracle (that is
-        # covered by riichi_mask_mismatch, which compares it with an independent shanten-based mask)
+        # the turn is picked by the library's Shanten (14-tile shanten >= 1: every discard leaves >= 1-shanten), a
+        # route independent of the gate's own Agari oracle (legal_oracles.tenpai_kinds_by_agari)
+        from mahjong.shanten import Shanten
         for t in (t for halfturns in H for t in halfturns if isinstance(t, DuringTurn)):
-            so = t.stateObj
-            if not t.decisions[DECISION_REACH_IDX] and not legal_oracles.tenpai_kinds_by_agari(so.hand_tensor, decoded_melds(so, t.player)):
+            if not t.decisions[DECISION_REACH_IDX] and Shanten.calculate_shanten(
+                    [int(x) for x in t.stateObj.hand_tensor[:34]]) >= 1:
                 t.decisions[DECISION_REACH_IDX].append(ReachDecision(t.player, executed=False))
                 return
-        found(0, "a DuringTurn whose hand has no tenpai-keeping discard")
+        found(0, "a DuringTurn whose hand is 1-shanten or worse")
 
     def tsumogiri_declaration(H, T):  # a declaration whose discard is the drawn tile: the flag alone decides its fate
         return any(t.is_riichi_declaration and (tokens[t.encoding_idx] >> 7) & 1
@@ -2664,10 +2835,13 @@ def self_test():
         expect_failure(f"{name} flag off", "yaku_oracle_mismatch", rerun(game, win_context_with(**{flag: False})), game=game)
     suuankou = _named_game(SUUANKOU_LOG)
 
-    def suuankou_ids_swapped(H, T, tp):  # Tenhou: Suuankou 40, SuuankouTanki 41; swapped here
-        with mock.patch.dict(win_oracles.TENHOU_YAKU_ID, {"Suuankou": 41, "SuuankouTanki": 40}):
-            return _count(suuankou, H, T, tp)
-    expect_failure("suuankou ids swapped", "yaku_oracle_mismatch", suuankou_ids_swapped, game=suuankou)
+    swap_suuankou, parser_win_yaku = {"Suuankou": "SuuankouTanki", "SuuankouTanki": "Suuankou"}, agari.win_yaku
+
+    def suuankou_names_swapped(*a):  # the parser's yaku list names Suuankou / SuuankouTanki the other way round
+        out = parser_win_yaku(*a)
+        return out if out is None else tuple(swap_suuankou.get(y, y) for y in out)
+    expect_failure("parser win_yaku: Suuankou / SuuankouTanki swapped", "yaku_oracle_mismatch",
+                   rerun(suuankou, mock.patch.object(agari, "win_yaku", suuankou_names_swapped)), game=suuankou)
     expect_failure("yaku check off (shape only)", "win_offer_without_yaku",
                    rerun(f, mock.patch.object(agari, "win_yaku", lambda *a: ())))
     partial = _game_with(partial_discard_furiten)
@@ -2775,21 +2949,24 @@ def self_test():
     expect_failure("after_call cleared on post-call discards", "kuikae_mask_mismatch", clear_after_call,
                    game=_game_with(call_holds_forbidden))
     expect_failure("legal tile removed from an ordinary sample", "discard_mask_unrestricted_mismatch", zero_legal_plain_slot)
-    expect_failure("executed discard masked out", "discard_target_illegal", zero_target_slot)
+    expect_failure("executed discard masked out", ("discard_target_illegal", "discard_label_outside_mask"), zero_target_slot)
     expect_failure("unheld tile enabled", "discard_mask_superset", enable_unheld_slot)
-    expect_failure("all-zero discard mask", "discard_mask_empty", empty_mask)
+    expect_failure("all-zero discard mask (the builder skips the sample)", ("discard_mask_empty", "tensor_skipped"),
+                   empty_mask)
     expect_failure("riichi offered with no tenpai-keeping discard", "riichi_offer_without_legal_discard", offer_riichi_off_tenpai)
     expect_failure("red-only five's red slot cleared", "discard_mask_red_rule", zero_red_only_five,
                    game=_game_with(red_only_legal_five))
     unflag_game = _game_with(tsumogiri_declaration)
     expect_failure("declaration flag cleared (tsumogiri)", "riichi_declaration_unflagged", unflag_tsumogiri_declaration,
                    game=unflag_game)
-    expect_failure("declaration flag cleared (tsumogiri): sample lost", "discard_sample_count_mismatch",
-                   unflag_tsumogiri_declaration, game=unflag_game)
+    expect_failure("declaration flag cleared (tsumogiri): sample lost",
+                   ("discard_sample_count_mismatch", "legal_declaration_coverage"), unflag_tsumogiri_declaration,
+                   game=unflag_game)
 
-    expect_failure("un-labelled ron", "lab_ron", unlabel_ron)
+    expect_failure("un-labelled ron", ("lab_ron", "yaku_coverage", "ba_coverage"), unlabel_ron)
     expect_failure("triple ron left unlabelled", "lab_ron", skip_ron3_marking, game=ron3)
-    expect_failure("executed riichi labels erased", "riichi_label_mismatch", erase_riichi_labels, game=riichi_game)
+    expect_failure("executed riichi labels erased", ("riichi_label_mismatch", "lab_riichi"), erase_riichi_labels,
+                   game=riichi_game)
     expect_failure("tsumogiri bit flipped in the token list", "token_xml_mismatch", flip_tsumogiri_bit)
     expect_failure("wrong responder POV", "post_wrong_pov", wrong_pov)
     expect_failure("responder unseen count -1", "pov_negative", responder_unseen_negative)
@@ -2810,8 +2987,8 @@ def self_test():
                    "dora_draw_to_discard"), open_kan_dora_seen(with_dora=True), game=open_kan)
     expect_failure("open-kan indicator in the discard state's unseen counts only", "pov_xml_mismatch",
                    open_kan_dora_seen(with_dora=False), game=open_kan)
-    expect_failure("open-kan indicator token in the discard history", "dora_draw_to_discard", open_kan_token_seen,
-                   game=open_kan)
+    expect_failure("open-kan indicator token in the discard history", ("dora_draw_to_discard", "open_kan_dora_deferred"),
+                   open_kan_token_seen, game=open_kan)
     expect_failure("ron winner misses the open-kan indicator", "dora_vs_agari", ron_misses_kan_dora, game=open_kan_ron)
     expect_failure("a win left out of the doraHai check", "dora_vs_agari_coverage", unlabel_ron, game=open_kan_ron)
     expect_failure("zeroed ron targets", "tensor_ron", zero_ron_targets)
@@ -2830,7 +3007,8 @@ def self_test():
     expect_failure("bakaze of the post head unchecked", "round_wind_coverage", post_wind_unchecked, game=tonpuu)
     expect_failure("post history truncated to the answered token", "history_prefix_mismatch", truncate_history)
     expect_failure("padding mask all valid", "padding_mask_mismatch", full_padding_mask)
-    expect_failure("post sample answers the token before its event", "post_history_last_token", stale_answered_token)
+    expect_failure("post sample answers the token before its event", ("post_history_last_token", "post_answered_event_hidden"),
+                   stale_answered_token)
 
     # ---- T-040: every gate oracle independent of the parser
     from mahjong.agari import Agari
@@ -2989,7 +3167,7 @@ def self_test():
     expect_failure("e2 discard2idx: red slot -> plain slot", "token_xml_mismatch",
                    rerun(red_discard_game, mock.patch.object(process_xml, "discard2idx", red_discard_plain)),
                    game=red_discard_game)
-    expect_failure("e3 new_dora2idx: kind + 1", "token_xml_mismatch",
+    expect_failure("e3 new_dora2idx: kind + 1", ("token_xml_mismatch", "first_token_not_dora"),
                    rerun(f, mock.patch.object(process_xml, "new_dora2idx", lambda k: orig_dora_tok((k + 1) % 34))))
 
     # (f) executed actions bound to their XML decision point
@@ -3190,6 +3368,238 @@ def self_test():
     expect_failure("j6 replay: the draw answers lost", "action_xml_coverage_riichi",
                    rounds_with(lambda r: dict(r, during_answer=[None] * len(r["during_answer"]))), game=SAMPLE_LOG)
 
+    # ---- T-041: a parser-side corruption for every gate name (the gate-only checks: any corruption)
+    k_games = [_named_game(OPEN_KAN_THEN_ANKAN_LOG), yao9_game]  # together: an XML event of every LABELLED kind
+
+    def over_k(kinds, edit):
+        """A corrupt for expect_failure: edit(H, T, tp) on each game of k_games, their counters summed. Each game
+        passes every gate clean (checked one by one: a sum could hide opposite mismatches), and the clean games hold
+        an XML event of every kind in kinds (else no gate on that kind could fail)."""
+        for k in kinds:
+            found(sum(clean_count(game)[f"xml_{k}"] for game in k_games), f"an XML {k} event in {k_games}")
+
+        def corrupt(H, T, tp):
+            C = collections.Counter()
+            for game in k_games:
+                base = failed_gates(clean_count(game))
+                if base:
+                    raise SystemExit(f"self-test FAILED: the clean game {game} already fails {base}")
+                tpg = TransformerTensorProcessor()
+                Hg, Tg = process(game)
+                edit(Hg, Tg, tpg)
+                C += _count(game, Hg, Tg, tpg)
+            return C
+        return corrupt
+
+    def unlabel_tsumo_and_calls(H, T, tp):  # one executed tsumo and every executed chi / pon / daiminkan / kakan
+        for d in [d for t in _durings(H) for d in t.decisions[DECISION_AGARI_IDX] if d.executed][:1]:
+            d.executed = False
+        for t in (t for hs in H for t in hs):
+            for decs in ([t.decisions] if isinstance(t, DuringTurn) else t.decisions if isinstance(t, PostTurn) else []):
+                for d in decs[DECISION_NAKI_IDX]:
+                    if d.executed and kind_of(d.naki) != "ankan":
+                        d.executed = False
+
+    def zero_win_and_call_targets(H, T, tp):  # built targets: tsumo, ankan, kakan, chi, pon, daiminkan -> pass
+        def edit(td, tdisc, tpost):
+            td[3].masked_fill_((td[3] == 1) | ((td[3] >= 3) & (td[3] <= 70)), 0)
+            tpost[3].masked_fill_((tpost[3] >= 2) & (tpost[3] <= 153), 0)
+        _patch_tensors(tp, edit)
+
+    def drop_durings(H, T, tp):  # every DuringTurn of every round: no round lines up with the replay
+        for hs in H:
+            hs[:] = [t for t in hs if not isinstance(t, DuringTurn)]
+
+    def head_rows(head, keep):  # one built head with only the rows keep (a bool / index tensor) selects
+        enc, xs, mask, y, pad = head
+        return enc[keep], tuple(x[keep] for x in xs), mask[keep], y[keep], pad[keep]
+
+    def without_row(head, i):
+        keep = torch.ones(len(head[3]), dtype=torch.bool)
+        keep[i] = False
+        return head_rows(head, keep)
+
+    def patch_build(tp, edit):  # edit(halfturns, (td, tdisc, tpost)) -> the heads build_tensors returns
+        orig = tp.build_tensors
+        tp.build_tensors = lambda halfturns, tokens: edit(halfturns, orig(halfturns, tokens))
+
+    def no_rows(H, T, tp):  # every head of every round built empty
+        patch_build(tp, lambda halfturns, heads: tuple(
+            head_rows(h, torch.zeros(len(h[3]), dtype=torch.bool)) for h in heads))
+
+    def drop_during_and_post_call_rows(H, T, tp):  # one during row, and the discard row right after a chi / pon
+        done = set()
+
+        def edit(halfturns, heads):
+            td, tdisc, tpost = heads
+            if "during" not in done and len(td[3]):
+                td = without_row(td, 0)
+                done.add("during")
+            samples = [t for t in halfturns if isinstance(t, DiscardTurn)
+                       and not (t.stateObj.reaches[t.player] and not t.is_riichi_declaration)]
+            j = next((j for j, t in enumerate(samples) if t.after_call is not None), None)
+            if "discard" not in done and j is not None:
+                tdisc = without_row(tdisc, j)
+                done.add("discard")
+            return td, tdisc, tpost
+        patch_build(tp, edit)
+
+    def call_target_bit_cleared(H, T, tp):  # the post mask bit of ONE executed call target
+        done = []
+
+        def edit(td, tdisc, tpost):
+            hit = ((tpost[3] >= 2) & (tpost[3] <= 153)).nonzero()
+            if not done and len(hit):
+                i = hit[0, 0].item()
+                tpost[2][i, tpost[3][i]] = 0.0
+                done.append(i)
+        _patch_tensors(tp, edit)
+
+    def build_raises_on_round_0(H, T, tp):
+        orig, calls = tp.build_tensors, []
+
+        def bad(halfturns, tokens):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("self-test: build_tensors fails on round 0")
+            return orig(halfturns, tokens)
+        tp.build_tensors = bad
+
+    def pov_136(H, T, tp):  # one state's unseen count of 1m = 136 (own buffer): unseen + hand > 135 for any hand
+        so = next(_durings(H)).stateObj
+        so.remaining_tiles_pov = np.array(so.remaining_tiles_pov, copy=True)
+        so.remaining_tiles_pov[0] = 136
+
+    def exhaustive_last_draw(hs):  # the last DuringTurn of a round that ends in an exhaustive draw, else None
+        durings, last = [t for t in hs if isinstance(t, DuringTurn)], hs[-1] if hs else None
+        won = isinstance(last, PostTurn) and any(d.executed for p in range(4) for d in last.decisions[p][DECISION_AGARI_IDX])
+        if durings and isinstance(last, PostTurn) and not won and durings[-1].stateObj.remaining_tsumo == 0:
+            return durings[-1]
+        return None
+
+    def tsumo_out_of_range(H, T, tp):  # draws left: -1 in one state, 71 in another, 1 at an exhaustive draw's last
+        last = next(t for t in (exhaustive_last_draw(hs) for hs in H) if t is not None)
+        first, second = [t for t in _durings(H) if t.stateObj is not last.stateObj][:2]
+        first.stateObj.remaining_tsumo, second.stateObj.remaining_tsumo, last.stateObj.remaining_tsumo = -1, 71, 1
+
+    def own_score_2000(H, T, tp):  # one state's own score 200,000 points: x2 = 2000 / 250 = 8 > 5
+        so = next(_durings(H)).stateObj
+        so.scores = list(so.scores)
+        so.scores[so.player] = 2000
+
+    def x2_seats_rolled(H, T, tp):  # the converter's x2 seat columns rolled by one: column 0 is no longer the actor
+        _patch_inputs(tp, lambda x1, x2, x3: x2.copy_(x2.roll(1, dims=2)))
+
+    def x1_plane_dropped(H, T, tp):  # the converter returns one x1 plane fewer
+        orig = tp._convert_state_obj_to_tensors
+
+        def bad(so):
+            x1, x2, x3 = orig(so)
+            return x1[:, :-1], x2, x3
+        tp._convert_state_obj_to_tensors = bad
+
+    def rotation_actor_2(H, T, tp):  # the builder rotates actor 2's history as if seat 3 acted (audit demo)
+        orig = tp._relative_seats
+        tp._relative_seats = lambda tokens, actor: orig(tokens, 3 if actor == 2 else actor)
+
+    def red_discard_target_plain(H, T, tp):  # a red-five discard target moved to its plain slot (the old T-027 bug)
+        def edit(td, tdisc, tpost):
+            for red, plain in RED_TO_PLAIN.items():
+                tdisc[3].masked_fill_(tdisc[3] == red, plain)
+        _patch_tensors(tp, edit)
+
+    def forced_riichi_draw_changed(H, T, tp):  # the drawn tile of one forced riichi discard state
+        for t in (t for hs in H for t in hs if isinstance(t, DiscardTurn)):
+            so = t.stateObj
+            if so.reaches[t.player] and not t.is_riichi_declaration and so.drawn_tile is not None:
+                so.drawn_tile = [(so.drawn_tile[0] + 1) % 34]
+                return
+        found(0, "a forced riichi discard")
+
+    def win_offers_on_incomplete(H, T, tp):  # a ron offer on a hand the tile does not complete, a tsumo offer on an
+        # incomplete hand (audit demo 2); completeness by the library's Shanten (win_oracles), as the gate reads it
+        done = set()
+        for hs, toks in zip(H, T):
+            for t in hs:
+                if ("tsumo" not in done and isinstance(t, DuringTurn) and not t.decisions[DECISION_AGARI_IDX]
+                        and not win_oracles.complete_hand(t.stateObj.hand_tensor[:34], {})):
+                    t.decisions[DECISION_AGARI_IDX].append(AgariDecision(t.player, False, yaku=("Tanyao",)))
+                    done.add("tsumo")
+                kind = answered_kind(toks[t.encoding_idx - 1]) if isinstance(t, PostTurn) and t.encoding_idx else None
+                for p, rs in (t.responder_states.items() if kind is not None and "ron" not in done else ()):
+                    if not t.decisions[p][DECISION_AGARI_IDX] and not win_oracles.complete_on(rs.hand_tensor[:34], kind, {}):
+                        t.decisions[p][DECISION_AGARI_IDX].append(AgariDecision(p, False, yaku=("Tanyao",)))
+                        done.add("ron")
+                        break
+        found(len(done) == 2, "an incomplete DuringTurn and an incomplete PostTurn responder")
+
+    def nine_kinds_later(H, T):  # a seat with >= 9 terminal / honor kinds on a draw other than its first
+        for hs in H:
+            draws = collections.Counter()
+            for t in (t for t in hs if isinstance(t, DuringTurn)):
+                draws[t.player] += 1
+                if draws[t.player] > 1 and legal_oracles.kyuushu_by_rules(t.stateObj.hand_tensor[:34], 1, False):
+                    return True
+        return False
+
+    @staticmethod
+    def library_error(*a, **kw):  # the shared library engine fails on every hand (an error other than no-yaku)
+        res = copy.copy(orig_estimate(*a, **kw))
+        res.error = HandCalculator.ERR_HAND_NOT_WINNING
+        return res
+
+    def chi_index_into_pon(H, T, tp):  # after a clean count, ONE extra index_checks under a post index whose chi
+        # range sits on the pon range (no index 154-163 ever reaches the builder)
+        C = _count(f, H, T, tp)
+        with mock.patch.object(Naki, "get_post_turn_filter_idx",
+                               lambda self: orig_post_idx(self) + (81 if self.is_chi() else 0)):
+            index_checks(C)
+        return C
+
+    def extra_post_x3_row(H, T, tp):  # one copied x3 row appended to the post head (targets kept)
+        def edit(halfturns, heads):
+            td, tdisc, (enc, (x1, x2, x3), mask, y, pad) = heads
+            return td, tdisc, (enc, (x1, x2, torch.cat([x3, x3[-1:]]) if len(x3) else x3), mask, y, pad)
+        patch_build(tp, edit)
+
+    call_kinds = ["tsumo", "chi", "pon", "minkan", "kakan"]
+    expect_failure("10 executed tsumo and calls un-labelled (K)", tuple(f"lab_{k}" for k in call_kinds),
+                   over_k(call_kinds, unlabel_tsumo_and_calls), game=k_games[0])
+    target_kinds = ["tsumo", "chi", "pon", "minkan", "ankan", "kakan"]
+    expect_failure("11 built tsumo / call targets -> pass (K)", tuple(f"tensor_{k}" for k in target_kinds),
+                   over_k(target_kinds, zero_win_and_call_targets), game=k_games[0])
+    expect_failure("12 every DuringTurn dropped (K)", tuple(f"action_xml_coverage_{k}" for k in LABELLED)
+                   + ("during_samples", "dora_draw_to_discard_checked"), over_k(LABELLED, drop_durings), game=k_games[0])
+    expect_failure("14 every head built empty", ("discard_samples", "post_samples"), no_rows)
+    expect_failure("15 a during row and a post-call discard row dropped",
+                   ("during_sample_count_mismatch", "legal_call_coverage"), drop_during_and_post_call_rows, game=chi_game)
+    expect_failure("16 post mask bit of an executed call cleared", "post_label_outside_mask", call_target_bit_cleared,
+                   game=chi_game)
+    expect_failure("17 build_tensors raises on round 0", "tensor_build_error", build_raises_on_round_0)
+    expect_failure("18 one unseen count 136", "pov_sum_too_big", pov_136)
+    exhaustive_game = _game_with(lambda H, T: any(exhaustive_last_draw(hs) is not None for hs in H))
+    expect_failure("19 draws left -1, 71 and 1 at an exhaustive draw", ("tsumo_negative", "tsumo_over_70",
+                   "exhaustive_draw_tsumo_not_zero"), tsumo_out_of_range, game=exhaustive_game)
+    expect_failure("20 own score 2,000 (x2 = 8)", "x_scale_over_5", own_score_2000)
+    expect_failure("21 x2 seat columns rolled by one", "x2_not_actor_first", x2_seats_rolled)
+    expect_failure("22 x1 one plane short", "x1_plane_count", x1_plane_dropped)
+    expect_failure("23 history rotated for seat 3 when actor 2 acts", "rotation_mismatch", rotation_actor_2)
+    expect_failure("24 red-five discard target -> plain slot", "discard_label_mismatch", red_discard_target_plain,
+                   game=red_discard_game)
+    expect_failure("25 forced riichi discard state draws another tile", ("riichi_discard_not_tsumogiri", "tensor_skipped"),
+                   forced_riichi_draw_changed, game=riichi_game)
+    expect_failure("26 win offers on incomplete hands", ("ron_offer_incomplete", "tsumo_offer_incomplete"),
+                   win_offers_on_incomplete)
+    later_nine = _parsed_fixture(KYUUSHU_LATER_NINE, nine_kinds_later)
+    expect_failure("27 parser kyuushu rule: every draw counts as the first",
+                   ("kyuushu_offer_not_first_draw", "during_mask_mismatch"),
+                   reparse(later_nine, kyuushu_legal=lambda hand34, first: kyuushu_legal(hand34, True)), game=later_nine)
+    expect_failure("28 library engine errors at count time (parsed clean first)", "yaku_oracle_error",
+                   lambda H, T, tp: mock.patch.object(HandCalculator, "estimate_hand_value", library_error))
+    expect_failure("32 Naki post index: chi + 81 (one extra index_checks)", ("index_collisions", "index_spill_into_pon"),
+                   chi_index_into_pon)
+    expect_failure("33 an extra x3 row in the post head", "round_wind_coverage", extra_post_x3_row)
+
     from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster
     dl = DataLoader(os.path.dirname(f), batch_size=1, log_func=lambda *_: None)
     dl.file_list = dl.file_list[:1] or [f]
@@ -3198,24 +3608,62 @@ def self_test():
         games, _tokens = next(cluster)
         assert games, "loader rollover returned an empty batch"
     print("self-test OK: one-loader cluster rolls over at the epoch boundary")
+
+    # ---- T-041 meta-check: every gate name failed under a corruption of the right side
+    names = gate_names()
+    gaps = gate_coverage_gaps(names, sides, GATE_ONLY, UNTESTED_GATES)
+    if gaps:
+        raise SystemExit("self-test FAILED: gate coverage (T-041):\n  " + "\n  ".join(gaps))
+    print(f"self-test OK: {len(names)} gate names, {len(names - set(GATE_ONLY) - set(UNTESTED_GATES))} parser-side, "
+          f"{len(set(GATE_ONLY) & names)} gate-only, {len(UNTESTED_GATES)} untested")
     print("self-test passed")
 
 
-if __name__ == "__main__":
+def resolve_days(year, days, seed, root) -> list:
+    """T-042: the day directories a CLI run samples. days given: those days, each 8 digits and of `year` when year is
+    given (else SystemExit naming the day); year in DEFAULT_POOL: its pool days; another year: up to
+    OUTSIDE_POOL_DAYS of the 8-digit day directories of root/<year> (sorted, then sampled with random.Random(seed)),
+    SystemExit when that year has none; no year: every pool day of every year."""
+    if days:
+        bad = [d for d in days if not (len(d) == 8 and d.isdigit() and (year is None or d.startswith(year)))]
+        if bad:
+            raise SystemExit(f"--days {bad}: each day must be 8 digits (YYYYMMDD)"
+                             + (f" of --year {year}" if year is not None else ""))
+        return list(days)
+    if year is None:
+        return [d for y in sorted(DEFAULT_POOL) for d in DEFAULT_POOL[y]]
+    if year in DEFAULT_POOL:
+        return list(DEFAULT_POOL[year])
+    year_dir = os.path.join(root, year)
+    found = sorted(d for d in (os.listdir(year_dir) if os.path.isdir(year_dir) else [])
+                   if len(d) == 8 and d.isdigit() and d.startswith(year))
+    if not found:
+        raise SystemExit(f"--year {year}: no day directory under {year_dir}")
+    return sorted(random.Random(seed).sample(found, min(OUTSIDE_POOL_DAYS, len(found))))
+
+
+def select_files(days, root) -> list:
+    """Every game log root/<day[:4]>/<day>/*/*.log of the days, in day order; SystemExit when there is none."""
+    files = [f for d in days for f in sorted(glob.glob(os.path.join(root, d[:4], d, "*", "*.log")))]
+    if not files:
+        raise SystemExit(f"no games under {root} for the days {list(days)}")
+    return files
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--test", action="store_true", help="run the self-test and exit")
     ap.add_argument("--games", type=int, default=150, help="number of random games to check")
-    ap.add_argument("--year", default="2021")
-    ap.add_argument("--days", nargs="*", default=DEFAULT_DAYS, help="day directories to sample from")
+    ap.add_argument("--year", default=None, help="a year (YYYY); default: every DEFAULT_POOL year")
+    ap.add_argument("--days", nargs="+", default=None, help="day directories (YYYYMMDD) to sample from")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verbose", action="store_true", help="print every counter")
     ap.add_argument("--list-declined", action="store_true", help="print every win offer that was not taken")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.test:
         self_test()
-        raise SystemExit(0)
-    files = [f for d in args.days for f in sorted(glob.glob(os.path.join(DATA_ROOT, args.year, d, "*", "*.log")))]
-    assert files, f"no games under {DATA_ROOT}/{args.year}/{args.days}"
+        return
+    files = select_files(resolve_days(args.year, args.days, args.seed, DATA_ROOT), DATA_ROOT)
     files = random.Random(args.seed).sample(files, min(args.games, len(files)))
     C = run(files)
     if args.verbose:
@@ -3230,3 +3678,7 @@ if __name__ == "__main__":
             for ri, i, seat, kind, yaku, scores in declined_offers(H):
                 print(f"declined {kind}: {os.path.basename(f)} round {ri} halfturn {i} seat {seat} yaku {yaku} scores {scores}")
     check(C)
+
+
+if __name__ == "__main__":
+    main()

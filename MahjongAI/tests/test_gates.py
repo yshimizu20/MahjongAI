@@ -8,11 +8,14 @@ import ast
 import collections
 import os
 import random
+from unittest import mock
 
 import numpy as np
 import pytest
 
+from MahjongAI import process_xml
 from MahjongAI.draw import Naki
+from MahjongAI.process_xml import process
 from MahjongAI.utils import agari, gates, legal_oracles, win_oracles
 from MahjongAI.utils.legal_oracles import Meld
 
@@ -33,7 +36,7 @@ BANNED_IN_ORACLES = {"Naki", "legal", "agari", "gameinfo"} | TOKEN_BUILDERS
 # gates.py functions that read the PARSER's objects or patch the parser: the only ones allowed the banned names
 PARSER_SIDE = {"index_checks", "_option_fixtures", "self_test"}
 # the runner helpers parse a game: the parser's entry point is the one parser name they may hold
-RUNNER = {"run", "_count", "_first_valid_game", "_game_with", "_parsed_fixture"}
+RUNNER = {"run", "_count", "_first_valid_game", "_game_with", "_parsed_fixture", "main"}
 RUNNER_ORIGINS = {"MahjongAI.process_xml.process", "MahjongAI.process_xml.InvalidGameException"}
 # Naki's own decoders: an oracle decodes the raw naki_code with legal_oracles.decode_meld instead
 NAKI_DECODERS = {"get_exposed", "pattern_chi", "pattern_pon", "pattern_kakan", "pattern_minkan", "pattern_ankan"}
@@ -362,3 +365,139 @@ def test_chinroutou_through_both_adapters():  # Tenhou id 44: no hand in the lib
     assert win_oracles.parser_yaku_ids(("Chinroutou",)) == {44}
     exists, lib = _both("111p 999p 11s", 18, False, (0, 8), S, E)
     assert lib == {44} and exists
+
+
+# ---- T-041: every gate name is read off failed_gates and proven able to fail
+
+def test_gate_names(monkeypatch):
+    names = gates.gate_names()
+    assert set(gates.ZERO_GATES) <= names
+    for k in gates.LABELLED:
+        assert {f"lab_{k}", f"tensor_{k}", f"action_xml_coverage_{k}"} <= names, k
+    for h in gates.HEADS:
+        assert {f"{h}_samples", f"{h}_label_outside_mask"} <= names, h
+    assert {"games", "dora_draw_to_discard_checked", "win_yaku_coverage", "agari_coverage"} <= names
+    assert set(gates.GATE_ONLY) <= names and not gates.UNTESTED_GATES
+    monkeypatch.setattr(gates, "ZERO_GATES", gates.ZERO_GATES + ["t041_new_gate"])
+    assert "t041_new_gate" in gates.gate_names()
+
+
+def _contract_violations(fn):
+    """Compare nodes of a function AST that break the failed_gates contract: an operator other than == / != / in /
+    not in, a numeric literal other than 0 as a side, or a non-integer / >= 500 coefficient inside a side."""
+    bad = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not all(isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn)) for op in node.ops):
+            bad.append((node.lineno, "operator"))
+        for side in [node.left] + node.comparators:
+            for sub in ast.walk(side):
+                v = getattr(sub, "value", None) if isinstance(sub, ast.Constant) else None
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    if sub is side and v != 0:
+                        bad.append((node.lineno, f"literal {v}"))
+                    elif sub is not side and not (isinstance(v, int) and abs(v) < 500):
+                        bad.append((node.lineno, f"coefficient {v}"))
+    return bad
+
+
+def test_failed_gates_contract():
+    fn = next(n for n in _tree(gates).body if isinstance(n, ast.FunctionDef) and n.name == "failed_gates")
+    assert not _contract_violations(fn)
+    for dirty in ('if C["x"] == 1: pass', 'if C["x"] > 0: pass', 'if C["x"] != 600 * C["y"]: pass'):
+        assert _contract_violations(ast.parse(dirty)), dirty  # the check can fail
+
+
+def test_gate_coverage_gaps():
+    names, gate_only = {"a", "b", "g"}, {"g": "oracle only"}
+    full = {"a": {"parser"}, "b": {"parser", "gate"}, "g": {"gate"}}
+    assert gates.gate_coverage_gaps(names, full, gate_only, {}) == []
+    assert gates.gate_coverage_gaps(names | {"new"}, full, gate_only, {}) == [
+        "new: parser gate with no parser-side corruption"]
+    assert gates.gate_coverage_gaps(names, {**full, "a": {"gate"}}, gate_only, {}) == [
+        "a: parser gate with no parser-side corruption (gate-code corruptions only)"]
+    assert gates.gate_coverage_gaps(names, {"a": {"parser"}, "b": {"parser"}}, gate_only, {}) == [
+        "g: gate-only check with no corruption"]
+    assert gates.gate_coverage_gaps(names | {"u"}, full, gate_only, {"u": "cannot fail"}) == []
+    assert gates.gate_coverage_gaps(names, full, gate_only, {"a": "cannot fail"}) == [
+        "a: in UNTESTED_GATES but a corruption fails it (drop the entry)"]
+    assert gates.gate_coverage_gaps(names, full, {**gate_only, "old": "gone"}, {"gone": "x"}) == [
+        "gone: stale UNTESTED_GATES entry (failed_gates cannot return it)",
+        "old: stale GATE_ONLY entry (failed_gates cannot return it)"]
+    assert "g: on both GATE_ONLY and UNTESTED_GATES" in gates.gate_coverage_gaps(names, full, gate_only, {"g": "x"})
+
+
+def test_gate_fingerprint():
+    f0 = gates.gate_fingerprint()
+    with mock.patch.object(gates, "snap_kans", lambda snap: (4, 1)):
+        assert gates.gate_fingerprint() != f0
+    with mock.patch.dict(win_oracles.TENHOU_YAKU_ID, {"Suuankou": 41, "SuuankouTanki": 40}):
+        assert gates.gate_fingerprint() != f0
+    assert gates.gate_fingerprint() == f0
+    with mock.patch.object(process_xml, "_is_houtei", lambda *a: False):
+        assert gates.gate_fingerprint() == f0
+    with mock.patch.object(Naki, "get_post_turn_filter_idx", lambda self: 0):
+        assert gates.gate_fingerprint() == f0
+    H, T = process(gates.SAMPLE_LOG)
+    H[0][0].stateObj.honba, T[0][0] = 99, T[0][0] ^ 1
+    assert gates.gate_fingerprint() == f0
+
+
+def test_watch_gate_code(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gates, "count_game", lambda *a: calls.append(a))
+    dummy = gates.count_game
+    with gates.watch_gate_code() as (check, touched):
+        gates.count_game(1)
+        assert not touched  # nothing patched: a parser-side corruption
+        with mock.patch.object(gates, "xml_rounds", lambda raw: []):
+            gates.count_game(2)  # the spy compares at every count call
+        assert touched
+    assert gates.count_game is dummy and calls == [(1,), (2,)]
+    with gates.watch_gate_code() as (check, touched):
+        with mock.patch.object(win_oracles, "has_yaku", lambda *a: False):
+            check()  # no count call: the on-demand comparison
+    assert touched
+
+
+# ---- T-042: per-year default days; the CLI path on the fixture tree
+
+def test_resolve_days(monkeypatch):
+    val_week = [f"202201{d:02d}" for d in range(1, 8)]
+    assert gates.resolve_days("2022", None, 0, GATE_GAMES) == val_week  # the T-042 crash: --year 2022, no --days
+    every = gates.resolve_days(None, None, 0, GATE_GAMES)
+    assert every == gates.DEFAULT_POOL["2021"] + val_week and {"20211230", "20211231"} <= set(every)
+    assert gates.resolve_days("2021", ["20210101", "20210102"], 0, GATE_GAMES) == ["20210101", "20210102"]
+    with pytest.raises(SystemExit, match="20220101"):
+        gates.resolve_days("2021", ["20220101"], 0, GATE_GAMES)
+    with pytest.raises(SystemExit, match="2021011"):
+        gates.resolve_days(None, ["2021011"], 0, GATE_GAMES)
+    assert gates.resolve_days("2020", None, 0, GATE_GAMES) == ["20200719"] == gates.resolve_days("2020", None, 5, GATE_GAMES)
+    with pytest.raises(SystemExit, match="2019"):
+        gates.resolve_days("2019", None, 0, GATE_GAMES)
+    monkeypatch.setattr(gates, "DEFAULT_POOL", {"2022": val_week})  # 2021 outside the pool: 21 fixture day dirs
+    days = sorted(os.listdir(os.path.join(GATE_GAMES, "2021")))
+    got = gates.resolve_days("2021", None, 3, GATE_GAMES)
+    assert len(days) > gates.OUTSIDE_POOL_DAYS and len(got) == gates.OUTSIDE_POOL_DAYS == len(set(got))
+    assert set(got) <= set(days) and got == sorted(got) == gates.resolve_days("2021", None, 3, GATE_GAMES)
+
+
+def test_select_files():
+    files = gates.select_files(gates.resolve_days("2022", None, 0, GATE_GAMES), GATE_GAMES)
+    assert files and all(os.path.relpath(f, GATE_GAMES).split(os.sep)[1] == "20220106" for f in files)
+    files = gates.select_files(gates.resolve_days(None, None, 0, GATE_GAMES), GATE_GAMES)
+    assert {os.path.relpath(f, GATE_GAMES).split(os.sep)[0] for f in files} == {"2021", "2022"}  # both pool years
+    with pytest.raises(SystemExit, match="20190101"):
+        gates.select_files(["20190101"], GATE_GAMES)
+
+
+def test_default_pool_2022_is_the_val_week():
+    from MahjongAI.supervised_learning import VAL_DAYS
+    assert gates.DEFAULT_POOL["2022"] == list(VAL_DAYS)
+
+
+def test_main_cli(monkeypatch, capsys):
+    monkeypatch.setattr(gates, "DATA_ROOT", GATE_GAMES)
+    gates.main(["--year", "2021", "--days", "20210101", "--games", "2"])
+    assert "GATES OK" in capsys.readouterr().out
