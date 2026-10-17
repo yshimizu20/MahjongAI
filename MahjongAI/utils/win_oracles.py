@@ -11,8 +11,10 @@ route (library routes crossed against the parser: see the table in legal_oracles
                                replay's flags, then the structural yaku over the full hand and every standard
                                decomposition (own recursion) with every placement of the win tile
   yaku_ids_by_library          HandCalculator called directly with the replay's REAL 136-ids, decoded melds and a
-                               HandConfig rebuilt from the replay (never agari.WinContext / _build_hand)
-  TENHOU_YAKU_ID / xml_yaku_ids  yaku names mapped to Tenhou's ids, against the <AGARI> attributes
+                               HandConfig rebuilt from the replay (never agari.WinContext / _build_hand); Tenhou
+                               ids by the library's yaku_id map (the parser's route is by class NAME)
+  TENHOU_YAKU_ID / xml_yaku_ids  the parser's canonical yaku names mapped to Tenhou's ids, against the <AGARI>
+                               attributes
 Pure functions over plain values; gates.py extracts those values from the XML replay, the tokens and the halfturns.
 """
 import collections
@@ -21,13 +23,13 @@ from typing import FrozenSet, Iterable, Optional
 
 import numpy as np
 
-from MahjongAI.utils.mahjong_version import require_mahjong_1
+from MahjongAI.utils.mahjong_version import require_mahjong_2
 
-require_mahjong_1()
+require_mahjong_2()
 
 from mahjong.hand_calculating.hand import HandCalculator
 from mahjong.hand_calculating.hand_config import HandConfig, OptionalRules
-from mahjong.hand_calculating.yaku_config import YakuConfig
+from mahjong.hand_calculating.yaku_config import YAKU_ID_TO_TENHOU_ID, YakuConfig
 from mahjong.meld import Meld as LibMeld
 from mahjong.shanten import Shanten
 
@@ -36,21 +38,23 @@ _calculator = HandCalculator()
 
 WINDS = "ESWN"
 XML_BONUS_IDS = frozenset({52, 53, 54})  # dora, ura dora, red dora: never a yaku (ura 53 is listed even with 0 han)
+LIBRARY_BONUS = frozenset({"Dora", "AkaDora", "UraDora"})  # bonus han, never a yaku
 
 
 def _yaku_table() -> dict:
-    """Canonical yaku name (utils/agari.py win_yaku) -> Tenhou id. The library's tenhou_id is right except: every seat
-    wind is 10 and the round wind 11 (Tenhou: 10 + seat wind, 14 + round wind), and Suuankou / SuuankouTanki are
-    swapped (library 41 / 40; Tenhou 40 = suuankou, 41 = suuankou tanki)."""
-    table = {type(y).__name__: y.tenhou_id for y in vars(YakuConfig()).values() if getattr(y, "tenhou_id", None) is not None}
-    # wind yaku reach the parser only as SeatWind / RoundWind (YakuhaiEast..North would be a renaming bug), and
-    # Paarenchan reuses Tenhou's tenhou id (37): none of these may map to an id
-    for name in ("YakuhaiOfPlace", "YakuhaiOfRound", "YakuhaiEast", "YakuhaiSouth", "YakuhaiWest", "YakuhaiNorth",
-                 "Paarenchan", "Dora", "AkaDora"):
-        table.pop(name, None)
+    """Canonical yaku name (utils/agari.py win_yaku) -> Tenhou id, from the library's own map
+    (YAKU_ID_TO_TENHOU_ID by Yaku.yaku_id). The library's wind classes SeatWind<East..North> / RoundWind<East..North>
+    and the bonus han never reach the parser's names, so they are left out; the canonical wind names are added by
+    Tenhou's rule: SeatWind:<w> = 10 + seat wind, RoundWind:<w> = 14 + round wind (E / S / W: no North round).
+    A yaku the library cannot map to a Tenhou id (OpenRiichi, NagashiMangan, Paarenchan, ...) has no entry."""
+    table = {}
+    for y in vars(YakuConfig()).values():
+        name, tenhou_id = type(y).__name__, YAKU_ID_TO_TENHOU_ID.get(type(y).yaku_id)
+        if tenhou_id is None or name in LIBRARY_BONUS or name.startswith(("SeatWind", "RoundWind")):
+            continue
+        table[name] = tenhou_id
     table.update({f"SeatWind:{w}": 10 + i for i, w in enumerate(WINDS)})
     table.update({f"RoundWind:{w}": 14 + i for i, w in enumerate(WINDS[:3])})
-    table.update({"Suuankou": 40, "SuuankouTanki": 41})
     return table
 
 
@@ -119,7 +123,6 @@ WinFlags = collections.namedtuple("WinFlags", ["tsumo", "riichi", "double_riichi
 DRAGONS = (31, 32, 33)
 ORPHANS = (0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33)
 TENHOU_RULES = OptionalRules(has_open_tanyao=True, has_aka_dora=True, has_double_yakuman=False)
-LIBRARY_BONUS = frozenset({"Dora", "AkaDora", "Uradora"})  # bonus han, never a yaku
 
 
 class YakuOracleError(Exception):
@@ -241,9 +244,9 @@ def has_yaku(concealed34, melds, win_kind: int, flags: WinFlags) -> bool:
 def yaku_ids_by_library(concealed_ids, melds, win_id: int, flags: WinFlags) -> FrozenSet[int]:
     """Tenhou yaku ids of the win by mahjong's HandCalculator, called directly on the replay's REAL 136-ids (the
     concealed ones WITH the win tile, plus every meld id) and a HandConfig built from flags, Tenhou's options
-    restated (open tanyao, aka dora, no double yakuman, no renhou). Bonus han dropped; YakuhaiOfPlace -> 10 + seat
-    wind, YakuhaiOfRound -> 14 + round wind; other names through TENHOU_YAKU_ID. Empty when the hand has no yaku;
-    any other library error, or a name without an id, raises YakuOracleError."""
+    restated (open tanyao, aka dora, no double yakuman, no renhou). Bonus han dropped; every other yaku by the
+    library's own id map, YAKU_ID_TO_TENHOU_ID[yaku_id] (never through the canonical names of TENHOU_YAKU_ID).
+    Empty when the hand has no yaku; any other library error, or a yaku without a Tenhou id, raises YakuOracleError."""
     lib_melds, tiles = [], list(concealed_ids)
     for m in melds:
         meld_type = {"chi": LibMeld.CHI, "pon": LibMeld.PON, "minkan": LibMeld.KAN, "ankan": LibMeld.KAN,
@@ -266,12 +269,8 @@ def yaku_ids_by_library(concealed_ids, melds, win_id: int, flags: WinFlags) -> F
         name = type(y).__name__
         if name in LIBRARY_BONUS:
             continue
-        if name == "YakuhaiOfPlace":
-            out.add(10 + flags.seat_wind - 27)
-        elif name == "YakuhaiOfRound":
-            out.add(14 + flags.round_wind - 27)
-        elif name in TENHOU_YAKU_ID:
-            out.add(TENHOU_YAKU_ID[name])
-        else:
+        tenhou_id = YAKU_ID_TO_TENHOU_ID.get(type(y).yaku_id)
+        if tenhou_id is None:
             raise YakuOracleError(f"library yaku {name} has no Tenhou id")
+        out.add(tenhou_id)
     return frozenset(out)

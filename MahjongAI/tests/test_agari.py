@@ -125,6 +125,19 @@ def test_double_east_for_the_dealer_in_the_east_round():
     assert win_yaku(concealed, melds, kind("9m"), ron_ctx(seat=NORTH, rnd=SOUTH)) is None
 
 
+def test_west_round_wind():  # 西入: the library's RoundWindWest class
+    concealed, melds = wind_hand("3z")
+    assert win_yaku(concealed, melds, kind("9m"), ron_ctx(seat=SOUTH, rnd=WEST)) == ("RoundWind:W",)
+    assert win_yaku(concealed, melds, kind("9m"), ron_ctx(seat=WEST, rnd=WEST)) == ("RoundWind:W", "SeatWind:W")
+    assert win_yaku(concealed, melds, kind("9m"), ron_ctx(seat=SOUTH, rnd=SOUTH)) is None
+
+
+def test_north_seat_wind():  # the library's SeatWindNorth class
+    concealed, melds = wind_hand("4z")
+    assert win_yaku(concealed, melds, kind("9m"), ron_ctx(seat=NORTH, rnd=SOUTH)) == ("SeatWind:N",)
+    assert win_yaku(concealed, melds, kind("9m"), ron_ctx(seat=WEST, rnd=SOUTH)) is None
+
+
 def test_wind_helpers():
     assert [seat_wind(p, oya=2) for p in range(4)] == [WEST, NORTH, EAST, SOUTH]
     assert [round_wind(r) for r in (0, 3, 4, 7, 8, 11)] == [EAST, EAST, SOUTH, SOUTH, WEST, WEST]

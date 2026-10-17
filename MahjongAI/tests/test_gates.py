@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from MahjongAI.draw import Naki
-from MahjongAI.utils import gates, legal_oracles, win_oracles
+from MahjongAI.utils import agari, gates, legal_oracles, win_oracles
 from MahjongAI.utils.legal_oracles import Meld
 
 GATE_GAMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "gate_games")
@@ -306,3 +306,47 @@ def test_has_yaku_vs_library():
             bad.append((sorted(concealed), melds, win_id, flags, exists, sorted(lib)))
     assert not bad, f"{len(bad)} / {n} hands disagree, e.g. {bad[:3]}"
     assert 0.2 < yes / n < 0.95, f"{yes} / {n} hands with a yaku: the sample lost one side"
+
+
+# ---- T-036: Tenhou's yaku ids under mahjong 2.x, pinned by hand (a library reassignment must fail here)
+
+TENHOU_IDS = {
+    "Tsumo": 0, "Riichi": 1, "Ippatsu": 2, "Chankan": 3, "Rinshan": 4, "Haitei": 5, "Houtei": 6, "Pinfu": 7,
+    "Tanyao": 8, "Iipeiko": 9,
+    "SeatWind:E": 10, "SeatWind:S": 11, "SeatWind:W": 12, "SeatWind:N": 13,
+    "RoundWind:E": 14, "RoundWind:S": 15, "RoundWind:W": 16,
+    "Haku": 18, "Hatsu": 19, "Chun": 20, "DaburuRiichi": 21, "Chiitoitsu": 22, "Chantai": 23, "Ittsu": 24,
+    "Sanshoku": 25, "SanshokuDoukou": 26, "SanKantsu": 27, "Toitoi": 28, "Sanankou": 29, "Shosangen": 30,
+    "Honroto": 31, "Ryanpeikou": 32, "Junchan": 33, "Honitsu": 34, "Chinitsu": 35, "Renhou": 36, "Tenhou": 37,
+    "Chiihou": 38, "Daisangen": 39, "Suuankou": 40, "SuuankouTanki": 41, "Tsuuiisou": 42, "Ryuuiisou": 43,
+    "Chinroutou": 44, "ChuurenPoutou": 45, "DaburuChuurenPoutou": 46, "KokushiMusou": 47, "DaburuKokushiMusou": 48,
+    "DaiSuushii": 49, "Shousuushii": 50, "Suukantsu": 51,
+}
+
+
+def test_tenhou_yaku_ids_pinned():
+    raw = [n for n in win_oracles.TENHOU_YAKU_ID if n.startswith(("SeatWind", "RoundWind", "Yakuhai")) and ":" not in n]
+    assert not raw, f"library wind class names must never map to an id: {raw}"
+    leaked = {"Dora", "AkaDora", "UraDora", "Paarenchan"} & set(win_oracles.TENHOU_YAKU_ID)
+    assert not leaked, f"bonus han / Paarenchan must never map to an id: {leaked}"
+    assert win_oracles.TENHOU_YAKU_ID == TENHOU_IDS
+
+
+@pytest.mark.parametrize("seat, rnd, expected", [
+    (W, S, {12}),  # seat wind West in the South round
+    (S, W, {16}),  # round wind West (西入), seat South
+    (W, W, {12, 16}),  # both
+])
+def test_wind_ids_by_library(seat, rnd, expected):  # pon West + 123m 789p 456s 99s, ron on 1m
+    exists, lib = _both("23m 1m 789p 456s 99s", 0, False, (W,), seat, rnd)
+    assert lib == expected and exists
+
+
+def test_chinroutou_through_both_adapters():  # Tenhou id 44: no hand in the library differential hit it
+    concealed = np.bincount(_kinds("111p 999p 11s"), minlength=34)
+    melds = [Naki.from_pon_info(0, 0, False, 1), Naki.from_pon_info(8, 0, False, 1)]  # pon 1m, pon 9m
+    ctx = agari.WinContext(is_tsumo=False, seat_wind=S, round_wind=E)
+    assert agari.win_yaku(concealed, melds, 18, ctx) == ("Chinroutou",)
+    assert win_oracles.parser_yaku_ids(("Chinroutou",)) == {44}
+    exists, lib = _both("111p 999p 11s", 18, False, (0, 8), S, E)
+    assert lib == {44} and exists

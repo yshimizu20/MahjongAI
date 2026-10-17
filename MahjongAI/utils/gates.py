@@ -2556,10 +2556,10 @@ def self_test():
         expect_failure(f"{name} flag off", "yaku_oracle_mismatch", rerun(game, win_context_with(**{flag: False})), game=game)
     suuankou = _named_game(SUUANKOU_LOG)
 
-    def suuankou_ids_swapped(H, T, tp):  # the library's own ids: Suuankou 41, SuuankouTanki 40
+    def suuankou_ids_swapped(H, T, tp):  # Tenhou: Suuankou 40, SuuankouTanki 41; swapped here
         with mock.patch.dict(win_oracles.TENHOU_YAKU_ID, {"Suuankou": 41, "SuuankouTanki": 40}):
             return _count(suuankou, H, T, tp)
-    expect_failure("suuankou id override removed", "yaku_oracle_mismatch", suuankou_ids_swapped, game=suuankou)
+    expect_failure("suuankou ids swapped", "yaku_oracle_mismatch", suuankou_ids_swapped, game=suuankou)
     expect_failure("yaku check off (shape only)", "win_offer_without_yaku",
                    rerun(f, mock.patch.object(agari, "win_yaku", lambda *a: ())))
     partial = _game_with(partial_discard_furiten)
@@ -2787,8 +2787,9 @@ def self_test():
     orig_flags = win_flags
     orig_estimate = HandCalculator.estimate_hand_value
 
-    def riichi_not_no_yaku(self, *a, **kw):  # the shared library engine: ERR_NO_YAKU becomes a Riichi
-        res = orig_estimate(self, *a, **kw)
+    @staticmethod
+    def riichi_not_no_yaku(*a, **kw):  # the shared library engine: ERR_NO_YAKU becomes a Riichi
+        res = orig_estimate(*a, **kw)
         if res.error == HandCalculator.ERR_NO_YAKU:
             res = copy.copy(res)
             res.error, res.yaku = None, [YakuConfig().riichi]
@@ -2953,8 +2954,9 @@ def self_test():
     orig_shanten, orig_agari = Shanten.calculate_shanten, Agari.is_agari
 
     def shanten_plus_one_at(counts):
-        def patched(self, tiles_34, *a, **kw):
-            out = orig_shanten(self, tiles_34, *a, **kw)
+        @staticmethod
+        def patched(tiles_34, *a, **kw):
+            out = orig_shanten(tiles_34, *a, **kw)
             return out + 1 if tuple(int(x) for x in tiles_34) == counts else out
         return patched
 
@@ -2979,8 +2981,8 @@ def self_test():
 
     def ron_shape_hidden(H, T, tp):  # the parser (Agari) misses ONE complete ron shape; the oracle asks Shanten
         counts = ron_point(H, T)
-        patched = lambda self, tiles_34, *a, **kw: (False if tuple(int(x) for x in tiles_34) == counts
-                                                   else orig_agari(self, tiles_34, *a, **kw))
+        patched = staticmethod(lambda tiles_34, *a, **kw: (False if tuple(int(x) for x in tiles_34) == counts
+                                                           else orig_agari(tiles_34, *a, **kw)))
         return rerun(ron_shape_game, mock.patch.object(Agari, "is_agari", patched))(H, T, tp)
 
     orig_exposed = Naki.get_exposed
