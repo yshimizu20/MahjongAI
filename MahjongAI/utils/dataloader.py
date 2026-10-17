@@ -20,6 +20,8 @@ class DataLoader:
     expected_skips: None counts every skip and continues; a set of keys raises UnexpectedSkip on any other key.
     logged_skips: keys whose skipped file is also reported through `log_func` (a parse error always is).
     last_batch_files: the files of the games in the batch last returned, in batch order.
+    pending: accepted files of a batch cut short by UnexpectedSkip; the next batch reads them first (kept in the state),
+    so a stop loses no good game while the position stays past the offending one.
     """
 
     def __init__(self, path: str, batch_size: int = 1, log_func: callable = print,
@@ -48,6 +50,7 @@ class DataLoader:
         self.expected_skips = None if expected_skips is None else frozenset(expected_skips)
         self.logged_skips = frozenset(logged_skips)
         self.last_batch_files = []
+        self.pending = []
 
     @staticmethod
     def day_of(file_path: str) -> str:
@@ -59,23 +62,32 @@ class DataLoader:
     def __next__(self):
         self.batch_count += 1
 
-        if self.current_index >= len(self.file_list):
+        if self.current_index >= len(self.file_list) and not self.pending:
             raise StopIteration
 
         all_halfturns_list, all_encoding_tokens_list, files = [], [], []
+        queue, self.pending = self.pending, []
 
-        while self.current_index < len(self.file_list) and len(all_halfturns_list) < self.batch_size:
-            filename = self.file_list[self.current_index]
-            self.current_index += 1
+        while (queue or self.current_index < len(self.file_list)) and len(all_halfturns_list) < self.batch_size:
+            if queue:
+                filename = queue.pop(0)
+            else:
+                filename = self.file_list[self.current_index]
+                self.current_index += 1
 
             try:
                 all_halfturns, all_encoding_tokens = process(filename)
-            except InvalidGameException as e:
-                self._skip(filename, "invalid:" + e.msg, e)
-                continue
-            except Exception as e:  # a parser bug on one game: report it, keep going unless told otherwise
-                self.log_func(f"skipped {filename}: {type(e).__name__}: {str(e)[:200]}")
-                self._skip(filename, type(e).__name__, e)
+            except Exception as e:
+                if isinstance(e, InvalidGameException):
+                    key = "invalid:" + e.msg
+                else:  # a parser bug on one game: report it, keep going unless told otherwise
+                    key = type(e).__name__
+                    self.log_func(f"skipped {filename}: {key}: {str(e)[:200]}")
+                try:
+                    self._skip(filename, key, e)
+                except UnexpectedSkip:
+                    self.pending = files + queue  # the good games already read in this batch are not lost
+                    raise
                 continue
 
             all_halfturns_list.append(all_halfturns)
@@ -95,10 +107,11 @@ class DataLoader:
     def reset(self):
         """Resets the dataloader's current index for re-iteration."""
         self.current_index = 0
+        self.pending = []
 
     def state_dict(self) -> dict:
         return {"current_index": self.current_index, "seed": self.seed, "n_files": len(self.file_list),
-                "skipped": dict(self.skipped)}
+                "skipped": dict(self.skipped), "pending": [os.path.relpath(f, self.path) for f in self.pending]}
 
     def load_state_dict(self, state: dict):
         assert state["seed"] == self.seed and state["n_files"] == len(self.file_list), (
@@ -106,6 +119,7 @@ class DataLoader:
         )
         self.current_index = state["current_index"]
         self.skipped = Counter(state.get("skipped", {}))  # counts of the games before the checkpoint
+        self.pending = [os.path.join(self.path, f) for f in state.get("pending", [])]
 
     def __repr__(self):
         return f"DataLoader(path={self.path}, batch_size={self.batch_size}, n_files={len(self.file_list)}, seed={self.seed})"

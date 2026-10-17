@@ -174,6 +174,7 @@ def fit_prior(log: RunLog) -> dict:
         m, y = torch.cat(masks[head]), torch.cat(labels[head])
         bias[head] = fit_bias_prior(m, y, l2=PRIOR_L2)
         nll, _ = score_bias(bias[head], m, y)
+        assert torch.isfinite(bias[head]).all() and torch.isfinite(nll).all(), f"prior {head}: non-finite bias or NLL"
         unseen = (torch.bincount(y, minlength=m.shape[1]) == 0).sum().item()
         log(f"  prior {head}: n={len(y)}, train CE {nll.mean().item():.4f}, slots never taken {unseen}")
     return bias
@@ -322,6 +323,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
         return {k: v for k, v in c.items() if k != "total_steps"}
 
     current_step, rows = 0, []
+    train_sums = {h: [0.0, 0] for h in HEADS}  # train-mode batch loss x n, n; since the last eval row
     latest_step, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
     if latest_checkpoint:
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=True)
@@ -343,6 +345,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
         current_step = checkpoint["current_step"]
         assert current_step == latest_step, f"{latest_checkpoint} holds step {current_step}"
         bias = {h: checkpoint["prior_bias"][h] for h in HEADS}
+        train_sums = {h: list(checkpoint["train_sums"][h]) for h in HEADS}
         header, _ = metrics.read()
         assert header is not None, f"{metrics.path} is missing: cannot resume a run without its header"
         assert identity(header["config"]) == identity(config) and header["val_ids"] == val.ids, (
@@ -387,8 +390,6 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     def is_save_step(s: int) -> bool:
         return s % save_every == 0 or s == total_steps
 
-    train_sums = {h: [0.0, 0] for h in HEADS}  # train-mode batch loss x n, n; since the last eval row
-
     def evaluate():
         """Row `current_step`: val per head and game, mean train CE since the last row. Row 0 is written only if
         it passes the uniform-legal check, so a restart after that stop checks it again."""
@@ -403,7 +404,6 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
                 "train_ce": train_sums[h][0] / train_sums[h][1] if train_sums[h][1] else None,
                 "train_n": train_sums[h][1],
             }
-            train_sums[h] = [0.0, 0]
         log(f"step {current_step} | val " + " | ".join(
             f"{h} CE {heads[h]['ce']:.4f} (uniform {uniform_ce[h]:.4f}, prior {prior_ce[h]:.4f}) top1 {heads[h]['top1']:.3f} "
             f"n={heads[h]['n']}" + (f" train CE {heads[h]['train_ce']:.4f}" if heads[h]["train_ce"] is not None else "")
@@ -413,8 +413,12 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
             log("row 0 gap to uniform-legal CE: " + " | ".join(f"{h} {gaps[h]:+.4f}" for h in HEADS)
                 + f" (|gap| <= {UNIFORM_ROW0_TOL} required)")
             assert all(abs(v) <= UNIFORM_ROW0_TOL for v in gaps.values()), f"row 0 is not near uniform-legal: {gaps}"
+        bad = {h: heads[h]["ce"] for h in HEADS if not math.isfinite(heads[h]["ce"])}
+        assert not bad, f"non-finite val CE at step {current_step}: {bad}"
         metrics.append({"type": "eval", "step": current_step, "total_steps": total_steps,
                         "lr": optimizer.param_groups[0]["lr"], "heads": heads})
+        for h in HEADS:  # reset only once the row is on disk: a stop before keeps the sums in the checkpoint
+            train_sums[h] = [0.0, 0]
 
     def save_checkpoint():
         """Everything a resume needs, written atomically (*.tmp, then os.replace)."""
@@ -427,6 +431,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
             "loader_state": cluster.state_dict(),
             "prior_bias": bias,
             "torch_rng_state": torch.get_rng_state(),
+            "train_sums": train_sums,
             "config": config,
             "val_ids": val.ids,
         }, path + ".tmp")
@@ -463,7 +468,8 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
 
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # a finite loss can still give non-finite gradients: raise before optimizer.step, the weights stay clean
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, error_if_nonfinite=True)
             consistent = False
             optimizer.step()
             scheduler.step()

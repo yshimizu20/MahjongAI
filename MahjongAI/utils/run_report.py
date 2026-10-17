@@ -15,6 +15,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -57,12 +58,16 @@ def final_row(header: dict, rows: list) -> dict:
     return last
 
 
-def _aligned(a: list, b: list, what: str):
-    """Per-game arrays (n, value_a, value_b) of two per-game lists [id, n, value, ...] in the same game order."""
-    ids_a, ids_b = [r[0] for r in a], [r[0] for r in b]
-    if ids_a != ids_b:
-        bad = next(i for i, (x, y) in enumerate(zip(ids_a, ids_b)) if x != y) if len(ids_a) == len(ids_b) else None
-        raise AssertionError(f"{what}: game ids differ (lengths {len(ids_a)} / {len(ids_b)}, first mismatch at {bad})")
+def _aligned(a: list, b: list, what: str, ids: list):
+    """Per-game arrays (n, value_a, value_b) of two per-game lists [id, n, value, ...]; both must list exactly the
+    header's val_ids in that order (so every head and gate resamples the same games)."""
+    for name, rows in (("reference", a), ("model", b)):
+        got = [r[0] for r in rows]
+        if got != ids:
+            bad = next((i for i, (x, y) in enumerate(zip(got, ids)) if x != y), None)
+            raise AssertionError(f"{what}: {name} game ids differ from the header's val_ids "
+                                 f"(lengths {len(got)} / {len(ids)}, first mismatch at {bad})")
+    ids_a = ids
     n_a, n_b = np.array([r[1] for r in a]), np.array([r[1] for r in b])
     if not np.array_equal(n_a, n_b):
         i = int(np.flatnonzero(n_a != n_b)[0])
@@ -87,18 +92,18 @@ def paired_delta(n: np.ndarray, gain: np.ndarray, idx: np.ndarray):
 def gate_results(header: dict, rows: list) -> list:
     """[GateResult] of G1 (every head), then G2 (only when every G1 head passed)."""
     last = final_row(header, rows)
+    ids = header["val_ids"]
+    assert ids and len(set(ids)) == len(ids), "header val_ids empty or not unique"
+    idx = resamples(len(ids))
     out = []
-    idx = None
     for head in HEADS:
         model_games = [[r[0], r[1], r[2]] for r in last["heads"][head]["games"]]
-        n, prior_nll, model_nll = _aligned(header["prior"][head], model_games, f"G1 {head}")
-        idx = resamples(len(n)) if idx is None else idx
-        assert idx.shape[1] == len(n), f"G1 {head}: {len(n)} games, other heads {idx.shape[1]}"
+        n, prior_nll, model_nll = _aligned(header["prior"][head], model_games, f"G1 {head}", ids)
         delta, q = paired_delta(n, prior_nll - model_nll, idx)
         out.append(GateResult(f"G1 {head}", delta, q, MARGIN[head], int(n.sum()), delta >= MARGIN[head] and q > 0))
     if all(r.passed for r in out):
         model_hits = [[r[0], r[1], r[3]] for r in last["heads"]["discard"]["games"]]
-        n, rule_hits, model = _aligned(header["shanten_greedy"], model_hits, "G2 discard")
+        n, rule_hits, model = _aligned(header["shanten_greedy"], model_hits, "G2 discard", ids)
         delta, q = paired_delta(n, model - rule_hits, idx)
         out.append(GateResult("G2 discard", delta, q, 0.0, int(n.sum()), q > 0))
     return out
@@ -141,8 +146,13 @@ def fig_val_vs_prior(header: dict, rows: list, out):
     try:
         results = gate_results(header, rows)
         verdict = " · ".join(f"{r.gate} {'PASS' if r.passed else 'FAIL'} (Δ {r.delta:+.3f})" for r in results)
-        answer = "state benefit shown on every head" if all(r.passed for r in results) and len(results) == 4 else \
-            "state benefit NOT shown: no scaling"
+        if not all(r.passed for r in results[:len(HEADS)]):
+            answer = "G1 fails: state benefit NOT shown on every head, no scaling"
+        elif not results[-1].passed:
+            answer = ("G1 passes (state benefit on every head), G2 fails (discard imitation does not beat the rule): "
+                      "no scaling yet")
+        else:
+            answer = "G1 and G2 pass: go (T-011 / T-012 speed, then T-010)"
     except AssertionError as e:
         verdict, answer = f"gates not computable: {str(e)[:120]}", "no answer"
     steps = [r["step"] for r in rows]
@@ -220,6 +230,34 @@ def _synthetic(model_gain: dict, discard_hit_gain: float, n_games: int = 60, see
     return header, [row(0, header["prior"] | {}), row(100, games)]
 
 
+def _check_numbers():
+    """Δ is a ratio of sums (not a mean of game means) and the bootstrap quantile matches a plain loop."""
+    ids = ["a", "b", "c", "d"]
+    n = [1, 9, 0, 10]
+    prior, model = [2.0, 9.0, 0.0, 10.0], [1.0, 9.0, 0.0, 9.0]  # gains 1, 0, 0, 1 -> Δ = 2 / 20 = 0.1
+    header = {"val_ids": ids, "prior": {}, "shanten_greedy": [[i, k, 0] for i, k in zip(ids, n)]}
+    heads = {}
+    for head in HEADS:
+        header["prior"][head] = [[i, k, p, 0] for i, k, p in zip(ids, n, prior)]
+        heads[head] = {"games": [[i, k, m, 0] for i, k, m in zip(ids, n, model)]}
+    rows = [{"type": "eval", "step": 5, "total_steps": 5, "heads": heads}]
+    for r in gate_results(header, rows)[:len(HEADS)]:
+        assert abs(r.delta - 0.1) < 1e-12 and r.n == 20, r  # a mean of game means would give (1 + 0 + 0.1) / 3
+
+    rng = np.random.default_rng(7)  # heterogeneous sizes and gains, zero-sample games included
+    k = rng.integers(0, 50, 40).astype(float)
+    k[:3] = 0
+    gain = rng.normal(0.02, 0.3, 40) * k
+    idx = resamples(40)
+    delta, q = paired_delta(k, gain, idx)
+    loop = []
+    for row in idx:
+        nb = sum(k[j] for j in row)
+        loop.append(sum(gain[j] for j in row) / nb if nb else 0.0)
+    assert abs(delta - gain.sum() / k.sum()) < 1e-12 and abs(q - float(np.quantile(loop, QUANTILE))) < 1e-12, (delta, q)
+    print("  numbers: Δ = ratio of sums, bootstrap quantile = plain loop")
+
+
 def _expect_failure(header, rows, needle: str):
     try:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -252,8 +290,25 @@ def self_test():
     _expect_failure(header, rows, "G1 post: FAIL")
     _expect_failure(*_synthetic(clean, -0.02), "G2 discard: FAIL")  # G2: the model agrees less than the rule
 
+    # G2 confidence: Δtop1 > 0, carried by one game, every other game below the rule -> the 2.5 % quantile <= 0
+    header, rows = _synthetic(clean, -0.004)
+    games, rule = rows[-1]["heads"]["discard"]["games"], header["shanten_greedy"]
+    rule[0][2], games[0][3] = 0, games[0][1]
+    g2 = gate_results(header, rows)[-1]
+    assert g2.gate == "G2 discard" and g2.delta > 0 and g2.q025 <= 0 and not g2.passed, g2
+    _expect_failure(header, rows, "G2 discard: FAIL")
+
+    _check_numbers()
+
     header, rows = _synthetic(clean, 0.05)  # id mismatch: the same games in another order
     rows[-1]["heads"]["discard"]["games"] = rows[-1]["heads"]["discard"]["games"][::-1]
+    _expect_failure(header, rows, "game ids differ")
+    header, rows = _synthetic(clean, 0.05)  # reference and model reordered alike: still not the header's order
+    header["prior"]["post"] = header["prior"]["post"][::-1]
+    rows[-1]["heads"]["post"]["games"] = rows[-1]["heads"]["post"]["games"][::-1]
+    _expect_failure(header, rows, "game ids differ")
+    header, rows = _synthetic(clean, 0.05)  # header val_ids that are not the scored games
+    header["val_ids"] = [f"other{i}" for i in range(len(header["val_ids"]))]
     _expect_failure(header, rows, "game ids differ")
     header, rows = _synthetic(clean, 0.05)  # a final row short of the run budget
     rows[-1]["step"] = 90
@@ -272,6 +327,8 @@ if __name__ == "__main__":
         raise SystemExit(0)
     assert args.metrics and args.out, "give a metrics.jsonl and --out"
     header, rows = read_metrics(args.metrics)
+    if os.path.dirname(args.out):
+        os.makedirs(os.path.dirname(args.out), exist_ok=True)
     fig_val_vs_prior(header, rows, args.out)  # first: the figure is the result, also when a gate fails
     print(f"figure: {args.out}")
     check_gates(header, rows)
