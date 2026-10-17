@@ -58,6 +58,13 @@ class InvalidGameException(Exception):
         self.msg = msg
 
 
+def _reject_after_own_discard(curr_halfturn, player: int) -> None:
+    """An own-turn declaration (kan, riichi) right after the actor's own discard: 7 Tenhou logs in 2.2M games (T-046),
+    byte-identical on re-fetch. Tenhou records the declaration as real; the game cannot be replayed. Reject it."""
+    if isinstance(curr_halfturn, PostTurn) and curr_halfturn.player == player:
+        raise InvalidGameException("Own-turn action after own discard")
+
+
 def process(file_path: str, verbose: bool = False):
     gameinfo, rounds = _get_rounds(file_path)
 
@@ -239,6 +246,7 @@ def process(file_path: str, verbose: bool = False):
                 player = int(event["attr"]["who"])
 
                 if event["attr"]["step"] == "1":
+                    _reject_after_own_discard(curr_halfturn, player)
                     assert isinstance(curr_halfturn, DuringTurn) and curr_halfturn.player == player
                     assert acquired is not None
 
@@ -293,6 +301,7 @@ def process(file_path: str, verbose: bool = False):
                 # Label the executed call. Match on the ACTION INDEX the model predicts, never on the
                 # raw Tenhou meld code: its `which`/unused-copy bits depend on tile ids the mask cannot know.
                 if naki.is_ankan() or naki.is_kakan():
+                    _reject_after_own_discard(curr_halfturn, player)
                     assert isinstance(curr_halfturn, DuringTurn) and curr_halfturn.player == player
                     target_idx = naki.get_during_turn_filter_idx()
                     offered = [

@@ -80,6 +80,7 @@ Gate groups (counted over every game, round, halfturn and built tensor):
           read from the XML INIT seed (seed[0] // 4: 0 East, 1 South, 2 West), never from agari.round_wind or
           the StateObject (round_wind_xml); every built row is checked (round_wind_coverage). A North round
           (seed[0] >= 12) is rejected by the parser and counted (skipped_invalid_north, path printed)
+  T-046   a kan / riichi right after the actor's own discard: rejected (skipped_invalid_after_own_discard, path)
 """
 import argparse
 import collections
@@ -155,6 +156,10 @@ OPEN_KAN_THEN_ANKAN_LOG = ("20210108", "2021010823gm-00a9-0000-725fdda5.log",  #
 # T-038 bakaze fixtures: a tonpuu game that reaches South (E1-E4, S1, S2), and a hanchan game that reaches West
 TONPUU_SOUTH_LOG = ("20210101", "2021010100gm-00e1-0000-4762443c.log", r'<GO type="225"[\s\S]*<INIT seed="[4-7],')
 HANCHAN_WEST_LOG = ("20210101", "2021010100gm-00a9-0000-0af99d68.log", r'<GO type="169"[\s\S]*<INIT seed="(8|9|10|11),')
+# T-046 malformed Tenhou logs: an own-turn declaration right after the actor's own discard (kakan, ankan, riichi)
+AFTER_OWN_DISCARD_LOGS = [("20220106", "2022010616gm-00a9-0000-d4d83e3e.log", r'<U88/><E88/><N who="1" m="34834"'),
+                          ("20200719", "2020071919gm-00a9-0000-a0a61b0b.log", r'<V124/><F82/><N who="2" m="31744"'),
+                          ("20220512", "2022051222gm-00a9-0000-b02c0edb.log", r'<W100/><G100/><REACH who="3" step="1"/>')]
 FULL_WALL = np.array([4] * 34 + [1] * 3)  # copies per 37-slot index (slots 34-36: the red fives)
 DEFAULT_DAYS = ["20210103", "20210214", "20210322", "20210430", "20210518", "20210626",
                 "20210709", "20210815", "20210921", "20211030", "20211112", "20211225"]
@@ -1234,6 +1239,9 @@ def run(files, tp=None):
             if e.msg == "North round":  # 0 in 2.2M games: name the file, never hide it in skipped_invalid
                 C["skipped_invalid_north"] += 1
                 print(f"North round rejected: {f}")
+            elif e.msg == "Own-turn action after own discard":  # 7 Tenhou logs in 2.2M games (T-046): name each
+                C["skipped_invalid_after_own_discard"] += 1
+                print(f"Own-turn action after own discard rejected: {f}")
             continue
         except Exception as e:
             C["parse_error"] += 1
@@ -1565,6 +1573,14 @@ def self_test():
     for k in ("round_wind_samples_E", "round_wind_samples_S", "round_wind_samples_W", "round_wind_tonpuu_samples"):
         if not clean[k]:  # the bakaze gate saw every wind and a tonpuu game, or it proves nothing about them
             raise SystemExit(f"self-test FAILED: the clean pool has no {k}")
+    bad = run([_named_game(g) for g in AFTER_OWN_DISCARD_LOGS])
+    got = tuple(bad[k] for k in ("games", "skipped_invalid", "skipped_invalid_after_own_discard", "parse_error"))
+    if got != (0, 3, 3, 0) or clean["skipped_invalid_after_own_discard"] != 0:
+        raise SystemExit(f"self-test FAILED: own-turn action after own discard: (games, skipped_invalid, after_own"
+                         f"_discard, parse_error) {got} != (0, 3, 3, 0), clean "
+                         f"{clean['skipped_invalid_after_own_discard']}")
+    print("self-test OK: own-turn action after own discard -> skipped_invalid_after_own_discard=3, parse_error=0 "
+          "(clean 0)")
 
     def expect_failure(name, gate, corrupt, game=f, absent=()):
         """corrupt(H, T, tp) edits the parse in place; it may return a context manager that stays active while the
