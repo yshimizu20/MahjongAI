@@ -17,9 +17,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from MahjongAI.utils.mahjong_version import require_mahjong_1
+from MahjongAI.utils.mahjong_version import require_mahjong_2
 
-require_mahjong_1()
+require_mahjong_2()
 
 from mahjong.agari import Agari
 from mahjong.constants import EAST
@@ -35,8 +35,13 @@ _agari = Agari()
 _calculator = HandCalculator()
 
 TENHOU_RULES = OptionalRules(has_open_tanyao=True, has_aka_dora=True, has_double_yakuman=False)
-BONUS_YAKU = frozenset({"Dora", "AkaDora", "Uradora"})  # dora never make a hand legal; the synthetic ids create AkaDora
-WIND_LETTERS = "ESWN"
+BONUS_YAKU = frozenset({"Dora", "AkaDora", "UraDora"})  # dora never make a hand legal; the synthetic ids create AkaDora
+# the library's wind yaku classes (one per direction) -> canonical names; Tenhou plays no North round
+WIND_NAMES = {
+    "SeatWindEast": "SeatWind:E", "SeatWindSouth": "SeatWind:S", "SeatWindWest": "SeatWind:W", "SeatWindNorth": "SeatWind:N",
+    "RoundWindEast": "RoundWind:E", "RoundWindSouth": "RoundWind:S", "RoundWindWest": "RoundWind:W",
+    "RoundWindNorth": "RoundWind:N",
+}
 
 FURITEN_DISCARD = "discard"
 FURITEN_TEMP = "temp"
@@ -161,22 +166,19 @@ def _build_hand(concealed34, melds: Sequence[Naki], win_kind: int):
     return tiles, lib_melds, win_tile
 
 
-def _canonical_name(yaku, ctx: WinContext) -> Optional[str]:
+def _canonical_name(yaku) -> Optional[str]:
+    """The canonical name of one library yaku: None for bonus han, WIND_NAMES for a wind, else the class name."""
     name = type(yaku).__name__
     if name in BONUS_YAKU:
         return None
-    if name == "YakuhaiOfPlace":
-        return f"SeatWind:{WIND_LETTERS[ctx.seat_wind - EAST]}"
-    if name == "YakuhaiOfRound":
-        return f"RoundWind:{WIND_LETTERS[ctx.round_wind - EAST]}"
-    return name
+    return WIND_NAMES.get(name, name)
 
 
 def win_yaku(concealed34, melds: Sequence[Naki], win_kind: int, ctx: WinContext) -> Optional[Tuple[str, ...]]:
     """The yaku of a complete hand, or None when it has none.
 
     concealed34: the concealed hand WITH the win tile (3n+2 tiles). Names: the library's yaku class names, bonus
-    yaku dropped, YakuhaiOfPlace -> "SeatWind:<E|S|W|N>", YakuhaiOfRound -> "RoundWind:<E|S|W>".
+    yaku dropped, SeatWind<East..North> -> "SeatWind:<E|S|W|N>", RoundWind<East..West> -> "RoundWind:<E|S|W>".
     Any library error other than "no_yaku" (hand_not_winning included) raises WinRuleError."""
     tiles, lib_melds, win_tile = _build_hand(concealed34, melds, win_kind)
     result = _calculator.estimate_hand_value(tiles, win_tile, lib_melds, [], ctx.hand_config())
@@ -185,7 +187,7 @@ def win_yaku(concealed34, melds: Sequence[Naki], win_kind: int, ctx: WinContext)
     if result.error:
         raise WinRuleError(f"{result.error}: concealed={np.asarray(concealed34)[:34].astype(int).tolist()} "
                            f"melds={list(melds)!r} win_kind={win_kind} ctx={ctx}")
-    names = tuple(sorted(n for n in (_canonical_name(y, ctx) for y in result.yaku) if n is not None))
+    names = tuple(sorted(n for n in (_canonical_name(y) for y in result.yaku) if n is not None))
     if not names:  # the library found a "yaku" that is only dora: still no yaku
         return None
     return names
