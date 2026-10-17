@@ -1077,6 +1077,32 @@ def check_win_anchors(path, xr, halfturns, tokens, C):
             C["replay_ba_mismatch"] += 1
 
 
+def oracle_win_points(xr) -> int:
+    """The complete, non-furiten win points of one round from the XML replay ALONE (no parser halfturn): every
+    during snap whose actor's concealed hand is complete, and every (post snap, seat != actor) whose hand the
+    answered kind completes with no furiten by the token rules. check_wins visits the same points through the
+    parser's halfturns; win_yaku_checked == this count proves that loop skipped none."""
+    memo, n = {}, 0
+    passes = collections.defaultdict(list)
+    for snap in xr["during"]:
+        n += win_oracles.complete_hand(snap.hands[snap.actor][:34], memo)
+    toks = xr["tokens"]
+    for snap in xr["post"]:
+        ans, kind = snap.n_tokens - 1, snap.tile // 4
+        for p in (q for q in range(4) if q != snap.actor):
+            concealed = snap.hands[p][:34]
+            complete = win_oracles.complete_on(concealed, kind, memo)
+            if complete:
+                own = [i for i in range(ans) if _is_discard(toks[i]) and _who(toks[i]) == p]
+                reach = next((i for i in range(ans) if _is_reach(toks[i]) and _who(toks[i]) == p), None)
+                last_own = own[-1] if own else -1
+                n += win_oracles.furiten_reason(
+                    concealed, {answered_kind(toks[i]) for i in own}, any(c for j, c in passes[p] if j > last_own),
+                    reach is not None and any(c for j, c in passes[p] if j > reach), memo) is None
+            passes[p].append((ans, complete))
+    return n
+
+
 def check_wins(path, ri, xr, halfturns, tokens, snaps, C):
     """WIN gates of one round (win_oracles, never utils/agari.py). snaps: per halfturn its replay Snap (None when the
     round is not aligned with the replay: the parser's state and tokens are read instead, and the yaku gates below
@@ -1090,7 +1116,8 @@ def check_wins(path, ri, xr, halfturns, tokens, snaps, C):
                             block reason
       ron/tsumo_offer_incomplete  an offer on an incomplete hand
       win_offer_without_yaku      an offer whose yaku is empty
-      at every complete point with no furiten by the oracle (oracle_complete_points; every tsumo point):
+      at every complete point with no furiten by the oracle (every tsumo point; their number, counted from the
+      replay alone by oracle_win_points, is oracle_complete_points == win_yaku_checked):
       no_yaku_block_mismatch  the parser's offer / no_yaku block != has_yaku
       win_offer_yaku_mismatch an offer (executed or declined) whose Tenhou ids != the library route's
       yaku_exists_vs_library  has_yaku != (library ids non-empty); yaku_oracle_error: a library error
@@ -1136,7 +1163,6 @@ def check_wins(path, ri, xr, halfturns, tokens, snaps, C):
             if t.tsumo_blocked:
                 C[f"diag_tsumo_blocked_{t.tsumo_blocked}"] += 1
             if complete and snap is not None:  # no furiten on a tsumo
-                C["oracle_complete_points"] += 1
                 check_win_point(path, snap, snap.actor, True, offers, t.tsumo_blocked, xr["tokens"], C)
             continue
         if not isinstance(t, PostTurn) or t.encoding_idx == 0:
@@ -1184,7 +1210,6 @@ def check_wins(path, ri, xr, halfturns, tokens, snaps, C):
                         print(f"furiten mismatch in {os.path.basename(path)} round {ri} token {ans} seat {p} kind "
                               f"{kind}: parser {blocked}, oracle {verdict}")
                 if verdict is None and snap is not None:
-                    C["oracle_complete_points"] += 1
                     check_win_point(path, snap, p, False, offers, blocked, toks, C)
             passes[p].append((ans, complete))
 
@@ -1303,6 +1328,7 @@ def count_game(path, H, T, C, tp):
                 answers[i] = xr[f"{k}_answer"][nth[k]] if k != "discard" else None
                 nth[k] += 1
         check_wins(path, ri, xr, halfturns, tokens, snaps, C)
+        C["oracle_complete_points"] += oracle_win_points(xr)
         if not (_event(tokens[0]) == EventStateTypes.NEW_DORA and _tile(tokens[0]) == xr["dora"] // 4):
             C["first_token_not_dora"] += 1
         if list(tokens) != xr["tokens"]:
@@ -3012,6 +3038,47 @@ def self_test():
     expect_failure("i1 safe_tiles values doubled", "safe_plane_mismatch", every_state(safe_doubled), game=SAMPLE_LOG)
     expect_failure("i2 a pre-empted chi classified as a pon (index kept)", "post_sample_count_mismatch", preempted_chi_not_chi,
                    game=SAMPLE_LOG)
+
+    # (code review round 2) the new oracle self-checks and coverage counters can fail
+    orig_rounds, orig_has_yaku = xml_rounds, win_oracles.has_yaku
+
+    def rounds_with(edit):  # the XML replay with one fact of every round edited
+        return lambda H, T, tp: mock.patch(f"{__name__}.xml_rounds", lambda raw: [edit(dict(r)) for r in orig_rounds(raw)])
+
+    def ron_point_skipped(H, T, tp):  # the WIN loop misses ONE complete, non-furiten ron point of the parser
+        found(ron_point(H, T), "a declined / no-yaku ron point")
+        t = next(t for hs in H for t in hs if isinstance(t, PostTurn) and t.encoding_idx and any(
+            (t.decisions[p][DECISION_AGARI_IDX] and not t.decisions[p][DECISION_AGARI_IDX][0].executed)
+            or t.ron_blocked.get(p) == NO_YAKU for p in t.responder_states))
+        return mock.patch.object(t, "encoding_idx", 0)
+
+    def stick_game():  # a pool game with a RYUUKYOKU after a REACH step 2 in the same round
+        for path in sorted(glob.glob(os.path.join(DATA_ROOT, "2021", "20210101", "*", "*.log")))[:60]:
+            raw = open(path, "rb").read().decode("utf-8", "ignore")
+            if any(k != r["seed"][2] for r in xml_rounds(raw) for _, k, _ in r["ryuukyoku_ba"]):
+                return path
+        raise SystemExit("self-test needs a RYUUKYOKU after a riichi in the 2021-01-01 pool")
+
+    def no_step2_sticks(r):
+        r["ryuukyoku_ba"] = [(h, r["seed"][2], ba) for h, _, ba in r["ryuukyoku_ba"]]
+        return r
+
+    def has_yaku_no_houtei(concealed, melds, kind, flags):
+        return False if flags.houtei else orig_has_yaku(concealed, melds, kind, flags)
+
+    expect_failure("j1 the WIN loop skips one complete ron point", "win_yaku_coverage", ron_point_skipped,
+                   game=ron_shape_game)
+    sticks = stick_game()
+    expect_failure("j2 replay: REACH step 2 adds no stick", "replay_ba_mismatch", rounds_with(no_step2_sticks), game=sticks)
+    expect_failure("j3 has_yaku: a houtei-only win has no yaku", "yaku_exists_vs_tenhou",
+                   lambda H, T, tp: mock.patch.object(win_oracles, "has_yaku", has_yaku_no_houtei),
+                   game=houtei_after_rinshan, absent=("yaku_library_vs_tenhou",))
+    expect_failure("j4 the <AGARI> anchors skipped", ("yaku_anchor_coverage", "ba_coverage"),
+                   lambda H, T, tp: mock.patch(f"{__name__}.check_win_anchors", lambda *a: None))
+    expect_failure("j5 replay: RYUUKYOKU ba dropped", "replay_ba_coverage",
+                   rounds_with(lambda r: dict(r, ryuukyoku_ba=[])), game=sticks)
+    expect_failure("j6 replay: the draw answers lost", "action_xml_coverage_riichi",
+                   rounds_with(lambda r: dict(r, during_answer=[None] * len(r["during_answer"]))), game=SAMPLE_LOG)
 
     from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster
     dl = DataLoader(os.path.dirname(f), batch_size=1, log_func=lambda *_: None)

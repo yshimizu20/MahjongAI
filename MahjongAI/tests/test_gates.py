@@ -32,6 +32,11 @@ TOKEN_BUILDERS = {"decision_mask", "naki2idx", "discard2idx", "reach2idx", "new_
 BANNED_IN_ORACLES = {"Naki", "legal", "agari", "gameinfo"} | TOKEN_BUILDERS
 # gates.py functions that read the PARSER's objects or patch the parser: the only ones allowed the banned names
 PARSER_SIDE = {"index_checks", "_option_fixtures", "self_test"}
+# the runner helpers parse a game: the parser's entry point is the one parser name they may hold
+RUNNER = {"run", "_count", "_first_valid_game", "_game_with", "_parsed_fixture"}
+RUNNER_ORIGINS = {"MahjongAI.process_xml.process", "MahjongAI.process_xml.InvalidGameException"}
+# Naki's own decoders: an oracle decodes the raw naki_code with legal_oracles.decode_meld instead
+NAKI_DECODERS = {"get_exposed", "pattern_chi", "pattern_pon", "pattern_kakan", "pattern_minkan", "pattern_ankan"}
 ORACLES = {"xml_rounds", "check_state_xml", "during_options", "post_options", "post_rule_hits", "answered_token",
            "check_wins", "check_win_point", "check_win_anchors", "win_flags", "win_routes", "history_facts",
            "check_actions", "tok_discard", "tok_call", "tok_reach", "tok_dora"}
@@ -57,7 +62,25 @@ def _origins(tree, module_name):
             for a in node.names:
                 bound[a.asname or a.name] = f"{mod}.{a.name}"
                 imported.append((f"{mod}.{a.name}", node.lineno))
+    for node in tree.body:  # a module-level rebinding (X = legal, Y = process_xml.naki2idx) keeps its origin
+        if isinstance(node, ast.Assign):
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in bound:
+                origin = bound[root.id] + "".join(f".{a}" for a in reversed(_attr_chain(node.value)))
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        bound[target.id] = origin
     return bound, imported
+
+
+def _attr_chain(node):
+    out = []
+    while isinstance(node, ast.Attribute):
+        out.append(node.attr)
+        node = node.value
+    return out
 
 
 def _parser_origin(origin):
@@ -69,18 +92,6 @@ def _dynamic_imports(tree):
     return [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and (
         (isinstance(n.func, ast.Name) and n.func.id == "__import__")
         or (isinstance(n.func, ast.Attribute) and n.func.attr == "import_module"))]
-
-
-def _oracle_closure(functions):
-    """ORACLES plus every gates.py function they call, directly or through each other (parser-side ones excluded)."""
-    todo, seen = list(ORACLES), set()
-    while todo:
-        name = todo.pop()
-        if name in seen or name in PARSER_SIDE or name not in functions:
-            continue
-        seen.add(name)
-        todo += [n.id for n in ast.walk(functions[name]) if isinstance(n, ast.Name) and n.id in functions]
-    return seen
 
 
 def test_oracle_independence():
@@ -97,18 +108,20 @@ def test_oracle_independence():
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     missing = (ORACLES | PARSER_SIDE) - set(functions)
     assert not missing, f"gates.py lost the functions {sorted(missing)}: update this test"
-    # every function outside the parser side: none of the banned names, however they are reached
-    hits = {name: sorted({x.id for x in ast.walk(fn) if isinstance(x, ast.Name) and x.id in BANNED_IN_ORACLES}
-                         | {x.attr for x in ast.walk(fn) if isinstance(x, ast.Attribute) and x.attr in TOKEN_BUILDERS})
-            for name, fn in functions.items() if name not in PARSER_SIDE}
-    hits = {k: v for k, v in hits.items() if v}
-    assert not hits, f"gate functions outside {sorted(PARSER_SIDE)} reference parser code: {hits}"
-    # the oracles and every helper they call: no name bound to parser code under any alias
-    closure = _oracle_closure(functions)
-    hits = {name: sorted({x.id for x in ast.walk(functions[name]) if isinstance(x, ast.Name)
-                          and _parser_origin(bound.get(x.id, ""))}) for name in closure}
-    hits = {k: v for k, v in hits.items() if v}
-    assert not hits, f"oracle functions (and their helpers) reach parser code: {hits}"
+    # every function outside the parser side: no banned name, no name bound to parser code under any alias or
+    # rebinding (the runner helpers: the parse entry point only), no token builder or Naki decoder attribute
+    hits = {}
+    for name, fn in functions.items():
+        if name in PARSER_SIDE:
+            continue
+        allowed = RUNNER_ORIGINS if name in RUNNER else set()
+        names = {x.id for x in ast.walk(fn) if isinstance(x, ast.Name)}
+        bad = {n for n in names if n in BANNED_IN_ORACLES}
+        bad |= {n for n in names if _parser_origin(bound.get(n, "")) and bound[n] not in allowed}
+        bad |= {x.attr for x in ast.walk(fn) if isinstance(x, ast.Attribute) and x.attr in TOKEN_BUILDERS | NAKI_DECODERS}
+        if bad:
+            hits[name] = sorted(bad)
+    assert not hits, f"gate functions outside {sorted(PARSER_SIDE)} reach parser code: {hits}"
     assert not _dynamic_imports(tree), f"gates.py imports dynamically at lines {_dynamic_imports(tree)}"
 
 
