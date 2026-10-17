@@ -213,14 +213,12 @@ class EncoderConvModel(nn.Module):
             state_mask = torch.ones(B, 1, dtype=torch.bool, device=padding_mask_batch.device)
             fused_mask = torch.cat([padding_mask_batch, state_mask], dim=1)  # (B, 151)
 
-            # Step 5: Bidirectional self-attention (no causal mask)
+            # Step 5: Bidirectional self-attention (no causal mask). Only the state token reaches the heads, so the
+            # last block computes its row alone (keys / values still come from every position): exact, T-011
             attn_mask = fused_mask.unsqueeze(1)  # (B, 1, 151)
             x = fused
-            for block in self.blocks:
-                x = block(x, attn_mask)
-
-            # Zero out padded positions to prevent signal leakage
-            x = x.masked_fill(~fused_mask.unsqueeze(-1), 0.0)
+            for i, block in enumerate(self.blocks):
+                x = block(x, attn_mask, state_row_only=(i == len(self.blocks) - 1))  # last: (B, 1, EMBD_SIZE)
 
             # Step 6: Extract state token (last position), output head, loss
             final_state = x[:, -1, :]  # (B, EMBD_SIZE)
@@ -374,15 +372,18 @@ class EncoderBlock(nn.Module):
         self.ln1 = nn.LayerNorm(EMBD_SIZE)
         self.ln2 = nn.LayerNorm(EMBD_SIZE)
 
-    def forward(self, x, attn_mask):
+    def forward(self, x, attn_mask, state_row_only=False):
         """
         Args:
             x: Input tensor of shape [B, T, EMBD_SIZE]
             attn_mask: Optional boolean tensor of shape [B, 1, T].
                        True = keep (valid position), False = mask out (padded position)
+            state_row_only: compute only the last (state token) row: returns [B, 1, EMBD_SIZE]. Equal to
+                       forward(x, attn_mask)[:, -1:] (every row is computed independently from the shared K / V)
         """
         x_norm = self.ln1(x)
-        x = x + self.self_attention(x_norm, x_norm, x_norm, attn_mask)
+        q, x = (x_norm[:, -1:], x[:, -1:]) if state_row_only else (x_norm, x)
+        x = x + self.self_attention(x_norm, x_norm, q, attn_mask)
         x = x + self.ffwd(self.ln2(x))
 
         return x
