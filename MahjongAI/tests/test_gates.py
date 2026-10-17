@@ -39,7 +39,7 @@ RUNNER_ORIGINS = {"MahjongAI.process_xml.process", "MahjongAI.process_xml.Invali
 NAKI_DECODERS = {"get_exposed", "pattern_chi", "pattern_pon", "pattern_kakan", "pattern_minkan", "pattern_ankan"}
 ORACLES = {"xml_rounds", "check_state_xml", "during_options", "post_options", "post_rule_hits", "answered_token",
            "check_wins", "check_win_point", "check_win_anchors", "win_flags", "win_routes", "history_facts",
-           "check_actions", "tok_discard", "tok_call", "tok_reach", "tok_dora"}
+           "check_actions", "tok_discard", "tok_call", "tok_reach", "tok_dora", "kept_xml", "auto_play_runs"}
 
 
 def _tree(module):

@@ -1,5 +1,7 @@
 import sys
 import xml.etree.ElementTree as ET
+from typing import Optional
+
 import numpy as np
 from mahjong.shanten import Shanten
 
@@ -65,6 +67,45 @@ def _reject_after_own_discard(curr_halfturn, player: int) -> None:
         raise InvalidGameException("Own-turn action after own discard")
 
 
+AUTO_PLAY_RUN = 25  # T-043: policy; ~0.1-3 human seats in 11 years by the run-length tail model
+
+
+def _auto_played_seat(rounds) -> Optional[int]:
+    """The first seat with AUTO_PLAY_RUN consecutive tsumogiri discards outside riichi and no call, riichi
+    declaration, win, kyuushu abort or ron3 declaration of its own in between, counted across rounds; None if no seat
+    has one. Tenhou plays an absent seat this way, and forced-tsumogiri mode does too; neither writes a <BYE> (T-043).
+    rounds: the event dicts of _get_rounds (already cut at the first BYE)."""
+    run = [0] * 4
+    for kyoku_events in rounds:
+        drawn, in_riichi = [None] * 4, [False] * 4
+        for event in kyoku_events:
+            tag, attr = event["event"], event["attr"]
+            if tag[0] in "TUVW" and tag[1:].isdigit():
+                drawn["TUVW".index(tag[0])] = int(tag[1:])
+            elif tag[0] in "DEFG" and tag[1:].isdigit():  # DORA is not a discard
+                seat = "DEFG".index(tag[0])
+                tsumogiri = int(tag[1:]) == drawn[seat]
+                drawn[seat] = None
+                if in_riichi[seat]:
+                    continue
+                run[seat] = run[seat] + 1 if tsumogiri else 0
+                if run[seat] >= AUTO_PLAY_RUN:
+                    return seat
+            elif tag == "N":
+                who = int(attr["who"])
+                run[who], drawn[who] = 0, None
+            elif tag == "REACH" and attr.get("step") == "1":
+                who = int(attr["who"])
+                run[who], in_riichi[who] = 0, True
+            elif tag == "AGARI":
+                run[int(attr["who"])] = 0
+            elif tag == "RYUUKYOKU" and attr.get("type") in ("yao9", "ron3"):
+                for q in range(4):  # the seats whose hand it shows declared the abort / the ron
+                    if f"hai{q}" in attr:
+                        run[q] = 0
+    return None
+
+
 def process(file_path: str, verbose: bool = False):
     gameinfo, rounds = _get_rounds(file_path)
 
@@ -76,6 +117,8 @@ def process(file_path: str, verbose: bool = False):
         raise InvalidGameException("Kansaki")
     if gameinfo.three_players() == 1:
         raise InvalidGameException("Three players")
+    if _auto_played_seat(rounds) is not None:
+        raise InvalidGameException("Auto-played seat")
 
     all_halfturns = []
     all_encoding_tokens = []
@@ -95,7 +138,9 @@ def process(file_path: str, verbose: bool = False):
             # 0 North rounds in 2.2M games (T-038): skip and count an unseen layout, never encode it
             raise InvalidGameException("North round")
         doras = [dora]
-        rounds_remaining = gameinfo.n_rounds() - int(curr_round)
+        rounds_remaining = gameinfo.rounds_remaining(curr_round)
+        # the rounds of the regular schedule [seed0, n_rounds) dealt by seat i (seat 0 deals round 0); all 0 in an
+        # extension round, the dealer's own too (T-039)
         parent_rounds_remaining = [(rounds_remaining + i) // 4 for i in range(4)]
         round_wind_ = round_wind(curr_round)
 
@@ -693,6 +738,7 @@ def _mark_yao9_executed(halfturns: list, attr: dict) -> None:
 
 
 def _get_rounds(file_path: str):
+    """(GameInfo, rounds): the file's <GO> game type and its events grouped into rounds (_rounds_from_events)."""
     with open(file_path, "rb") as file:
         tree = ET.parse(file)
         root = tree.getroot()
@@ -716,15 +762,30 @@ def _get_rounds(file_path: str):
     except:
         raise ValueError("Invalid game type element")
 
-    # group events into each round
+    return gameinfo, _rounds_from_events(events)
+
+
+def _rounds_from_events(events: list) -> list:
+    """Group the flat event list into rounds (each starts at its INIT). T-044: only the rounds that end before the
+    first <BYE> are kept. At the first BYE the round in progress is dropped if it has no AGARI / RYUUKYOKU yet, or if
+    the next event after the BYE (BYE / UN skipped) is an AGARI (the second AGARI of a double ron: the result group
+    continues past the BYE). Rounds after a reconnect (<UN>) stay out: the reconnected seat's moves were auto-play.
+    No round left: InvalidGameException("BYE")."""
     rounds = []
     curr_round_events = None
 
-    for event in events:
+    for i, event in enumerate(events):
         if event["event"] in ["mjloggm", "SHUFFLE", "UN", "GO", "TAIKYOKU"]:
             continue
         elif event["event"] == "BYE":
-            raise InvalidGameException("BYE")
+            after = next((e["event"] for e in events[i + 1:] if e["event"] not in ("BYE", "UN")), None)
+            ended = curr_round_events is not None and any(
+                e["event"] in ("AGARI", "RYUUKYOKU") for e in curr_round_events)
+            if ended and after != "AGARI":
+                rounds.append(curr_round_events)
+            if not rounds:
+                raise InvalidGameException("BYE")
+            return rounds
 
         if event["event"] == "INIT":
             if curr_round_events is not None:
@@ -736,7 +797,7 @@ def _get_rounds(file_path: str):
     if curr_round_events is not None:
         rounds.append(curr_round_events)
 
-    return gameinfo, rounds
+    return rounds
 
 
 def discard2idx(who: int, tile_idx: int, is_tsumogiri: bool):

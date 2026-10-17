@@ -55,8 +55,10 @@ EXPECT_PRIOR_CE_TOL = 1e-4
 EXPECTED_SKIPS = frozenset(f"invalid:{r}" for r in (
     "Three players", "BYE", "Against human", "Red tiles", "Kansaki",
     "Own-turn action after own discard",  # T-046: 7 malformed Tenhou logs in 2.2M games, rejected on purpose
+    "Auto-played seat",  # T-043: a seat with a tsumogiri run >= 25 outside riichi, ~100 games a year
 ))
-LOGGED_SKIPS = frozenset({"invalid:Own-turn action after own discard"})  # rare: each one is logged with its file
+LOGGED_SKIPS = frozenset({"invalid:Own-turn action after own discard",
+                          "invalid:Auto-played seat"})  # rare: each one is logged with its file
 EVAL_EVERY_STEPS = 500
 SAVE_EVERY_STEPS = 500
 MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)

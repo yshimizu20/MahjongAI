@@ -26,18 +26,10 @@ class GameInfo:
     def n_rounds(self):
         return 4 * (self.tonnan() + 1)
 
+    def rounds_remaining(self, curr_round: int) -> int:
+        """The regular rounds left, the current one included; 0 in an extension round (the bakaze one-hot, T-038,
+        marks the extension). T-039: never negative."""
+        return max(0, self.n_rounds() - curr_round)
+
     def __repr__(self):
         return f"GameInfo: against_human={self.against_human()}, no_red={self.no_red()}, kansaki={self.kansaki()}, tonnan={self.tonnan()}, three_players={self.three_players()}, fast={self.fast()}, level={self.level()}"
-
-
-class RoundInfo:
-    def __init__(self, gameinfo: GameInfo, curr_round: int):
-        self.gameinfo = gameinfo
-        N_ROUNDS = 4 * (gameinfo.tonnan() + 1)
-        self.remaining_rounds = N_ROUNDS - curr_round
-        self.parent_rounds_remaining = [
-            (self.remaining_rounds + i) // 4 for i in range(4)
-        ]
-
-    def __repr__(self):
-        return f"RoundInfo: gameinfo={self.gameinfo}, remaining_rounds={self.remaining_rounds}, parent_rounds_remaining={self.parent_rounds_remaining}"
