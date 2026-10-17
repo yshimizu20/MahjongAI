@@ -2,4 +2,5 @@ numpy
 torch
 mahjong==1.4.0  # 2.x renames the wind yaku and drops Yaku.tenhou_id; port = T-036
 requests
+matplotlib  # run_report figure (plan T-005)
 pytest>=7  # pytest.ini uses the pythonpath key (7.0+)
