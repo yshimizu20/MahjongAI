@@ -47,6 +47,15 @@ def _send_part_of_body(fd, body):
     time.sleep(120)
 
 
+def _send_good_then_malformed(fd, body):
+    """game-b.log's frame is a whole frame whose body does not unpickle (the worker stays alive); others are sent."""
+    import pickle
+    if pickle.loads(body)[0] == "game-b.log":
+        os.write(fd, struct.pack("!Q", 5) + b"xxxxx")
+    else:
+        _send_frame(fd, body)
+
+
 def _gone(pids):
     for pid in pids:
         try:
@@ -151,3 +160,17 @@ def test_interrupt_right_after_a_worker_start_still_stops_it(monkeypatch):
             p.join(5)
     assert not left, f"{len(left)} started worker(s) left alive by close()"
     assert w.procs == [] and not multiprocessing.active_children() and not _drain_threads()
+
+
+def test_recorded_transport_error_is_raised_before_cached_data():
+    """game-a.log's good result is cached and game-b.log's frame is malformed: fetching game-a.log raises the
+    recorded transport error (no update after a broken frame) and stops every worker."""
+    w = GameWorkers(1, _build_big, window=4, timeout_s=60, send=_send_good_then_malformed, parse=_parse_name)
+    w.prefetch(["game-a.log", "game-b.log"])
+    pids = w.pids()
+    with w._cond:
+        assert w._cond.wait_for(lambda: "game-a.log" in w.done and w._error is not None, timeout=60), (
+            f"cached {set(w.done)}, error {w._error!r}: the case is not constructed")
+    with pytest.raises(DataWorkerError, match="unreadable result frame.* while fetching game-a.log"):
+        w.fetch("game-a.log")
+    assert w.closed and w.pids() == [] and _gone(pids) and not _drain_threads()

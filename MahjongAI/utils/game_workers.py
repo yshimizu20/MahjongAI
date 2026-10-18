@@ -263,13 +263,13 @@ class GameWorkers:
                         failure = (f"data worker pid {dead[0].pid} died (exit code {dead[0].exitcode}) while fetching "
                                    f"{filename}; {len(self.in_flight)} file(s) in flight")
                         break
+                    if self._error is not None:  # before cached data: no update after a broken pipe or frame
+                        failure = f"{self._error} while fetching {filename}; {len(self.in_flight)} file(s) in flight"
+                        break
                     if filename in self.done:
                         self.in_flight.discard(filename)
                         data = self.done.pop(filename)
                         self._cond.notify_all()  # room under the bound again
-                        break
-                    if self._error is not None:
-                        failure = f"{self._error} while fetching {filename}; {len(self.in_flight)} file(s) in flight"
                         break
                     left = deadline - time.monotonic()
                     if left <= 0:
