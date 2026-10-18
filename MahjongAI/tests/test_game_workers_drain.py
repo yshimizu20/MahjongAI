@@ -89,7 +89,9 @@ def test_worker_finishes_two_large_frames_while_the_trainer_does_not_fetch(tmp_p
             time.sleep(0.05)
         sent = len(list(tmp_path.glob("sent-*")))
         assert sent == 2, f"the worker finished {sent} of 2 large frames without a fetch: its send blocks"
-        assert set(w.done) == set(files) and not w.in_flight
+        with w._cond:  # the send returned; the drain thread may still be storing the frame
+            stored = w._cond.wait_for(lambda: set(w.done) == set(files) and not w.in_flight, timeout=60)
+            assert stored, f"stored {sorted(w.done)}, in flight {sorted(w.in_flight)}"
         for f in files:
             built, tokens = w.fetch(f).game()
             assert tokens is None and built == _payload(f)
