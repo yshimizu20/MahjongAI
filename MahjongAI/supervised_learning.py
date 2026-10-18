@@ -41,7 +41,7 @@ TRAIN_YEARS = (2021,)
 # continues where it stopped
 DATA_SEED = 0
 MODEL_SEED = 0  # torch.manual_seed before the model is built
-TORCH_THREADS = 10
+TORCH_THREADS = 8  # T-011 T2: s/step with 2 data workers, 4: 0.324, 6: 0.330, 8: 0.316, 10: 0.341 threads
 VAL_YEAR = "2022"  # time-forward validation: the week after the training year
 VAL_DAYS = tuple(f"202201{d:02d}" for d in range(1, 8))
 VAL_GAMES = 100  # the first VAL_GAMES accepted games of VAL_DAYS in a seeded order, held in RAM
