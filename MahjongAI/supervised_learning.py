@@ -42,7 +42,8 @@ TRAIN_YEARS = (2021,)
 # continues where it stopped
 DATA_SEED = 0
 MODEL_SEED = 0  # torch.manual_seed before the model is built
-TORCH_THREADS = 8  # T-011 T2: s/step with 2 data workers, 4: 0.324, 6: 0.330, 8: 0.316, 10: 0.341 threads
+TORCH_THREADS = 4  # T-047 W2 (after M1 + M2, DATA_WORKERS 4): s/step 4 threads 0.159, 6: 0.162 (T-011 T2 chose 8 with
+# 2 workers and the slower model)
 VAL_YEAR = "2022"  # time-forward validation: the week after the training year
 VAL_DAYS = tuple(f"202201{d:02d}" for d in range(1, 8))
 VAL_GAMES = 100  # the first VAL_GAMES accepted games of VAL_DAYS in a seeded order, held in RAM
@@ -66,7 +67,9 @@ SAVE_EVERY_STEPS = 500
 # T-011 D1: training games are parsed and tensor-built in DATA_WORKERS spawn processes, DATA_PREFETCH files ahead
 # per loader (0 workers = in the trainer, as before). Exact: same games, tensors, skips and loader state.
 # Timed s/step (10 threads): 0 workers 0.718, 1: 0.469, 2: 0.332, 3: 0.324 (within 2's spread) -> 2.
-DATA_WORKERS = 2
+# T-047 W2 (drain thread, M1 + M2; workers/threads): 2/8 0.243, 3/6 0.184, 4/4 0.159, 4/6 0.162, 6/2 0.178, 6/4 0.168,
+# 6/6 0.165, 8/4 0.170 -> 4 workers, 4 threads.
+DATA_WORKERS = 4
 DATA_PREFETCH = 8
 # T-011 P: the prior's games are parsed and built by their own pool of PRIOR_WORKERS (0 = in the trainer), closed
 # when the prior sample is read; the training workers have not started yet. Exact: same games, masks and labels.
