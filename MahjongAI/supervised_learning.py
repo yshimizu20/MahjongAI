@@ -27,9 +27,9 @@ import torch
 import torch.nn.functional as F
 
 from MahjongAI.agents.encoder_conv import EncoderConvModel, PrebuiltGame, TransformerTensorProcessor, build_game
-from MahjongAI.utils.baselines import fit_bias_prior, score_bias, shanten_greedy, uniform_legal
+from MahjongAI.utils.baselines import fit_bias_prior, greedy_hits, score_bias, shanten_best, uniform_legal
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
-from MahjongAI.utils.game_workers import GameWorkers
+from MahjongAI.utils.game_workers import GameWorkers, _transportable
 
 # Root of the MahjongAI package: data paths resolve the same from any working directory.
 _PACKAGE_DIR = pathlib.Path(__file__).parent
@@ -73,7 +73,9 @@ DATA_WORKERS = 4
 DATA_PREFETCH = 8
 # T-011 P: the prior's games are parsed and built by their own pool of PRIOR_WORKERS (0 = in the trainer), closed
 # when the prior sample is read; the training workers have not started yet. Exact: same games, masks and labels.
-PRIOR_WORKERS = 8
+# T-047 S1: the validation set is built the same way, by a pool of PRIOR_WORKERS closed when it is read (VAL_BUILD:
+# PrebuiltGame plus the header's shanten step). The pool size comes from the core count (14 cores -> 12).
+PRIOR_WORKERS = max(1, (os.cpu_count() or 4) - 2)
 PRIOR_PREFETCH = 32
 # T-047 E1: the validation games are held as PrebuiltGame objects and evaluated EVAL_GAMES_PER_FORWARD per forward call.
 # The batch size moves logits by ~1e-7 (float reduction order), so a game with a sample whose top-2 logit margin is below
@@ -125,6 +127,31 @@ def _next_game(loader: DataLoader):
     return loader.last_batch_files[0], halfturns[0], tokens[0]
 
 
+class ValGame(PrebuiltGame):
+    """A validation game: the PrebuiltGame plus the header's bias-free shanten step of its discard samples
+    (baselines.shanten_best, bool (n, 37) numpy), or the error that step raised (raised by baseline_header)."""
+
+    def __init__(self, game: PrebuiltGame, shanten_best=None, shanten_error=None):
+        super().__init__(game.rounds, game.skipped, game.build_error)
+        self.shanten_best, self.shanten_error = shanten_best, shanten_error
+
+
+def build_val_game(halfturns, tokens, processor_cls=None) -> ValGame:
+    """A validation worker's build (T-047 S1): build_game, then the shanten step of the discard samples. A game with a
+    build error or a tensor-level skip gets no shanten step: ValSet raises for it first, as the serial path does."""
+    game = build_game(halfturns, tokens, processor_cls)
+    if game.build_error is not None or game.skipped:
+        return ValGame(game)
+    try:
+        mask, y, hand37 = head_tensors(TransformerTensorProcessor(), game, None)["discard"]
+        return ValGame(game, shanten_best(hand37, mask, y).numpy())
+    except Exception as e:
+        return ValGame(game, shanten_error=_transportable(e, "header"))
+
+
+VAL_BUILD = build_val_game  # tests force a skip or a failure with a functools.partial of it
+
+
 class ValSet:
     """The fixed validation games in RAM as PrebuiltGame objects (built once at load), with their per-head masks,
     labels and (discard) hands.
@@ -144,14 +171,22 @@ class ValSet:
 
     @classmethod
     def load(cls, log: RunLog) -> "ValSet":
-        loader = DataLoader(str(DATA_ROOT / VAL_YEAR), 1, log, days=VAL_DAYS, seed=VAL_SEED,
-                            expected_skips=EXPECTED_SKIPS, logged_skips=LOGGED_SKIPS)
-        assert loader.file_list, f"no validation games for {VAL_YEAR} {VAL_DAYS}"
-        log(f"Validation: first {VAL_GAMES} accepted games of {len(loader.file_list)} files "
-            f"({VAL_YEAR} {VAL_DAYS[0]}..{VAL_DAYS[-1]}, seed {VAL_SEED})")
-        games = [_next_game(loader) for _ in range(VAL_GAMES)]
-        log(f"  {VAL_GAMES} games from {loader.current_index} files; skipped {dict(loader.skipped)}")
-        return cls([f for f, _, _ in games], [build_game(h, t) for _, h, t in games], TransformerTensorProcessor())
+        """The first VAL_GAMES accepted games, parsed and built (VAL_BUILD) by a pool of PRIOR_WORKERS (0 = in the
+        trainer), closed on every exit of the read."""
+        workers = GameWorkers(PRIOR_WORKERS, VAL_BUILD, window=PRIOR_PREFETCH) if PRIOR_WORKERS else None
+        try:
+            loader = DataLoader(str(DATA_ROOT / VAL_YEAR), 1, log, days=VAL_DAYS, seed=VAL_SEED,
+                                expected_skips=EXPECTED_SKIPS, logged_skips=LOGGED_SKIPS, workers=workers)
+            assert loader.file_list, f"no validation games for {VAL_YEAR} {VAL_DAYS}"
+            log(f"Validation: first {VAL_GAMES} accepted games of {len(loader.file_list)} files "
+                f"({VAL_YEAR} {VAL_DAYS[0]}..{VAL_DAYS[-1]}, seed {VAL_SEED})")
+            games = [_next_game(loader) for _ in range(VAL_GAMES)]
+            log(f"  {VAL_GAMES} games from {loader.current_index} files; skipped {dict(loader.skipped)}")
+        finally:
+            if workers is not None:
+                workers.close()
+        built = [g if workers is not None else VAL_BUILD(g, t) for _, g, t in games]
+        return cls([f for f, _, _ in games], built, TransformerTensorProcessor())
 
     def head_samples(self, head: str):
         """Per game (id, mask, y, hand37) of one head."""
@@ -266,7 +301,7 @@ def baseline_header(val: ValSet, bias: dict) -> dict:
     out = {"uniform": {}, "prior": {}, "shanten_greedy": []}
     for head in HEADS:
         out["uniform"][head], out["prior"][head] = [], []
-        for gid, mask, y, hand37 in val.head_samples(head):
+        for game, (gid, mask, y, hand37) in zip(val.games, val.head_samples(head)):
             n = len(y)
             if n == 0:
                 out["uniform"][head].append([gid, 0, 0.0, 0.0])
@@ -279,7 +314,10 @@ def baseline_header(val: ValSet, bias: dict) -> dict:
             out["uniform"][head].append([gid, n, u_nll.sum().item(), u_p.sum().item()])
             out["prior"][head].append([gid, n, p_nll.sum().item(), int(p_hit.sum())])
             if head == "discard":
-                out["shanten_greedy"].append([gid, n, int(shanten_greedy(hand37, mask, y, bias[head]).sum())])
+                if game.shanten_error is not None:
+                    raise game.shanten_error
+                best = torch.from_numpy(game.shanten_best)
+                out["shanten_greedy"].append([gid, n, int(greedy_hits(best, y, bias[head]).sum())])
     return out
 
 

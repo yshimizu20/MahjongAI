@@ -372,7 +372,7 @@ def test_train_starts_workers_lazily_and_stops_them_on_every_stop_path(tmp_path,
     monkeypatch.setattr(SL, "PRIOR_GAMES", 2)
     monkeypatch.setattr(SL, "PRIOR_WORKERS", 2)
     monkeypatch.setattr(SL, "GameWorkers", _Recorded)
-    _Recorded.made = []  # [the training pool (made first, started lazily), the prior's pool (P)]
+    _Recorded.made = []  # [the training pool (made first, started lazily), the validation pool (T-047 S1), the prior's pool (P)]
     started_before_loop = []
     check = SL._check_tensor_skips
 
@@ -388,7 +388,7 @@ def test_train_starts_workers_lazily_and_stops_them_on_every_stop_path(tmp_path,
 
     def fit_prior_spy(log):
         out = fit_prior(log)
-        prior_pool = _Recorded.made[1]
+        prior_pool = _Recorded.made[2]
         started_after_prior.append((bool(_Recorded.made[0].started), prior_pool.closed and prior_pool.procs == []))
         return out
 
@@ -402,7 +402,8 @@ def test_train_starts_workers_lazily_and_stops_them_on_every_stop_path(tmp_path,
                 SL.train("encoder_conv", 3, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 3, 3)
     finally:
         torch.set_num_threads(threads)
-    w, prior_pool = _Recorded.made
+    w, val_pool, prior_pool = _Recorded.made
+    assert len(val_pool.started) == SL.PRIOR_WORKERS and _gone(val_pool.started) and val_pool.closed  # closed at load
     assert started_after_prior == [(False, True)] and started_before_loop[0]  # started by the first training batch
     assert len(w.started) == SL.DATA_WORKERS
     assert len(prior_pool.started) == SL.PRIOR_WORKERS and _gone(prior_pool.started)  # closed when the prior was fitted
