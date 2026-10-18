@@ -542,8 +542,11 @@ class MultiHeadAttention(nn.Module):
             attn_mask = attn_mask.unsqueeze(1)  # [B, 1, 1, T]
 
         dropout_p = self.attn_dropout_p if self.training else 0.0
-        # scaled_dot_product_attention: boolean mask True=attend matches our convention
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        if Q == 1:
+            out = self._single_query_attention(q, k, v, attn_mask, dropout_p)
+        else:
+            # scaled_dot_product_attention: boolean mask True=attend matches our convention
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
         # out: [B, H, Q, HS]
 
         # Guard: fully-masked positions produce NaN (same as original nan_to_num guard)
@@ -553,6 +556,26 @@ class MultiHeadAttention(nn.Module):
         out = self.proj(out)
         out = self.dropout(out)
         return out  # [B, Q, EMBD_SIZE]
+
+    @staticmethod
+    def _single_query_attention(q, k, v, attn_mask, dropout_p):
+        """SDPA for one query row, as broadcast multiply + sum (T-047 M1). In train mode SDPA takes its math path
+        (dropout_p > 0 rules out the CPU flash kernel) and, in this torch build without MKL, each of its bmm runs a
+        serial loop over the B*H [1, HS] x [HS, T] slices. With Q = 1 the scores are q . k per key, so
+        (q * k).sum(-1) and (a * v).sum over the keys compute the same function. As the math path: scale 1 / sqrt(HS),
+        masked keys get -inf, safe softmax (a fully masked row gives zero weights and finite gradients), dropout on the
+        contiguous [B, H, 1, T] weights (the same shape, so the same RNG draws).
+        q [B, H, 1, HS], k and v [B, H, T, HS], attn_mask [B, 1, 1, T] bool (True = attend) or None: [B, H, 1, HS]."""
+        scores = (q * k).sum(-1).unsqueeze(2) * (q.shape[-1] ** -0.5)  # [B, H, 1, T]
+        if attn_mask is not None:
+            empty = ~attn_mask.any(-1, keepdim=True)  # [B, 1, 1, 1]: a row with no key to attend
+            scores = scores.masked_fill(~(attn_mask | empty), float("-inf"))
+            weights = torch.softmax(scores, dim=-1).masked_fill(empty, 0.0)
+        else:
+            weights = torch.softmax(scores, dim=-1)
+        if dropout_p > 0.0:
+            weights = F.dropout(weights, dropout_p, True)
+        return (weights.transpose(-1, -2) * v).sum(2, keepdim=True)  # [B, H, 1, HS]
 
 
 class FeedForward(nn.Module):
