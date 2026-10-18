@@ -4,6 +4,7 @@ import random
 from collections import Counter
 
 from MahjongAI.process_xml import process, InvalidGameException
+from MahjongAI.utils.game_workers import RemoteError
 
 
 class UnexpectedSkip(RuntimeError):
@@ -58,11 +59,16 @@ class DataLoader:
     last_batch_files: the files of the games in the batch last returned, in batch order.
     pending: accepted files of a batch cut short by UnexpectedSkip; the next batch reads them first (kept in the state),
     so a stop loses no good game while the position stays past the offending one.
+    workers: a GameWorkers (T-011 D1) parses and builds the games in worker processes; a game is then a PrebuiltGame
+    in the halfturns slot (tokens slot None). The loader submits its next files ahead and stays the only authority on
+    order, batches, skips and state. A fatal worker error (or a stop) while fetching rolls the loader back to its
+    state before the batch, so a checkpoint saved on that stop resumes exactly where an unstopped run would go on.
     """
 
     def __init__(self, path: str, batch_size: int = 1, log_func: callable = print,
-                 days=None, exclude_days=None, seed=None, expected_skips=None, logged_skips=()):
+                 days=None, exclude_days=None, seed=None, expected_skips=None, logged_skips=(), workers=None):
         self.path = path
+        self.workers = workers
         self.file_list = sorted(
             os.path.join(dirpath, fname)
             for dirpath, _, fnames in os.walk(self.path)
@@ -96,7 +102,19 @@ class DataLoader:
     def __iter__(self):
         return self
 
+    def _snapshot(self):
+        """Everything a batch changes (file_list is replaced, never mutated, by next_epoch)."""
+        return (self.current_index, list(self.pending), self.skipped.copy(), self.accepted, self.epoch, self.file_list,
+                self.batch_count, self.last_batch_files)
+
+    def _restore(self, snapshot):
+        (self.current_index, self.pending, self.skipped, self.accepted, self.epoch, self.file_list,
+         self.batch_count, self.last_batch_files) = snapshot
+        self.pending = list(self.pending)
+        self.skipped = self.skipped.copy()
+
     def __next__(self):
+        snapshot = self._snapshot() if self.workers is not None else None
         self.batch_count += 1
 
         if self.current_index >= len(self.file_list) and not self.pending:
@@ -112,13 +130,21 @@ class DataLoader:
                 filename = self.file_list[self.current_index]
                 self.current_index += 1
 
+            if self.workers is not None:
+                try:  # outside the skip handler: a dead worker is no skip
+                    self.workers.prefetch(queue + self.file_list[self.current_index:self.current_index + self.workers.window])
+                    fetched = self.workers.fetch(filename)
+                except BaseException:
+                    self._restore(snapshot)  # a dead worker or a stop: as if this batch was never asked for
+                    raise
             try:
-                all_halfturns, all_encoding_tokens = process(filename)
+                all_halfturns, all_encoding_tokens = process(filename) if self.workers is None else fetched.game()
             except Exception as e:
-                if isinstance(e, InvalidGameException):
+                remote = isinstance(e, RemoteError)  # a worker's exception that did not pickle, as a record
+                if isinstance(e, InvalidGameException) or (remote and e.invalid_game):
                     key = "invalid:" + e.msg
                 else:  # a parser bug on one game: report it, keep going unless told otherwise
-                    key = type(e).__name__
+                    key = e.type_name if remote else type(e).__name__
                     self.log_func(f"skipped {filename}: {key}: {str(e)[:200]}")
                 try:
                     self._skip(filename, key, e)
@@ -133,6 +159,8 @@ class DataLoader:
 
         self.last_batch_files = files
         self.accepted += len(files)
+        if self.workers is not None:  # the next batch's files are parsed while the trainer runs this one
+            self.workers.prefetch(self.pending + self.file_list[self.current_index:self.current_index + self.workers.window])
         return all_halfturns_list, all_encoding_tokens_list
 
     def _skip(self, filename: str, key: str, error: Exception):
@@ -248,6 +276,22 @@ class DataLoaderCluster:
         return self.dataloaders[self.idx].last_batch_files
 
     def __next__(self):
+        """With data workers, a batch that fails with anything but UnexpectedSkip (a dead worker, a stop) leaves the
+        cluster and every loader as they were before it (the draw and an epoch change included)."""
+        if all(getattr(dl, "workers", None) is None for dl in self.dataloaders):
+            return self._next()
+        snapshot = (self.idx, self.draws, self.epoch, [dl._snapshot() for dl in self.dataloaders])
+        try:
+            return self._next()
+        except UnexpectedSkip:
+            raise
+        except BaseException:
+            self.idx, self.draws, self.epoch, loaders = snapshot
+            for dl, s in zip(self.dataloaders, loaders):
+                dl._restore(s)
+            raise
+
+    def _next(self):
         if not any(dl.file_list for dl in self.dataloaders):
             raise RuntimeError(
                 "DataLoaderCluster: all dataloaders are empty. "

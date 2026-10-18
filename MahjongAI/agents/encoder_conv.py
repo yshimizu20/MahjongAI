@@ -213,14 +213,12 @@ class EncoderConvModel(nn.Module):
             state_mask = torch.ones(B, 1, dtype=torch.bool, device=padding_mask_batch.device)
             fused_mask = torch.cat([padding_mask_batch, state_mask], dim=1)  # (B, 151)
 
-            # Step 5: Bidirectional self-attention (no causal mask)
+            # Step 5: Bidirectional self-attention (no causal mask). Only the state token reaches the heads, so the
+            # last block computes its row alone (keys / values still come from every position): exact, T-011
             attn_mask = fused_mask.unsqueeze(1)  # (B, 1, 151)
             x = fused
-            for block in self.blocks:
-                x = block(x, attn_mask)
-
-            # Zero out padded positions to prevent signal leakage
-            x = x.masked_fill(~fused_mask.unsqueeze(-1), 0.0)
+            for i, block in enumerate(self.blocks):
+                x = block(x, attn_mask, state_row_only=(i == len(self.blocks) - 1))  # last: (B, 1, EMBD_SIZE)
 
             # Step 6: Extract state token (last position), output head, loss
             final_state = x[:, -1, :]  # (B, EMBD_SIZE)
@@ -374,18 +372,34 @@ class EncoderBlock(nn.Module):
         self.ln1 = nn.LayerNorm(EMBD_SIZE)
         self.ln2 = nn.LayerNorm(EMBD_SIZE)
 
-    def forward(self, x, attn_mask):
+    def forward(self, x, attn_mask, state_row_only=False):
         """
         Args:
             x: Input tensor of shape [B, T, EMBD_SIZE]
             attn_mask: Optional boolean tensor of shape [B, 1, T].
                        True = keep (valid position), False = mask out (padded position)
+            state_row_only: compute only the last (state token) row: returns [B, 1, EMBD_SIZE]. Equal to
+                       forward(x, attn_mask)[:, -1:] (every row is computed independently from the shared K / V)
         """
         x_norm = self.ln1(x)
-        x = x + self.self_attention(x_norm, x_norm, x_norm, attn_mask)
+        q, x = (x_norm[:, -1:], x[:, -1:]) if state_row_only else (x_norm, x)
+        x = x + self.self_attention(x_norm, x_norm, q, attn_mask)
         x = x + self.ffwd(self.ln2(x))
 
         return x
+
+
+def conv1d_k3_rank_major(x: torch.Tensor, conv: nn.Conv1d) -> torch.Tensor:
+    """conv(x.transpose(1, 2)).transpose(1, 2) for a Conv1d(kernel 3, padding 1, stride 1), on rank-major input:
+    x [N, R, Cin] -> [N, R, Cout]. The 3 shifted rank slices side by side, then one matmul with conv's own weight and
+    bias (the module stays the parameter holder, so the state_dict is unchanged)."""
+    assert conv.kernel_size == (3,) and conv.padding == (1,) and conv.stride == (1,) and conv.dilation == (1,)
+    assert conv.groups == 1
+    R = x.shape[1]
+    xp = F.pad(x, (0, 0, 1, 1))  # [N, R + 2, Cin]: a zero rank at both ends
+    cols = torch.cat([xp[:, t:t + R] for t in range(3)], dim=2)  # [N, R, 3*Cin], column t*Cin + c = x[:, r + t - 1, c]
+    weight = conv.weight.permute(0, 2, 1).reshape(conv.out_channels, -1)  # [Cout, 3*Cin], the same column order
+    return F.linear(cols, weight, conv.bias)
 
 
 class StateNet(nn.Module):
@@ -435,26 +449,17 @@ class StateNet(nn.Module):
         C, K = N_X1_PLANES, 4
 
         # --- 1. Process Suits (indices 0-26) ---
-        # Extract Man (0-8), Pin (9-17), Sou (18-26)
-        x1_suits = torch.stack(
-            [x1[:, :, 0:9, :], x1[:, :, 9:18, :], x1[:, :, 18:27, :]], dim=1  # Man  # Pin  # Sou
-        )  # Shape: [B, S=3, C=10, R=9, K=4]
+        # Man (0-8), Pin (9-17), Sou (18-26), suits merged into the batch and rank-major: [B*3, R=9, C*K], channel
+        # c*K + k (the Conv1d channel order). Each Conv1d(k=3, pad=1) runs as one matmul over 3 shifted rank slices
+        # with its own weights (T-011: the stock CPU Conv1d backward is slow); the state_dict is unchanged.
+        x1_suits = x1[:, :, :27, :].reshape(batch_size, C, 3, 9, K)  # [B, C, S, R, K]
+        x1_suits = x1_suits.permute(0, 2, 3, 1, 4).reshape(batch_size * 3, 9, C * K)  # [B*3, R, C*K]
 
-        # Reshape to [B, S, C*K, R]
-        x1_suits = x1_suits.permute(0, 1, 2, 4, 3).contiguous()  # [B, S, C, K, R]
-        x1_suits = x1_suits.view(batch_size, 3, C * K, 9)  # [B, S=3, C*K, R=9]
-
-        # Merge suits into batch for Conv1d: [B*S, C*K, R]
-        x1_suits = x1_suits.view(batch_size * 3, C * K, 9)  # [B*3, C*K, 9]
-
-        # Apply Conv1d over rank
-        suits_feat = self.suit_conv1d_1(x1_suits)  # [B*3, 16, 9]
-        suits_feat = self.relu(suits_feat)
-        suits_feat = self.suit_conv1d_2(suits_feat)  # [B*3, 16, 9]
-        suits_feat = self.relu(suits_feat)
+        suits_feat = self.relu(conv1d_k3_rank_major(x1_suits, self.suit_conv1d_1))  # [B*3, 9, 16]
+        suits_feat = self.relu(conv1d_k3_rank_major(suits_feat, self.suit_conv1d_2))  # [B*3, 9, 16]
 
         # Global pooling over rank dimension
-        suits_feat = torch.mean(suits_feat, dim=2)  # [B*3, 16]
+        suits_feat = torch.mean(suits_feat, dim=1)  # [B*3, 16]
 
         # Reshape back and aggregate over suits
         suits_feat = suits_feat.view(batch_size, 3, 16)  # [B, S=3, 16]
@@ -564,6 +569,47 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+def _to_numpy(t):
+    return t.numpy() if isinstance(t, torch.Tensor) else tuple(_to_numpy(x) for x in t)
+
+
+def _to_torch(t):
+    return tuple(_to_torch(x) for x in t) if isinstance(t, tuple) else torch.from_numpy(t)
+
+
+class PrebuiltGame:
+    """One game's per-round build_tensors() output, built in a data worker (T-011 D1). It stands in a batch's
+    halfturns slot (the tokens slot holds None), and prepare_batches unpacks it where the serial path builds the game:
+    the worker processor's tensor-level skips are added to the processor there, and a build error is raised there,
+    after the rounds built before it (as in the serial path). Arrays travel as numpy: no shared-memory handles."""
+
+    def __init__(self, rounds, skipped: dict, build_error=None):
+        self.rounds = rounds  # [(during, discard, post)] of numpy, or the rounds built before build_error
+        self.skipped = skipped
+        self.build_error = build_error
+
+    def unpack(self, processor: "TransformerTensorProcessor"):
+        processor.skipped.update(self.skipped)
+        for r in self.rounds:
+            yield _to_torch(r)
+        if self.build_error is not None:
+            raise self.build_error
+
+
+def build_game(all_halfturns, all_encoding_tokens, processor_cls=None) -> PrebuiltGame:
+    """The data worker's tensor build of one parsed game: build_tensors() round by round with a fresh processor (the
+    processor holds no state but `skipped`). A build error is kept, not raised: the trainer raises it at its own
+    build point. processor_cls: tests force a skip or a failure with a subclass."""
+    processor = (processor_cls or TransformerTensorProcessor)()
+    rounds = []
+    try:
+        for h, t in zip(all_halfturns, all_encoding_tokens):
+            rounds.append(_to_numpy(processor.build_tensors(h, t)))
+    except Exception as e:
+        return PrebuiltGame(rounds, dict(processor.skipped), e)
+    return PrebuiltGame(rounds, dict(processor.skipped))
+
+
 class TransformerTensorProcessor:
     def __init__(self):
         self.skipped = Counter()  # samples dropped by a tensor-level sanity check; gates.py asserts it stays empty
@@ -595,9 +641,11 @@ class TransformerTensorProcessor:
         tensors_post_batch = []
 
         for all_halfturns, all_encoding_tokens in zip(all_halfturns_list, all_encoding_tokens_list):
-            for halfturns, encoding_tokens in zip(all_halfturns, all_encoding_tokens):
-                tensors_during, tensors_discard, tensors_post = self.build_tensors(halfturns, encoding_tokens)
-
+            if isinstance(all_halfturns, PrebuiltGame):  # built in a data worker: its skips and errors land here
+                rounds = all_halfturns.unpack(self)
+            else:
+                rounds = (self.build_tensors(h, t) for h, t in zip(all_halfturns, all_encoding_tokens))
+            for tensors_during, tensors_discard, tensors_post in rounds:
                 tensors_during_batch.append(tensors_during)
                 tensors_discard_batch.append(tensors_discard)
                 tensors_post_batch.append(tensors_post)

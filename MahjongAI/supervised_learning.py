@@ -21,13 +21,15 @@ import pathlib
 import pstats
 import re
 from datetime import datetime
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 
-from MahjongAI.agents.encoder_conv import EncoderConvModel, TransformerTensorProcessor
+from MahjongAI.agents.encoder_conv import EncoderConvModel, TransformerTensorProcessor, build_game
 from MahjongAI.utils.baselines import fit_bias_prior, score_bias, shanten_greedy, uniform_legal
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
+from MahjongAI.utils.game_workers import GameWorkers
 
 # Root of the MahjongAI package: data paths resolve the same from any working directory.
 _PACKAGE_DIR = pathlib.Path(__file__).parent
@@ -40,7 +42,7 @@ TRAIN_YEARS = (2021,)
 # continues where it stopped
 DATA_SEED = 0
 MODEL_SEED = 0  # torch.manual_seed before the model is built
-TORCH_THREADS = 10
+TORCH_THREADS = 8  # T-011 T2: s/step with 2 data workers, 4: 0.324, 6: 0.330, 8: 0.316, 10: 0.341 threads
 VAL_YEAR = "2022"  # time-forward validation: the week after the training year
 VAL_DAYS = tuple(f"202201{d:02d}" for d in range(1, 8))
 VAL_GAMES = 100  # the first VAL_GAMES accepted games of VAL_DAYS in a seeded order, held in RAM
@@ -61,6 +63,15 @@ LOGGED_SKIPS = frozenset({"invalid:Own-turn action after own discard",
                           "invalid:Auto-played seat"})  # rare: each one is logged with its file
 EVAL_EVERY_STEPS = 500
 SAVE_EVERY_STEPS = 500
+# T-011 D1: training games are parsed and tensor-built in DATA_WORKERS spawn processes, DATA_PREFETCH files ahead
+# per loader (0 workers = in the trainer, as before). Exact: same games, tensors, skips and loader state.
+# Timed s/step (10 threads): 0 workers 0.718, 1: 0.469, 2: 0.332, 3: 0.324 (within 2's spread) -> 2.
+DATA_WORKERS = 2
+DATA_PREFETCH = 8
+# T-011 P: the prior's games are parsed and built by their own pool of PRIOR_WORKERS (0 = in the trainer), closed
+# when the prior sample is read; the training workers have not started yet. Exact: same games, masks and labels.
+PRIOR_WORKERS = 8
+PRIOR_PREFETCH = 32
 MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -158,30 +169,58 @@ class ValSet:
             model.train()
 
 
-def fit_prior(log: RunLog) -> dict:
-    """{head: bias} of the no-state prior, fitted on the first PRIOR_GAMES accepted 2021 games (loader seed PRIOR_SEED)."""
+class PriorSample(NamedTuple):
+    """The prior's training sample: per head, one mask / label tensor per accepted game, in loader order."""
+    files: list
+    masks: dict  # {head: [mask (n, A) bool per game]}
+    labels: dict  # {head: [y (n,) per game]}
+    files_read: int
+    skipped: dict
+
+
+def prior_sample(log: RunLog, workers=None) -> PriorSample:
+    """Masks and labels of the first PRIOR_GAMES accepted 2021 games (loader seed PRIOR_SEED), the games parsed and
+    built by `workers` when given."""
     loader = DataLoader(str(DATA_ROOT / "2021"), 1, log, seed=PRIOR_SEED, expected_skips=EXPECTED_SKIPS,
-                        logged_skips=LOGGED_SKIPS)
+                        logged_skips=LOGGED_SKIPS, workers=workers)
     log(f"Prior: fitting on the first {PRIOR_GAMES} accepted games of {len(loader.file_list)} 2021 files (seed {PRIOR_SEED})")
     processor = TransformerTensorProcessor()
-    masks, labels = {h: [] for h in HEADS}, {h: [] for h in HEADS}
-    for k in range(PRIOR_GAMES):  # parse one game at a time and keep only its masks / labels
+    files, masks, labels = [], {h: [] for h in HEADS}, {h: [] for h in HEADS}
+    for k in range(PRIOR_GAMES):  # one game at a time: keep only its masks / labels
         f, h, t = _next_game(loader)
+        files.append(f)
         for head, (mask, y, _) in head_tensors(processor, h, t).items():
             masks[head].append(mask)
             labels[head].append(y)
         _check_tensor_skips(processor, "the prior's training games", [f])
         if (k + 1) % 500 == 0:
             log(f"  prior games {k + 1} / {PRIOR_GAMES} (files read {loader.current_index}, skipped {dict(loader.skipped)})")
+    return PriorSample(files, masks, labels, loader.current_index, dict(loader.skipped))
+
+
+def prior_bias(log: RunLog, sample: PriorSample) -> dict:
+    """{head: bias} of the no-state prior fitted on `sample`."""
     bias = {}
     for head in HEADS:
-        m, y = torch.cat(masks[head]), torch.cat(labels[head])
+        m, y = torch.cat(sample.masks[head]), torch.cat(sample.labels[head])
         bias[head] = fit_bias_prior(m, y, l2=PRIOR_L2)
         nll, _ = score_bias(bias[head], m, y)
         assert torch.isfinite(bias[head]).all() and torch.isfinite(nll).all(), f"prior {head}: non-finite bias or NLL"
         unseen = (torch.bincount(y, minlength=m.shape[1]) == 0).sum().item()
         log(f"  prior {head}: n={len(y)}, train CE {nll.mean().item():.4f}, slots never taken {unseen}")
     return bias
+
+
+def fit_prior(log: RunLog) -> dict:
+    """{head: bias} of the no-state prior, fitted on the first PRIOR_GAMES accepted 2021 games (loader seed PRIOR_SEED).
+    The games come from a pool of PRIOR_WORKERS, closed on every exit of the sample read."""
+    workers = GameWorkers(PRIOR_WORKERS, build_game, window=PRIOR_PREFETCH) if PRIOR_WORKERS else None
+    try:
+        sample = prior_sample(log, workers)
+    finally:
+        if workers is not None:
+            workers.close()
+    return prior_bias(log, sample)
 
 
 def baseline_header(val: ValSet, bias: dict) -> dict:
@@ -277,6 +316,39 @@ def train_files_sha256(cluster: DataLoaderCluster) -> str:
     return h.hexdigest()
 
 
+def batch_files_hash(files) -> str:
+    """12 hex characters of the sha256 of the game file names (basenames), in order: the per-step log's record of the
+    files an update consumed, so two runs' consumed-file sequences can be compared line by line."""
+    return hashlib.sha256("\n".join(os.path.basename(f) for f in files).encode()).hexdigest()[:12]
+
+
+def config_mismatch(saved: dict, current: dict) -> dict:
+    """{key: (saved, current)} of the run-identity keys that differ; total_steps may change on a resume (a run
+    extended past its budget), every other key (torch_threads too: it changes the float reduction order) must not."""
+    keys = sorted((saved.keys() | current.keys()) - {"total_steps"})
+    return {k: (saved.get(k, "<absent>"), current.get(k, "<absent>")) for k in keys
+            if k not in saved or k not in current or saved[k] != current[k]}
+
+
+def _mismatch_text(mismatch: dict) -> str:
+    return ", ".join(f"{k} {a!r} -> {b!r}" for k, (a, b) in mismatch.items())
+
+
+def make_workers():
+    """The run's data workers (started on first use), or None for DATA_WORKERS = 0."""
+    return GameWorkers(DATA_WORKERS, build_game, window=DATA_PREFETCH) if DATA_WORKERS else None
+
+
+def train_cluster(log, batch_size: int, workers=None) -> DataLoaderCluster:
+    """The training loaders (one per TRAIN_YEARS year) and their cluster, served by `workers` when given."""
+    dataloaders = [
+        DataLoader(str(DATA_ROOT / str(yr)), batch_size, log, seed=DATA_SEED, expected_skips=EXPECTED_SKIPS,
+                   logged_skips=LOGGED_SKIPS, workers=workers)
+        for yr in TRAIN_YEARS
+    ]
+    return DataLoaderCluster(dataloaders, seed=DATA_SEED)
+
+
 CHECKPOINT_RE = re.compile(r"step_(\d+)\.pt$")
 
 
@@ -289,6 +361,16 @@ def find_latest_checkpoint(checkpoint_dir: str):
 
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None):
+    workers = make_workers()
+    try:
+        _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers)
+    finally:  # every stop path: normal end, exception, KeyboardInterrupt
+        if workers is not None:
+            workers.close()
+
+
+def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int, save_every: int,
+           expect_prior_ce, expect_shanten, workers):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
@@ -311,12 +393,8 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    dataloaders = [
-        DataLoader(str(DATA_ROOT / str(yr)), batch_size, log, seed=DATA_SEED, expected_skips=EXPECTED_SKIPS,
-                   logged_skips=LOGGED_SKIPS)
-        for yr in TRAIN_YEARS
-    ]
-    cluster = DataLoaderCluster(dataloaders, seed=DATA_SEED)
+    cluster = train_cluster(log, batch_size, workers)
+    dataloaders = cluster.dataloaders
     val = ValSet.load(log)
     train_ids = {os.path.basename(f) for dl in dataloaders for f in dl.file_list}
     assert not train_ids & set(val.ids), f"train and validation games overlap: {sorted(train_ids & set(val.ids))[:5]}"
@@ -330,16 +408,14 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
         "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": TORCH_THREADS,
     }
 
-    def identity(c: dict) -> dict:  # total_steps may change on a resume (a run extended past its budget)
-        return {k: v for k, v in c.items() if k != "total_steps"}
-
     current_step, rows, header = 0, [], None
     train_sums = {h: [0.0, 0] for h in HEADS}  # train-mode batch loss x n, n; since the last eval row
     latest_step, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
     if latest_checkpoint:
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=True)
-        assert identity(checkpoint["config"]) == identity(config), (
-            f"{latest_checkpoint} is from another run config:\n{checkpoint['config']}\nvs\n{config}")
+        mismatch = config_mismatch(checkpoint["config"], config)
+        assert not mismatch, (f"{latest_checkpoint} is from another run config: {_mismatch_text(mismatch)}; "
+                              "resume with the same config or start a new run dir")
         assert checkpoint["val_ids"] == val.ids, f"{latest_checkpoint}: validation games differ"
         if checkpoint["config"]["total_steps"] != total_steps:
             log(f"total_steps {checkpoint['config']['total_steps']} -> {total_steps} (cosine horizon recomputed)")
@@ -359,8 +435,9 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
         train_sums = {h: list(checkpoint["train_sums"][h]) for h in HEADS}
         header, _ = metrics.read()
         assert header is not None, f"{metrics.path} is missing: cannot resume a run without its header"
-        assert identity(header["config"]) == identity(config) and header["val_ids"] == val.ids, (
-            f"{metrics.path} header is from another run")
+        mismatch = config_mismatch(header["config"], config)
+        assert not mismatch and header["val_ids"] == val.ids, (
+            f"{metrics.path} header is from another run" + (f": {_mismatch_text(mismatch)}" if mismatch else ""))
         rows = metrics.truncate_after(current_step)
         log(f"Loaded checkpoint {latest_checkpoint}: resuming at step {current_step}; prior loaded "
             f"(no refit); data loader at {checkpoint['loader_state']}; metrics rows kept {[r['step'] for r in rows]}")
@@ -464,8 +541,10 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     try:
         if is_eval_step(current_step) and not any(r["step"] == current_step for r in rows):
             evaluate()  # row 0 of a fresh run, or the row a stop / kill lost after its checkpoint
+        consumed = []  # the files of the batches drawn since the last update, in order (a no-sample batch included)
         while current_step < total_steps:
             games, tokens = next(cluster)
+            consumed += cluster.last_batch_files
             results = model(games, tokens, sample=True) if games else None  # no games: every one was skipped
             _check_tensor_skips(model.tensor_processor, f"the training batch after step {current_step}",
                                 cluster.last_batch_files)
@@ -497,7 +576,9 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
             for h, out in results.items():
                 train_sums[h][0] += out.loss.item() * out.y.numel()
                 train_sums[h][1] += out.y.numel()
-            log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results))
+            log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results)
+                + f" | files {batch_files_hash(consumed)}")
+            consumed = []
 
             if is_eval_step(current_step):
                 evaluate()
