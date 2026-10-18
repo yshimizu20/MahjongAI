@@ -161,8 +161,9 @@ def test_model_fast_path_equals_full_blocks(games, n_layers, mode):
 
 def test_dropout_active_on_state_row(games):
     """Train mode, default dropout: the last block draws its masks on the state row. Two seeds give different
-    outputs (the same seed the same), with the module dropouts alone and with the attention dropout alone; the
-    share the module dropouts zero over many draws is DROPOUT_RATIO +/- 0.02."""
+    outputs (the same seed the same), with the module dropouts alone and with the attention dropout alone. Each module
+    dropout, counted on its own, runs once per block forward, on the state row only, and zeroes DROPOUT_RATIO +/- 0.02
+    of its inputs over many draws."""
     torch.manual_seed(0)
     model = EncoderConvModel(verbose=False).train()
 
@@ -179,30 +180,38 @@ def test_dropout_active_on_state_row(games):
 
     _set_dropout(model, DROPOUT_RATIO)
     block = model.blocks[-1]
-    counts = {"kept": 0, "dropped": 0}
-    shapes = set()
+    modules = {"attention": block.self_attention.dropout, "ffwd": block.ffwd.net[-1]}
+    assert isinstance(modules["ffwd"], torch.nn.Dropout)
+    stats = {name: {"calls": 0, "kept": 0, "dropped": 0, "shapes": set()} for name in modules}
 
-    def count(module, inputs, output):
-        shapes.add(tuple(output.shape[1:]))
-        live = inputs[0] != 0
-        dropped = (output == 0) & live
-        counts["dropped"] += int(dropped.sum())
-        counts["kept"] += int((live & ~dropped).sum())
+    def counter(name):
+        def count(module, inputs, output):
+            s = stats[name]
+            s["calls"] += 1
+            s["shapes"].add(tuple(output.shape[1:]))
+            live = inputs[0] != 0
+            dropped = (output == 0) & live
+            s["dropped"] += int(dropped.sum())
+            s["kept"] += int((live & ~dropped).sum())
+        return count
 
-    hooks = [block.self_attention.dropout.register_forward_hook(count),
-             block.ffwd.net[-1].register_forward_hook(count)]
-    assert isinstance(block.ffwd.net[-1], torch.nn.Dropout)
+    hooks = [m.register_forward_hook(counter(name)) for name, m in modules.items()]
+    forwards = 10
     try:
-        for seed in range(10):
+        for seed in range(forwards):
             logits(seed)
     finally:
         for h in hooks:
             h.remove()
-    assert shapes == {(1, EMBD_SIZE)}, f"last-block dropout not on the state row only: {shapes}"
-    share = counts["dropped"] / (counts["dropped"] + counts["kept"])
-    print(f"last-block dropped share {share:.4f} over {counts['dropped'] + counts['kept']} state-row elements")
-    assert counts["dropped"] + counts["kept"] > 100_000
-    assert abs(share - DROPOUT_RATIO) <= 0.02, f"dropped share {share:.4f}"
+    for name, s in stats.items():  # each module on its own: called, on the state row only, at its rate
+        n = s["dropped"] + s["kept"]
+        share = s["dropped"] / max(1, n)
+        print(f"last-block {name} dropout: {s['calls']} calls, dropped share {share:.4f} over {n} state-row elements")
+        assert s["calls"] >= forwards, f"{name} dropout called {s['calls']} times in {forwards} forwards"
+        assert s["shapes"] == {(1, EMBD_SIZE)}, f"last-block {name} dropout not on the state row only: {s['shapes']}"
+        assert n > 50_000, f"{name} dropout: {n} elements"
+        assert abs(share - DROPOUT_RATIO) <= 0.02, f"{name} dropout: dropped share {share:.4f}"
+    assert stats["attention"]["calls"] == stats["ffwd"]["calls"], {k: v["calls"] for k, v in stats.items()}
 
 
 # ---------------------------------------------------------------- StateNet conv as one matmul (T-011 L2)
