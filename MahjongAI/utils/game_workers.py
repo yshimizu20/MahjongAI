@@ -156,12 +156,15 @@ class GameWorkers:
             reader, writer = ctx.Pipe(duplex=False)
             args = (self.tasks, writer, self.build, os.getpid(), self.send, self.parse)
             p = ctx.Process(target=_worker_main, args=args, daemon=True)
-            p.start()
-            writer.close()  # the child holds the only write end: its death is an EOF here
-            os.set_blocking(reader.fileno(), False)
+            # registered before start: an interrupt during or after p.start() leaves no process close() cannot see
             self.procs.append(p)
             self.readers.append(reader)
             self.buffers.append(bytearray())
+            try:
+                p.start()
+            finally:
+                writer.close()  # the child holds the only write end: its death is an EOF here
+            os.set_blocking(reader.fileno(), False)
         self._stop.clear()
         self._drainer = threading.Thread(target=self._drain_loop, name="game-workers-drain", daemon=True)
         self._drainer.start()
@@ -290,15 +293,21 @@ class GameWorkers:
         """Terminate and join every worker (idempotent). Called on every stop path of the trainer."""
         self.closed = True
         self._stop.set()
-        with self._cond:
-            self._cond.notify_all()
-        if self._drainer is not None:  # stopped before the readers close under it
-            self._drainer.join(timeout=10)
-            self._drainer = None
-        for p in self.procs:
+        try:
+            with self._cond:
+                self._cond.notify_all()
+            drainer, self._drainer = self._drainer, None
+            if drainer is not None and drainer.ident is not None:  # started: stopped before the readers close under it
+                drainer.join(timeout=10)
+        finally:  # the workers are stopped whatever happened to the drain thread
+            self._close_processes()
+
+    def _close_processes(self):
+        started = [p for p in self.procs if p.pid is not None]  # a registered process whose start failed has no pid
+        for p in started:
             if p.is_alive():
                 p.terminate()
-        for p in self.procs:
+        for p in started:
             p.join(timeout=5)
             if p.is_alive():
                 p.kill()

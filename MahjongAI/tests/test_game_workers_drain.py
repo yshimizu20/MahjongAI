@@ -96,3 +96,58 @@ def test_live_worker_with_an_unfinished_frame_is_a_bounded_fatal_error(send):
     assert f"data worker pid {pids[0]} holds " in message and "byte(s) of an unfinished frame" in message, message
     assert seconds < 20 and w.pids() == [] and w.closed and w._drainer is None
     assert _gone(pids) and not multiprocessing.active_children() and not _drain_threads()
+
+
+def test_drain_thread_start_failure_still_stops_every_worker(monkeypatch):
+    """Thread.start() of the drain thread raises after the workers started: close() does not join the never-started
+    thread, and every worker process is stopped."""
+    start = threading.Thread.start
+
+    def failing_start(self):
+        if self.name == "game-workers-drain":
+            raise RuntimeError("can't start new thread")
+        start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+    w = GameWorkers(2, _build_big, window=4, timeout_s=10, parse=_parse_name)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        w.prefetch(["game-a.log"])
+    procs = list(w.procs)
+    assert len(procs) == 2 and all(p.is_alive() for p in procs)
+    try:
+        w.close()
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.kill()
+                p.join(5)
+    assert not any(p.is_alive() for p in procs) and w.procs == [] and w._drainer is None
+    assert not multiprocessing.active_children() and not _drain_threads()
+
+
+def test_interrupt_right_after_a_worker_start_still_stops_it(monkeypatch):
+    """A KeyboardInterrupt arrives right after the second worker's start() returned (before the rest of _start ran):
+    that worker is already registered, so close() stops it with the first."""
+    ctx = multiprocessing.get_context("spawn")
+    start, started = ctx.Process.start, []
+
+    def interrupted_start(self):
+        start(self)
+        started.append(self)
+        if len(started) == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(ctx.Process, "start", interrupted_start)
+    w = GameWorkers(3, _build_big, window=4, timeout_s=10, parse=_parse_name)
+    with pytest.raises(KeyboardInterrupt):
+        w.prefetch(["game-a.log"])
+    assert len(started) == 2 and all(p.is_alive() for p in started)
+    try:
+        w.close()
+    finally:
+        left = [p for p in started if p.is_alive()]
+        for p in left:
+            p.kill()
+            p.join(5)
+    assert not left, f"{len(left)} started worker(s) left alive by close()"
+    assert w.procs == [] and not multiprocessing.active_children() and not _drain_threads()
