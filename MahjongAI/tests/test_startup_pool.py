@@ -151,20 +151,49 @@ def test_valset_header_and_bias_equal_serial(monkeypatch, wide_val_root):
     assert sum(r[2] for r in header_serial["shanten_greedy"]) > 0
 
 
+def frozen_shanten_greedy(hand37: torch.Tensor, mask: torch.Tensor, y: torch.Tensor, bias: torch.Tensor,
+                          reverse_ties: bool = False) -> torch.Tensor:
+    """baselines.shanten_greedy of 468d71c, verbatim (the oracle; shares no code with greedy_hits / shanten_best).
+    reverse_ties (not in 468d71c): equal-bias ties go to the highest slot, to prove the case has such ties."""
+    from MahjongAI.utils.baselines import _legal, shanten_after
+    mask = _legal(mask, y)
+    assert hand37.shape == mask.shape, f"hand {tuple(hand37.shape)} vs mask {tuple(mask.shape)}"
+    bias = bias.tolist()
+    hits = torch.zeros(len(y), dtype=torch.bool)
+    for i in range(len(y)):
+        hand = hand37[i].round().long().tolist()
+        assert sum(hand[:34]) % 3 == 2, f"sample {i}: {sum(hand[:34])} concealed tiles at a discard"
+        legal = mask[i].nonzero().flatten().tolist()
+        sh = {slot: shanten_after(hand, slot) for slot in legal}
+        best = min(sh.values())
+        pick = max((slot for slot in legal if sh[slot] == best),
+                   key=lambda slot: (bias[slot], slot if reverse_ties else -slot))
+        hits[i] = pick == int(y[i])
+    return hits
+
+
 def test_header_shanten_step_equals_shanten_greedy(monkeypatch, wide_val_root):
-    """The header's shanten-greedy hits from the stored shanten step equal baselines.shanten_greedy recomputed from
-    the hands (the 468d71c header) for a bias with ties broken both ways."""
-    from MahjongAI.utils.baselines import shanten_greedy
+    """The header's shanten-greedy hits from the stored shanten step equal the frozen 468d71c shanten_greedy
+    recomputed from the hands, for an all-equal bias (every tie to the lowest slot), a two-valued bias (equal-bias
+    ties inside each value) and a bias without ties. The equal-bias cases hold ties the human discard decides."""
     monkeypatch.setattr(SL, "DATA_ROOT", wide_val_root)
     val, _ = _load(monkeypatch, 2, 8)
     g = torch.Generator().manual_seed(0)
-    for bias in (torch.zeros(37, dtype=torch.float64), torch.randn(37, generator=g, dtype=torch.float64)):
-        width = {h: val.head_samples(h)[0][1].shape[1] for h in SL.HEADS}
+    biases = {"equal": torch.zeros(37, dtype=torch.float64),
+              "two_valued": (torch.randn(37, generator=g) > 0).double(),
+              "unique": torch.randn(37, generator=g, dtype=torch.float64)}
+    width = {h: val.head_samples(h)[0][1].shape[1] for h in SL.HEADS}
+    for name, bias in biases.items():
         header = SL.baseline_header(val, {h: bias if h == "discard" else torch.zeros(width[h], dtype=torch.float64)
                                           for h in SL.HEADS})
-        expected = [[gid, len(y), int(shanten_greedy(hand, mask, y, bias).sum()) if len(y) else 0]
+
+        def oracle(reverse_ties=False):
+            return [[gid, len(y), int(frozen_shanten_greedy(hand, mask, y, bias, reverse_ties).sum()) if len(y) else 0]
                     for gid, mask, y, hand in val.head_samples("discard")]
-        assert header["shanten_greedy"] == expected
+
+        assert header["shanten_greedy"] == oracle(), name
+        if name != "unique":
+            assert oracle(reverse_ties=True) != oracle(), f"{name}: no equal-bias tie decides a hit"
 
 
 @pytest.mark.parametrize("kind", ["parse_error", "tensor_skip", "build_failure"])
