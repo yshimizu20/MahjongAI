@@ -4,7 +4,10 @@ path. Each comparison runs a serial and a worker path side by side, each with it
 import functools
 import multiprocessing
 import os
+import re
 import signal
+import struct
+import threading
 import time
 
 import pytest
@@ -39,6 +42,13 @@ class FailingProcessor(TransformerTensorProcessor):
 class StallingProcessor(TransformerTensorProcessor):
     def build_tensors(self, turns, tokens):
         time.sleep(30)
+
+
+def _send_half_then_die(fd, body):
+    """A worker's frame writer that sends half of a frame, lets the parent read it, then dies (os._exit)."""
+    os.write(fd, struct.pack("!Q", len(body)) + body[:len(body) // 2])
+    time.sleep(1.0)
+    os._exit(3)
 
 
 def _workers(n=2, processor_cls=None, **kw):
@@ -240,6 +250,33 @@ def test_dead_worker_is_fatal_names_the_file_and_leaves_no_process(small_roots):
     for _ in range(4):
         next(serial), next(resumed)
         assert resumed.last_batch_files == serial.last_batch_files
+
+
+def test_worker_death_mid_frame_is_fatal_and_leaves_no_process(small_roots):
+    """A worker dies after half of a result frame is sent (the other workers still run): fetch must not block on the
+    cut frame. It raises DataWorkerError long before the deadline, and every worker is stopped."""
+    w = _workers(send=_send_half_then_die, timeout_s=60)
+    fast = _cluster(small_roots, 2, SL.EXPECTED_SKIPS, w)
+    w.prefetch([])
+    pids = w.pids()
+    out = {}
+
+    def run():
+        t = time.monotonic()
+        try:
+            next(fast)
+        except BaseException as e:
+            out["error"] = e
+        out["seconds"] = time.monotonic() - t
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(30)
+    assert not thread.is_alive(), "fetch is blocked on a cut result frame"
+    assert isinstance(out.get("error"), DataWorkerError), out
+    assert re.search(r"(closed its result pipe \([1-9]\d* byte\(s\) of an unfinished frame\)|died \(exit code 3\)) "
+                     r"while fetching .*\.log", str(out["error"])), str(out["error"])
+    assert out["seconds"] < 30 and w.pids() == [] and _gone(pids) and not multiprocessing.active_children()
 
 
 def test_hung_worker_times_out_and_leaves_no_process(small_roots):
