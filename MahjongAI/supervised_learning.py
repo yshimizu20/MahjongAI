@@ -316,6 +316,12 @@ def train_files_sha256(cluster: DataLoaderCluster) -> str:
     return h.hexdigest()
 
 
+def batch_files_hash(files) -> str:
+    """12 hex characters of the sha256 of the game file names (basenames), in order: the per-step log's record of the
+    files an update consumed, so two runs' consumed-file sequences can be compared line by line."""
+    return hashlib.sha256("\n".join(os.path.basename(f) for f in files).encode()).hexdigest()[:12]
+
+
 def config_mismatch(saved: dict, current: dict) -> dict:
     """{key: (saved, current)} of the run-identity keys that differ; total_steps may change on a resume (a run
     extended past its budget), every other key (torch_threads too: it changes the float reduction order) must not."""
@@ -535,8 +541,10 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     try:
         if is_eval_step(current_step) and not any(r["step"] == current_step for r in rows):
             evaluate()  # row 0 of a fresh run, or the row a stop / kill lost after its checkpoint
+        consumed = []  # the files of the batches drawn since the last update, in order (a no-sample batch included)
         while current_step < total_steps:
             games, tokens = next(cluster)
+            consumed += cluster.last_batch_files
             results = model(games, tokens, sample=True) if games else None  # no games: every one was skipped
             _check_tensor_skips(model.tensor_processor, f"the training batch after step {current_step}",
                                 cluster.last_batch_files)
@@ -568,7 +576,9 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             for h, out in results.items():
                 train_sums[h][0] += out.loss.item() * out.y.numel()
                 train_sums[h][1] += out.y.numel()
-            log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results))
+            log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results)
+                + f" | files {batch_files_hash(consumed)}")
+            consumed = []
 
             if is_eval_step(current_step):
                 evaluate()
