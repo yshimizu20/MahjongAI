@@ -4,6 +4,7 @@ import random
 from collections import Counter
 
 from MahjongAI.process_xml import process, InvalidGameException
+from MahjongAI.utils.game_workers import RemoteError
 
 
 class UnexpectedSkip(RuntimeError):
@@ -139,10 +140,11 @@ class DataLoader:
             try:
                 all_halfturns, all_encoding_tokens = process(filename) if self.workers is None else fetched.game()
             except Exception as e:
-                if isinstance(e, InvalidGameException):
+                remote = isinstance(e, RemoteError)  # a worker's exception that did not pickle, as a record
+                if isinstance(e, InvalidGameException) or (remote and e.invalid_game):
                     key = "invalid:" + e.msg
                 else:  # a parser bug on one game: report it, keep going unless told otherwise
-                    key = type(e).__name__
+                    key = e.type_name if remote else type(e).__name__
                     self.log_func(f"skipped {filename}: {key}: {str(e)[:200]}")
                 try:
                     self._skip(filename, key, e)

@@ -4,8 +4,9 @@ The DataLoader / DataLoaderCluster stay the only authority on the file order, th
 `pending`, UnexpectedSkip and the checkpoint state: a loader given `workers` asks them for the same file it would
 parse (`fetch`) and submits its next files ahead (`prefetch`). A worker runs `process(file)` and then `build(halfturns,
 tokens)` (encoder_conv.build_game). The two error phases stay apart:
-  - a parse error travels back as the exception itself and is raised by `Fetched.game()` inside the loader's skip
-    handler, so the skip key, the log line, UnexpectedSkip and `pending` are the serial path's;
+  - a parse error travels back as the exception itself (or, if it does not pickle, as a RemoteError record that keeps
+    its type name, text and `msg`) and is raised by `Fetched.game()` inside the loader's skip handler, so the skip
+    key, the log line, UnexpectedSkip and `pending` are the serial path's;
   - a build error travels inside the built game and is raised by the trainer's prepare_batches, where the serial path
     builds the game (after the loader accepted the batch).
 A dead, hung or broken worker is not a skip: `fetch` raises DataWorkerError naming the file, after terminating and
@@ -35,23 +36,32 @@ class DataWorkerError(RuntimeError):
     """A data worker died, hung or sent a broken result: fatal for the run (never a counted skip)."""
 
 
-class _RemoteError(Exception):
-    """Stand-in for an exception that does not survive pickling; renamed to the original type's name below."""
+class RemoteError(Exception):
+    """A worker's parse or build exception that does not survive pickling, as a pickleable record: the phase ("parse"
+    or "build"), the original type's name, its text, its `msg` attribute (None if it had none) and whether it was an
+    InvalidGameException. The loader takes the skip key from these, so the key and the log line are the serial path's.
+    """
+
+    def __init__(self, phase: str, type_name: str, message: str, msg=None, invalid_game: bool = False):
+        super().__init__(phase, type_name, message, msg, invalid_game)
+        self.phase, self.type_name, self.message, self.msg, self.invalid_game = (
+            phase, type_name, message, msg, invalid_game)
+
+    def __str__(self):
+        return self.message
 
 
-def _transportable(e: BaseException) -> BaseException:
-    """`e` if it pickles back to the same type and text (so the loader's skip key and log line are unchanged), else an
-    exception of a class with the same name, the same text and the same `msg` attribute when there is one."""
+def _transportable(e: BaseException, phase: str) -> BaseException:
+    """`e` if it pickles back to the same type and text (so the loader's skip key and log line are unchanged), else a
+    RemoteError record of it."""
     try:
         back = pickle.loads(pickle.dumps(e))
         if type(back) is type(e) and str(back) == str(e) and getattr(back, "msg", None) == getattr(e, "msg", None):
             return e
     except Exception:
         pass
-    stand_in = type(type(e).__name__, (_RemoteError,), {})(str(e))
-    if hasattr(e, "msg"):
-        stand_in.msg = e.msg
-    return stand_in
+    from MahjongAI.process_xml import InvalidGameException
+    return RemoteError(phase, type(e).__name__, str(e), getattr(e, "msg", None), isinstance(e, InvalidGameException))
 
 
 def _watch_parent(parent_pid: int):
@@ -68,24 +78,25 @@ def _send_frame(fd: int, body: bytes):
         view = view[os.write(fd, view):]
 
 
-def _worker_main(tasks, results, build, parent_pid: int, send=_send_frame):
+def _worker_main(tasks, results, build, parent_pid: int, send=_send_frame, parse=None):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     import torch
     torch.set_num_threads(1)  # the trainer's threads keep their cores
     threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
-    from MahjongAI.process_xml import process
+    if parse is None:
+        from MahjongAI.process_xml import process as parse
     while True:
         filename = tasks.get()
         if filename is None:
             return
         try:
-            halfturns, tokens = process(filename)
+            halfturns, tokens = parse(filename)
         except Exception as e:
-            payload = ("parse_error", _transportable(e))
+            payload = ("parse_error", _transportable(e, "parse"))
         else:
             built = build(halfturns, tokens)
             if getattr(built, "build_error", None) is not None:
-                built.build_error = _transportable(built.build_error)
+                built.build_error = _transportable(built.build_error, "build")
             payload = ("ok", built)
         try:
             data = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
@@ -109,11 +120,14 @@ class Fetched:
 
 class GameWorkers:
     """`n` spawn worker processes shared by the loaders of one run. window: files a loader keeps submitted ahead.
-    send: the worker's frame writer (a test hook: a module-level function of (fd, body))."""
+    send, parse: test hooks, module-level functions: the worker's frame writer of (fd, body), and its parser of a
+    file (default process_xml.process)."""
 
-    def __init__(self, n: int, build, window: int = 8, timeout_s: float = WORKER_TIMEOUT_S, send=_send_frame):
+    def __init__(self, n: int, build, window: int = 8, timeout_s: float = WORKER_TIMEOUT_S, send=_send_frame,
+                 parse=None):
         assert n >= 1 and window >= 1
-        self.n, self.build, self.window, self.timeout_s, self.send = n, build, window, timeout_s, send
+        self.n, self.build, self.window, self.timeout_s = n, build, window, timeout_s
+        self.send, self.parse = send, parse
         self.procs = []
         self.readers = []  # per worker: the read end of its result pipe (non-blocking)
         self.buffers = []  # per worker: bytes read and not yet a whole frame
@@ -130,8 +144,8 @@ class GameWorkers:
         self.tasks = ctx.Queue()
         for _ in range(self.n):
             reader, writer = ctx.Pipe(duplex=False)
-            p = ctx.Process(target=_worker_main, args=(self.tasks, writer, self.build, os.getpid(), self.send),
-                            daemon=True)
+            args = (self.tasks, writer, self.build, os.getpid(), self.send, self.parse)
+            p = ctx.Process(target=_worker_main, args=args, daemon=True)
             p.start()
             writer.close()  # the child holds the only write end: its death is an EOF here
             os.set_blocking(reader.fileno(), False)

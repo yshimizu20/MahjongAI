@@ -4,6 +4,7 @@ path. Each comparison runs a serial and a worker path side by side, each with it
 import functools
 import multiprocessing
 import os
+import pickle
 import re
 import signal
 import struct
@@ -16,7 +17,9 @@ import torch
 from MahjongAI import supervised_learning as SL
 from MahjongAI.agents.encoder_conv import EncoderConvModel, TransformerTensorProcessor, build_game
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
-from MahjongAI.utils.game_workers import DataWorkerError, GameWorkers
+from MahjongAI.process_xml import InvalidGameException, process
+from MahjongAI.utils import dataloader as DL
+from MahjongAI.utils.game_workers import DataWorkerError, GameWorkers, RemoteError
 
 
 # ---------------------------------------------------------------- processors that a test forces to skip, fail or stall
@@ -26,7 +29,32 @@ class SkippingProcessor(TransformerTensorProcessor):
         return super().build_tensors(turns, tokens)
 
 
+class Unpicklable(Exception):
+    """Pickles, but does not unpickle: its __init__ needs two arguments and its args hold one."""
+
+    def __init__(self, message, code):
+        super().__init__(message)
+
+
+class UnpicklableInvalid(InvalidGameException):
+    """An invalid game whose exception refuses pickling."""
+
+    def __reduce__(self):
+        raise TypeError("UnpicklableInvalid does not pickle")
+
+
+def _parse_or_raise(filename):
+    """process(), but a file named *-unpick* raises an exception that does not survive pickling."""
+    if "-unpick" in filename:
+        if "-unpickinv" in filename:
+            raise UnpicklableInvalid("Weird seat")
+        raise Unpicklable(f"cannot read {os.path.basename(filename)}", 7)
+    return process(filename)
+
+
 class FailingProcessor(TransformerTensorProcessor):
+    error, extra = ValueError, ()
+
     def __init__(self):
         super().__init__()
         self.calls = 0
@@ -35,8 +63,12 @@ class FailingProcessor(TransformerTensorProcessor):
         self.calls += 1
         if self.calls == 2:  # the 2nd round of the first game, in both paths
             self.skipped["before failure"] += 1
-            raise ValueError("forced build failure")
+            raise self.error("forced build failure", *self.extra)
         return super().build_tensors(turns, tokens)
+
+
+class UnpicklableFailingProcessor(FailingProcessor):
+    error, extra = Unpicklable, (7,)
 
 
 class StallingProcessor(TransformerTensorProcessor):
@@ -143,22 +175,52 @@ def test_parse_errors_raise_the_same_unexpected_skips_and_keep_pending(small_roo
     assert len(raises) >= 5 and any(ld["pending"] for e in raises for ld in e[3]["loaders"])
 
 
-def test_build_error_raises_at_the_build_point(small_roots):
-    """A tensor-build failure surfaces in prepare_batches, after the loader accepted the batch, with the same type,
-    message, loader state and tensor-level skip counts in both paths."""
+@pytest.mark.parametrize("processor_cls", [FailingProcessor, UnpicklableFailingProcessor])
+def test_build_error_raises_at_the_build_point(small_roots, processor_cls):
+    """A tensor-build failure surfaces in prepare_batches, after the loader accepted the batch, with the same message,
+    loader state and tensor-level skip counts in both paths, and the same type; an exception that does not pickle
+    arrives as a RemoteError record of phase "build" with the original type's name."""
     serial = _cluster(small_roots, 2, SL.EXPECTED_SKIPS)
     ga, ta = next(serial)
-    pa = FailingProcessor()
-    with pytest.raises(ValueError, match="^forced build failure$"):
+    pa = processor_cls()
+    with pytest.raises(processor_cls.error, match="^forced build failure$"):
         pa.prepare_batches(ga, ta)
-    with _workers(processor_cls=FailingProcessor) as w:
+    with _workers(processor_cls=processor_cls) as w:
         fast = _cluster(small_roots, 2, SL.EXPECTED_SKIPS, w)
         gb, tb = next(fast)  # the worker's build failure is not a loader event
         assert fast.state_dict() == serial.state_dict() and fast.last_batch_files == serial.last_batch_files
         pb = TransformerTensorProcessor()
-        with pytest.raises(ValueError, match="^forced build failure$"):
+        expected = ValueError if processor_cls.error is ValueError else RemoteError
+        with pytest.raises(expected, match="^forced build failure$") as error:
             pb.prepare_batches(gb, tb)
+    if expected is RemoteError:
+        assert (error.value.phase, error.value.type_name) == ("build", "Unpicklable")
     assert pa.skipped == pb.skipped == {"before failure": 1}
+
+
+@pytest.mark.parametrize("kind, key", [("unpick00", "Unpicklable"), ("unpickinv0", "invalid:Weird seat")])
+def test_unpicklable_parse_error_keeps_the_serial_skip_key_and_log(small_roots, monkeypatch, kind, key):
+    """A parse error that does not survive pickling: the worker sends a RemoteError record (phase "parse"), and the
+    loader counts the serial path's skip key, writes its log line and reads the same batches."""
+    src = next(small_roots[0].glob("*/*/*.log")).resolve()
+    day = small_roots[0] / "20210101" / "20210101_00"
+    day.mkdir(parents=True, exist_ok=True)
+    (day / f"2021010100gm-0000-0000-{kind}.log").write_bytes(src.read_bytes())
+    monkeypatch.setattr(DL, "process", _parse_or_raise)
+
+    def run(workers):
+        logs = []
+        cluster = _cluster(small_roots, 2, SL.EXPECTED_SKIPS | {key}, workers, logs.append)
+        batches = [(next(cluster), list(cluster.last_batch_files))[1] for _ in range(8)]
+        return logs, batches, cluster.skipped(), cluster.state_dict()
+
+    serial = run(None)
+    with _workers(parse=_parse_or_raise) as w:
+        fast = run(w)
+    assert serial == fast and serial[2][key] >= 1
+    assert (key == "Unpicklable") == any(": Unpicklable: cannot read " in line for line in serial[0])
+    record = pickle.loads(pickle.dumps(RemoteError("parse", "Unpicklable", "text", None, False)))
+    assert (record.phase, record.type_name, str(record), record.msg) == ("parse", "Unpicklable", "text", None)
 
 
 def test_tensor_skips_raise_the_same_unexpected_skip_before_the_update(small_roots):
