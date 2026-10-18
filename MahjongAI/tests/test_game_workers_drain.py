@@ -56,6 +56,13 @@ def _send_good_then_malformed(fd, body):
         _send_frame(fd, body)
 
 
+def _send_with_ghost(fd, body):
+    """The worker's frame, then a second whole frame for a file nobody submitted ("ghost.log")."""
+    import pickle
+    _send_frame(fd, body)
+    _send_frame(fd, pickle.dumps(("ghost.log", pickle.loads(body)[1])))
+
+
 def _gone(pids):
     for pid in pids:
         try:
@@ -174,3 +181,32 @@ def test_recorded_transport_error_is_raised_before_cached_data():
     with pytest.raises(DataWorkerError, match="unreadable result frame.* while fetching game-a.log"):
         w.fetch("game-a.log")
     assert w.closed and w.pids() == [] and _gone(pids) and not _drain_threads()
+
+
+def _assert_bound(w, outstanding):
+    """The drain buffer bound: frames held <= files submitted and not fetched (`outstanding`), every one of them."""
+    with w._cond:
+        assert set(w.done) <= outstanding and len(w.done) + len(w.in_flight) <= len(outstanding), (
+            f"held {sorted(w.done)}, in flight {sorted(w.in_flight)}, submitted and not fetched {sorted(outstanding)}")
+
+
+def test_drain_buffer_holds_only_files_submitted_and_not_fetched():
+    """Three 4 MB results and no fetch: the buffer holds the three; after a fetch, two. A worker that also sends a
+    frame for a file nobody submitted: the frame is not stored (the bound holds) and the next fetch raises."""
+    files = ["game-a.log", "game-b.log", "game-c.log"]
+    with GameWorkers(1, _build_big, window=1, timeout_s=60, parse=_parse_name) as w:
+        w.prefetch(files)
+        with w._cond:
+            assert w._cond.wait_for(lambda: len(w.done) == 3, timeout=60), f"stored {sorted(w.done)}"
+        _assert_bound(w, set(files))
+        assert w.fetch("game-a.log").game()[0] == _payload("game-a.log")
+        _assert_bound(w, set(files[1:]))
+
+    w = GameWorkers(1, _build_big, window=4, timeout_s=60, send=_send_with_ghost, parse=_parse_name)
+    w.prefetch(["game-a.log"])
+    with w._cond:
+        assert w._cond.wait_for(lambda: w._error is not None or "ghost.log" in w.done, timeout=60)
+    _assert_bound(w, {"game-a.log"})
+    with pytest.raises(DataWorkerError, match="result frame for ghost.log, which is not in flight"):
+        w.fetch("game-a.log")
+    assert w.closed and not _drain_threads()

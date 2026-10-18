@@ -14,9 +14,10 @@ joining every worker. Every wait is bounded: each worker sends its results on it
 read end, so a dead writer gives EOF), as length-prefixed frames; a frame cut by a worker's death or stall is an EOF,
 a dead process or the deadline, never a blocked read. A parent drain thread per pool (T-047 D-B) reads every worker's
 pipe continuously into the in-memory `done` buffer, so a worker never waits for the trainer's next fetch to finish a
-send (a macOS pipe holds 64 KB; a game's frame is 3-4 MB). The buffer is bounded: the thread stops reading while it
-holds `window` whole frames and the trainer is not waiting, and reads on while a fetch waits (the awaited frame can be
-behind a held one). The thread only records a broken pipe or frame; the next fetch raises it. Workers start on the
+send (a macOS pipe holds 64 KB; a game's frame is 3-4 MB). The buffer holds only results of files submitted and not
+fetched yet: a frame for a file not in flight is a broken frame, never stored. So it never holds more frames than files
+submitted and not fetched, which the loaders bound (a loader submits its pending files and `window` files ahead). The
+thread only records a broken pipe or frame; the next fetch raises it, before any cached result. Workers start on the
 first prefetch / fetch, ignore SIGINT (the trainer owns the stop), run one torch thread each, and exit by themselves
 when the trainer process is gone (kill -9).
 """
@@ -138,11 +139,10 @@ class GameWorkers:
         self.in_flight = set()  # submitted, result not received
         self.done = {}  # file -> pickled result, not fetched yet
         self.closed = False
-        # the drain thread and the trainer share in_flight, done, buffers, _waiting and _error under _cond
+        # the drain thread and the trainer share in_flight, done, buffers and _error under _cond
         self._cond = threading.Condition()
         self._stop = threading.Event()
         self._drainer = None
-        self._waiting = False  # a fetch waits: the thread reads past the bound
         self._error = None  # the first broken pipe or frame the thread saw, raised by the next fetch
 
     def _start(self):
@@ -183,14 +183,9 @@ class GameWorkers:
         raise DataWorkerError(message)
 
     def _drain_loop(self):
-        """The drain thread: read every open pipe as data arrives; stop reading at the bound unless a fetch waits."""
+        """The drain thread: read every open pipe as data arrives."""
         open_ = set(range(len(self.readers)))
         while not self._stop.is_set():
-            with self._cond:
-                while len(self.done) >= self.window and not self._waiting and not self._stop.is_set():
-                    self._cond.wait(POLL_S)
-            if self._stop.is_set():
-                return
             if not open_:
                 self._stop.wait(POLL_S)
                 continue
@@ -232,7 +227,10 @@ class GameWorkers:
                 except Exception as e:
                     self._error = self._error or f"unreadable result frame: {type(e).__name__}: {e}"
                     break
-                self.in_flight.discard(f)
+                if f not in self.in_flight:  # the bound: a result is stored only for a file submitted and not received
+                    self._error = self._error or f"result frame for {f}, which is not in flight"
+                    break
+                self.in_flight.remove(f)
                 self.done[f] = data
             if eof:
                 self._error = self._error or error or (
@@ -254,31 +252,25 @@ class GameWorkers:
         deadline = time.monotonic() + self.timeout_s
         failure, data = None, None
         with self._cond:
-            self._waiting = True
-            self._cond.notify_all()
-            try:
-                while True:
-                    dead = [p for p in self.procs if not p.is_alive()]
-                    if dead:
-                        failure = (f"data worker pid {dead[0].pid} died (exit code {dead[0].exitcode}) while fetching "
-                                   f"{filename}; {len(self.in_flight)} file(s) in flight")
-                        break
-                    if self._error is not None:  # before cached data: no update after a broken pipe or frame
-                        failure = f"{self._error} while fetching {filename}; {len(self.in_flight)} file(s) in flight"
-                        break
-                    if filename in self.done:
-                        self.in_flight.discard(filename)
-                        data = self.done.pop(filename)
-                        self._cond.notify_all()  # room under the bound again
-                        break
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        failure = (f"no result for {filename} from the data workers within {self.timeout_s:.0f} s"
-                                   + self._unfinished())
-                        break
-                    self._cond.wait(min(POLL_S, left))
-            finally:
-                self._waiting = False
+            while True:
+                dead = [p for p in self.procs if not p.is_alive()]
+                if dead:
+                    failure = (f"data worker pid {dead[0].pid} died (exit code {dead[0].exitcode}) while fetching "
+                               f"{filename}; {len(self.in_flight)} file(s) in flight")
+                    break
+                if self._error is not None:  # before cached data: no update after a broken pipe or frame
+                    failure = f"{self._error} while fetching {filename}; {len(self.in_flight)} file(s) in flight"
+                    break
+                if filename in self.done:
+                    self.in_flight.discard(filename)
+                    data = self.done.pop(filename)
+                    break
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    failure = (f"no result for {filename} from the data workers within {self.timeout_s:.0f} s"
+                               + self._unfinished())
+                    break
+                self._cond.wait(min(POLL_S, left))
         if failure is not None:
             self._fail(failure)  # outside _cond: close() joins the drain thread
         try:
