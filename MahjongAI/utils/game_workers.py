@@ -11,8 +11,12 @@ tokens)` (encoder_conv.build_game). The two error phases stay apart:
     builds the game (after the loader accepted the batch).
 A dead, hung or broken worker is not a skip: `fetch` raises DataWorkerError naming the file, after terminating and
 joining every worker. Every wait is bounded: each worker sends its results on its own pipe (the parent holds only the
-read end, so a dead writer gives EOF), as length-prefixed frames that the parent reads without blocking; a frame cut
-by a worker's death or stall is an EOF, a dead process or the deadline, never a blocked read. Workers start on the
+read end, so a dead writer gives EOF), as length-prefixed frames; a frame cut by a worker's death or stall is an EOF,
+a dead process or the deadline, never a blocked read. A parent drain thread per pool (T-047 D-B) reads every worker's
+pipe continuously into the in-memory `done` buffer, so a worker never waits for the trainer's next fetch to finish a
+send (a macOS pipe holds 64 KB; a game's frame is 3-4 MB). The buffer is bounded: the thread stops reading while it
+holds `window` whole frames and the trainer is not waiting, and reads on while a fetch waits (the awaited frame can be
+behind a held one). The thread only records a broken pipe or frame; the next fetch raises it. Workers start on the
 first prefetch / fetch, ignore SIGINT (the trainer owns the stop), run one torch thread each, and exit by themselves
 when the trainer process is gone (kill -9).
 """
@@ -72,7 +76,7 @@ def _watch_parent(parent_pid: int):
 
 
 def _send_frame(fd: int, body: bytes):
-    """Write one length-prefixed frame to the worker's result pipe (blocking: the parent drains it)."""
+    """Write one length-prefixed frame to the worker's result pipe (blocking: the parent's drain thread reads it)."""
     view = memoryview(_HEADER.pack(len(body)) + body)
     while view:
         view = view[os.write(fd, view):]
@@ -134,6 +138,12 @@ class GameWorkers:
         self.in_flight = set()  # submitted, result not received
         self.done = {}  # file -> pickled result, not fetched yet
         self.closed = False
+        # the drain thread and the trainer share in_flight, done, buffers, _waiting and _error under _cond
+        self._cond = threading.Condition()
+        self._stop = threading.Event()
+        self._drainer = None
+        self._waiting = False  # a fetch waits: the thread reads past the bound
+        self._error = None  # the first broken pipe or frame the thread saw, raised by the next fetch
 
     def _start(self):
         if self.procs:
@@ -152,67 +162,124 @@ class GameWorkers:
             self.procs.append(p)
             self.readers.append(reader)
             self.buffers.append(bytearray())
+        self._stop.clear()
+        self._drainer = threading.Thread(target=self._drain_loop, name="game-workers-drain", daemon=True)
+        self._drainer.start()
 
     def prefetch(self, files):
         """Submit the files not submitted yet, in order (the workers take them first come, first served)."""
         self._start()
-        for f in files:
-            if f not in self.in_flight and f not in self.done:
-                self.in_flight.add(f)
-                self.tasks.put(f)
+        with self._cond:
+            for f in files:
+                if f not in self.in_flight and f not in self.done:
+                    self.in_flight.add(f)
+                    self.tasks.put(f)
 
     def _fail(self, message: str):
         self.close()
         raise DataWorkerError(message)
 
-    def _drain(self, i: int, filename: str):
-        """Read what worker i's pipe holds now (never blocks) and store each whole frame's result."""
-        buf = self.buffers[i]
+    def _drain_loop(self):
+        """The drain thread: read every open pipe as data arrives; stop reading at the bound unless a fetch waits."""
+        open_ = set(range(len(self.readers)))
+        while not self._stop.is_set():
+            with self._cond:
+                while len(self.done) >= self.window and not self._waiting and not self._stop.is_set():
+                    self._cond.wait(POLL_S)
+            if self._stop.is_set():
+                return
+            if not open_:
+                self._stop.wait(POLL_S)
+                continue
+            try:
+                ready = wait([self.readers[i] for i in open_], timeout=POLL_S)
+            except (OSError, ValueError):  # a reader closed under us: only close() does that
+                return
+            for i in sorted(open_):
+                if self.readers[i] in ready and not self._read(i):
+                    open_.discard(i)
+
+    def _read(self, i: int) -> bool:
+        """Read what worker i's pipe holds now (never blocks) and store each whole frame's result. False at EOF."""
+        chunks, eof = [], False
         while True:
             try:
                 chunk = os.read(self.readers[i].fileno(), _READ_CHUNK)
             except BlockingIOError:
                 break
-            if not chunk:
-                p = self.procs[i]
-                self._fail(f"data worker pid {p.pid} closed its result pipe ({len(buf)} byte(s) of an unfinished "
-                           f"frame) while fetching {filename}; {len(self.in_flight)} file(s) in flight")
-            buf += chunk
-        while len(buf) >= _HEADER.size:
-            (size,) = _HEADER.unpack_from(buf)
-            if len(buf) < _HEADER.size + size:
+            except OSError as e:
+                eof, error = True, f"data worker pid {self.procs[i].pid} result pipe read failed: {e}"
                 break
-            body = bytes(buf[_HEADER.size:_HEADER.size + size])
-            del buf[:_HEADER.size + size]
-            try:
-                f, data = pickle.loads(body)
-            except Exception as e:
-                self._fail(f"unreadable result frame while fetching {filename}: {type(e).__name__}: {e}")
-            self.in_flight.discard(f)
-            self.done[f] = data
+            if not chunk:
+                eof, error = True, None
+                break
+            chunks.append(chunk)
+        with self._cond:
+            buf = self.buffers[i]
+            for chunk in chunks:
+                buf += chunk
+            while len(buf) >= _HEADER.size:
+                (size,) = _HEADER.unpack_from(buf)
+                if len(buf) < _HEADER.size + size:
+                    break
+                body = bytes(buf[_HEADER.size:_HEADER.size + size])
+                del buf[:_HEADER.size + size]
+                try:
+                    f, data = pickle.loads(body)
+                except Exception as e:
+                    self._error = self._error or f"unreadable result frame: {type(e).__name__}: {e}"
+                    break
+                self.in_flight.discard(f)
+                self.done[f] = data
+            if eof:
+                self._error = self._error or error or (
+                    f"data worker pid {self.procs[i].pid} closed its result pipe ({len(buf)} byte(s) of an unfinished "
+                    f"frame)")
+            self._cond.notify_all()
+        return not eof
+
+    def _unfinished(self) -> str:
+        """The workers holding part of a frame (call under _cond), for the timeout message."""
+        parts = [f"data worker pid {p.pid} holds {len(b)} byte(s) of an unfinished frame"
+                 for p, b in zip(self.procs, self.buffers) if b]
+        return ("; " + "; ".join(parts)) if parts else ""
 
     def fetch(self, filename: str) -> Fetched:
         """The game of `filename` (submitted now if it was not). Raises DataWorkerError, every worker stopped, if a
         worker is dead, the result does not come within timeout_s, or it cannot be read."""
         self.prefetch([filename])
         deadline = time.monotonic() + self.timeout_s
-        while True:
-            dead = [p for p in self.procs if not p.is_alive()]
-            if dead:
-                self._fail(f"data worker pid {dead[0].pid} died (exit code {dead[0].exitcode}) while fetching "
-                           f"{filename}; {len(self.in_flight)} file(s) in flight")
-            if filename in self.done:
-                break
-            left = deadline - time.monotonic()
-            if left <= 0:
-                self._fail(f"no result for {filename} from the data workers within {self.timeout_s:.0f} s")
-            ready = wait(self.readers, timeout=min(POLL_S, left))
-            for i, reader in enumerate(self.readers):
-                if reader in ready:
-                    self._drain(i, filename)
-        self.in_flight.discard(filename)
+        failure, data = None, None
+        with self._cond:
+            self._waiting = True
+            self._cond.notify_all()
+            try:
+                while True:
+                    dead = [p for p in self.procs if not p.is_alive()]
+                    if dead:
+                        failure = (f"data worker pid {dead[0].pid} died (exit code {dead[0].exitcode}) while fetching "
+                                   f"{filename}; {len(self.in_flight)} file(s) in flight")
+                        break
+                    if filename in self.done:
+                        self.in_flight.discard(filename)
+                        data = self.done.pop(filename)
+                        self._cond.notify_all()  # room under the bound again
+                        break
+                    if self._error is not None:
+                        failure = f"{self._error} while fetching {filename}; {len(self.in_flight)} file(s) in flight"
+                        break
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        failure = (f"no result for {filename} from the data workers within {self.timeout_s:.0f} s"
+                                   + self._unfinished())
+                        break
+                    self._cond.wait(min(POLL_S, left))
+            finally:
+                self._waiting = False
+        if failure is not None:
+            self._fail(failure)  # outside _cond: close() joins the drain thread
         try:
-            status, value = pickle.loads(self.done.pop(filename))
+            status, value = pickle.loads(data)
         except Exception as e:
             self._fail(f"unreadable result for {filename}: {type(e).__name__}: {e}")
         if status == "broken":
@@ -222,6 +289,12 @@ class GameWorkers:
     def close(self):
         """Terminate and join every worker (idempotent). Called on every stop path of the trainer."""
         self.closed = True
+        self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
+        if self._drainer is not None:  # stopped before the readers close under it
+            self._drainer.join(timeout=10)
+            self._drainer = None
         for p in self.procs:
             if p.is_alive():
                 p.terminate()
@@ -238,6 +311,7 @@ class GameWorkers:
         self.procs, self.readers, self.buffers = [], [], []
         self.in_flight.clear()
         self.done.clear()
+        self._error = None
 
     def pids(self) -> list:
         return [p.pid for p in self.procs]
