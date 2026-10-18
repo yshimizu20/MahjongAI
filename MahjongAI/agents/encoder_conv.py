@@ -569,6 +569,47 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+def _to_numpy(t):
+    return t.numpy() if isinstance(t, torch.Tensor) else tuple(_to_numpy(x) for x in t)
+
+
+def _to_torch(t):
+    return tuple(_to_torch(x) for x in t) if isinstance(t, tuple) else torch.from_numpy(t)
+
+
+class PrebuiltGame:
+    """One game's per-round build_tensors() output, built in a data worker (T-011 D1). It stands in a batch's
+    halfturns slot (the tokens slot holds None), and prepare_batches unpacks it where the serial path builds the game:
+    the worker processor's tensor-level skips are added to the processor there, and a build error is raised there,
+    after the rounds built before it (as in the serial path). Arrays travel as numpy: no shared-memory handles."""
+
+    def __init__(self, rounds, skipped: dict, build_error=None):
+        self.rounds = rounds  # [(during, discard, post)] of numpy, or the rounds built before build_error
+        self.skipped = skipped
+        self.build_error = build_error
+
+    def unpack(self, processor: "TransformerTensorProcessor"):
+        processor.skipped.update(self.skipped)
+        for r in self.rounds:
+            yield _to_torch(r)
+        if self.build_error is not None:
+            raise self.build_error
+
+
+def build_game(all_halfturns, all_encoding_tokens, processor_cls=None) -> PrebuiltGame:
+    """The data worker's tensor build of one parsed game: build_tensors() round by round with a fresh processor (the
+    processor holds no state but `skipped`). A build error is kept, not raised: the trainer raises it at its own
+    build point. processor_cls: tests force a skip or a failure with a subclass."""
+    processor = (processor_cls or TransformerTensorProcessor)()
+    rounds = []
+    try:
+        for h, t in zip(all_halfturns, all_encoding_tokens):
+            rounds.append(_to_numpy(processor.build_tensors(h, t)))
+    except Exception as e:
+        return PrebuiltGame(rounds, dict(processor.skipped), e)
+    return PrebuiltGame(rounds, dict(processor.skipped))
+
+
 class TransformerTensorProcessor:
     def __init__(self):
         self.skipped = Counter()  # samples dropped by a tensor-level sanity check; gates.py asserts it stays empty
@@ -600,9 +641,11 @@ class TransformerTensorProcessor:
         tensors_post_batch = []
 
         for all_halfturns, all_encoding_tokens in zip(all_halfturns_list, all_encoding_tokens_list):
-            for halfturns, encoding_tokens in zip(all_halfturns, all_encoding_tokens):
-                tensors_during, tensors_discard, tensors_post = self.build_tensors(halfturns, encoding_tokens)
-
+            if isinstance(all_halfturns, PrebuiltGame):  # built in a data worker: its skips and errors land here
+                rounds = all_halfturns.unpack(self)
+            else:
+                rounds = (self.build_tensors(h, t) for h, t in zip(all_halfturns, all_encoding_tokens))
+            for tensors_during, tensors_discard, tensors_post in rounds:
                 tensors_during_batch.append(tensors_during)
                 tensors_discard_batch.append(tensors_discard)
                 tensors_post_batch.append(tensors_post)

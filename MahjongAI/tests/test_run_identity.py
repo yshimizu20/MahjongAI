@@ -1,14 +1,11 @@
 """The run identity: a run dir resumes only under the same config. torch_threads is part of it (T-011 T1: a changed
 TORCH_THREADS default makes old run dirs non-resumable, on purpose)."""
 import os
-import pathlib
 
 import pytest
 import torch
 
 from MahjongAI import supervised_learning as SL
-
-GATE_GAMES = pathlib.Path(__file__).resolve().parent / "data" / "gate_games"
 
 
 def test_config_mismatch_names_the_changed_keys():
@@ -19,25 +16,10 @@ def test_config_mismatch_names_the_changed_keys():
     assert SL.config_mismatch(dict(saved, extra=None), saved) == {"extra": (None, "<absent>")}
 
 
-def _data_root(root: pathlib.Path) -> pathlib.Path:
-    """Fixture games as a data root: every 2021 fixture game but the day VAL_FROM for training, and VAL_FROM's games
-    as validation day 2022-01-01 (every 2022 fixture game is an expected skip). Linked file by file: the loader's
-    os.walk does not enter linked directories."""
-    for f in sorted(GATE_GAMES.glob("2021/*/*/*.log")):
-        day, sub = f.parent.parent.name, f.parent.name
-        dest = root / "2022" / "20220101" / "20220101_00" if day == VAL_FROM else root / "2021" / day / sub
-        dest.mkdir(parents=True, exist_ok=True)
-        (dest / f.name).symlink_to(f)
-    return root
-
-
-VAL_FROM = "20210103"
-
-
-def test_resume_with_other_torch_threads_is_rejected(tmp_path, monkeypatch):
+def test_resume_with_other_torch_threads_is_rejected(tmp_path, monkeypatch, train_data_root):
     """A 1-step run on fixture games saves a checkpoint under one TORCH_THREADS; starting again on the same run dir
     under another value stops before any work, naming torch_threads."""
-    monkeypatch.setattr(SL, "DATA_ROOT", _data_root(tmp_path / "data"))
+    monkeypatch.setattr(SL, "DATA_ROOT", train_data_root)
     monkeypatch.setattr(SL, "VAL_GAMES", 1)
     monkeypatch.setattr(SL, "PRIOR_GAMES", 2)
     run_dir = tmp_path / "run"

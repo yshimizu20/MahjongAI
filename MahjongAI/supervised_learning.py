@@ -25,9 +25,10 @@ from datetime import datetime
 import torch
 import torch.nn.functional as F
 
-from MahjongAI.agents.encoder_conv import EncoderConvModel, TransformerTensorProcessor
+from MahjongAI.agents.encoder_conv import EncoderConvModel, TransformerTensorProcessor, build_game
 from MahjongAI.utils.baselines import fit_bias_prior, score_bias, shanten_greedy, uniform_legal
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
+from MahjongAI.utils.game_workers import GameWorkers
 
 # Root of the MahjongAI package: data paths resolve the same from any working directory.
 _PACKAGE_DIR = pathlib.Path(__file__).parent
@@ -61,6 +62,11 @@ LOGGED_SKIPS = frozenset({"invalid:Own-turn action after own discard",
                           "invalid:Auto-played seat"})  # rare: each one is logged with its file
 EVAL_EVERY_STEPS = 500
 SAVE_EVERY_STEPS = 500
+# T-011 D1: training games are parsed and tensor-built in DATA_WORKERS spawn processes, DATA_PREFETCH files ahead
+# per loader (0 workers = in the trainer, as before). Exact: same games, tensors, skips and loader state.
+# Timed s/step (10 threads): 0 workers 0.718, 1: 0.469, 2: 0.332, 3: 0.324 (within 2's spread) -> 2.
+DATA_WORKERS = 2
+DATA_PREFETCH = 8
 MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -289,6 +295,21 @@ def _mismatch_text(mismatch: dict) -> str:
     return ", ".join(f"{k} {a!r} -> {b!r}" for k, (a, b) in mismatch.items())
 
 
+def make_workers():
+    """The run's data workers (started on first use), or None for DATA_WORKERS = 0."""
+    return GameWorkers(DATA_WORKERS, build_game, window=DATA_PREFETCH) if DATA_WORKERS else None
+
+
+def train_cluster(log, batch_size: int, workers=None) -> DataLoaderCluster:
+    """The training loaders (one per TRAIN_YEARS year) and their cluster, served by `workers` when given."""
+    dataloaders = [
+        DataLoader(str(DATA_ROOT / str(yr)), batch_size, log, seed=DATA_SEED, expected_skips=EXPECTED_SKIPS,
+                   logged_skips=LOGGED_SKIPS, workers=workers)
+        for yr in TRAIN_YEARS
+    ]
+    return DataLoaderCluster(dataloaders, seed=DATA_SEED)
+
+
 CHECKPOINT_RE = re.compile(r"step_(\d+)\.pt$")
 
 
@@ -301,6 +322,16 @@ def find_latest_checkpoint(checkpoint_dir: str):
 
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None):
+    workers = make_workers()
+    try:
+        _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers)
+    finally:  # every stop path: normal end, exception, KeyboardInterrupt
+        if workers is not None:
+            workers.close()
+
+
+def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int, save_every: int,
+           expect_prior_ce, expect_shanten, workers):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
@@ -323,12 +354,8 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    dataloaders = [
-        DataLoader(str(DATA_ROOT / str(yr)), batch_size, log, seed=DATA_SEED, expected_skips=EXPECTED_SKIPS,
-                   logged_skips=LOGGED_SKIPS)
-        for yr in TRAIN_YEARS
-    ]
-    cluster = DataLoaderCluster(dataloaders, seed=DATA_SEED)
+    cluster = train_cluster(log, batch_size, workers)
+    dataloaders = cluster.dataloaders
     val = ValSet.load(log)
     train_ids = {os.path.basename(f) for dl in dataloaders for f in dl.file_list}
     assert not train_ids & set(val.ids), f"train and validation games overlap: {sorted(train_ids & set(val.ids))[:5]}"
