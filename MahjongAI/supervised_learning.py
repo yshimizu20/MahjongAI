@@ -21,6 +21,7 @@ import pathlib
 import pstats
 import re
 from datetime import datetime
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -67,6 +68,10 @@ SAVE_EVERY_STEPS = 500
 # Timed s/step (10 threads): 0 workers 0.718, 1: 0.469, 2: 0.332, 3: 0.324 (within 2's spread) -> 2.
 DATA_WORKERS = 2
 DATA_PREFETCH = 8
+# T-011 P: the prior's games are parsed and built by their own pool of PRIOR_WORKERS (0 = in the trainer), closed
+# when the prior sample is read; the training workers have not started yet. Exact: same games, masks and labels.
+PRIOR_WORKERS = 8
+PRIOR_PREFETCH = 32
 MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -164,30 +169,58 @@ class ValSet:
             model.train()
 
 
-def fit_prior(log: RunLog) -> dict:
-    """{head: bias} of the no-state prior, fitted on the first PRIOR_GAMES accepted 2021 games (loader seed PRIOR_SEED)."""
+class PriorSample(NamedTuple):
+    """The prior's training sample: per head, one mask / label tensor per accepted game, in loader order."""
+    files: list
+    masks: dict  # {head: [mask (n, A) bool per game]}
+    labels: dict  # {head: [y (n,) per game]}
+    files_read: int
+    skipped: dict
+
+
+def prior_sample(log: RunLog, workers=None) -> PriorSample:
+    """Masks and labels of the first PRIOR_GAMES accepted 2021 games (loader seed PRIOR_SEED), the games parsed and
+    built by `workers` when given."""
     loader = DataLoader(str(DATA_ROOT / "2021"), 1, log, seed=PRIOR_SEED, expected_skips=EXPECTED_SKIPS,
-                        logged_skips=LOGGED_SKIPS)
+                        logged_skips=LOGGED_SKIPS, workers=workers)
     log(f"Prior: fitting on the first {PRIOR_GAMES} accepted games of {len(loader.file_list)} 2021 files (seed {PRIOR_SEED})")
     processor = TransformerTensorProcessor()
-    masks, labels = {h: [] for h in HEADS}, {h: [] for h in HEADS}
-    for k in range(PRIOR_GAMES):  # parse one game at a time and keep only its masks / labels
+    files, masks, labels = [], {h: [] for h in HEADS}, {h: [] for h in HEADS}
+    for k in range(PRIOR_GAMES):  # one game at a time: keep only its masks / labels
         f, h, t = _next_game(loader)
+        files.append(f)
         for head, (mask, y, _) in head_tensors(processor, h, t).items():
             masks[head].append(mask)
             labels[head].append(y)
         _check_tensor_skips(processor, "the prior's training games", [f])
         if (k + 1) % 500 == 0:
             log(f"  prior games {k + 1} / {PRIOR_GAMES} (files read {loader.current_index}, skipped {dict(loader.skipped)})")
+    return PriorSample(files, masks, labels, loader.current_index, dict(loader.skipped))
+
+
+def prior_bias(log: RunLog, sample: PriorSample) -> dict:
+    """{head: bias} of the no-state prior fitted on `sample`."""
     bias = {}
     for head in HEADS:
-        m, y = torch.cat(masks[head]), torch.cat(labels[head])
+        m, y = torch.cat(sample.masks[head]), torch.cat(sample.labels[head])
         bias[head] = fit_bias_prior(m, y, l2=PRIOR_L2)
         nll, _ = score_bias(bias[head], m, y)
         assert torch.isfinite(bias[head]).all() and torch.isfinite(nll).all(), f"prior {head}: non-finite bias or NLL"
         unseen = (torch.bincount(y, minlength=m.shape[1]) == 0).sum().item()
         log(f"  prior {head}: n={len(y)}, train CE {nll.mean().item():.4f}, slots never taken {unseen}")
     return bias
+
+
+def fit_prior(log: RunLog) -> dict:
+    """{head: bias} of the no-state prior, fitted on the first PRIOR_GAMES accepted 2021 games (loader seed PRIOR_SEED).
+    The games come from a pool of PRIOR_WORKERS, closed on every exit of the sample read."""
+    workers = GameWorkers(PRIOR_WORKERS, build_game, window=PRIOR_PREFETCH) if PRIOR_WORKERS else None
+    try:
+        sample = prior_sample(log, workers)
+    finally:
+        if workers is not None:
+            workers.close()
+    return prior_bias(log, sample)
 
 
 def baseline_header(val: ValSet, bias: dict) -> dict:
