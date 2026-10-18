@@ -291,35 +291,53 @@ class TokenEmbedder(nn.Module):
         """
         Converts encoding tokens to embeddings (no attention blocks).
 
+        A slot's embedding depends only on its (token, position) pair, and the histories of a batch share most pairs
+        (every sample's history is a prefix of its round's tokens): 2.5-19 % of the B * T pairs are unique. So the
+        summed embedding is computed once per unique pair and gathered back (T-047 M2). The per-element float ops
+        and their order are the full-size computation's, so the output is bitwise equal to it; the backward reaches
+        the tables through one gather over the unique rows.
+
         Args:
             encoding_tokens_batch: (B, 150) tensor of encoding tokens
 
         Returns:
             x: (B, 150, EMBD_SIZE) tensor of summed embeddings
         """
-        event_type = (encoding_tokens_batch >> 13) & 7
-        embedding_type = (encoding_tokens_batch >> 10) & 7
-        player_idx = (encoding_tokens_batch >> 8) & 3
-        tile_encoding = encoding_tokens_batch & 0x7F
-        tsumogiri = (encoding_tokens_batch >> 7) & 1
-        naki_idx = encoding_tokens_batch & 0xFF
+        T = encoding_tokens_batch.size(1)
+        assert T <= MAX_ACTION_LEN
+        positions = torch.arange(T, device=encoding_tokens_batch.device)
+        codes = encoding_tokens_batch * MAX_ACTION_LEN + positions  # (B, T): one code per (token, position)
+        unique_codes, inverse = torch.unique(codes, return_inverse=True)  # (U,), (B, T)
+        tokens = torch.div(unique_codes, MAX_ACTION_LEN, rounding_mode="floor")
+        rows = self._embed_codes(tokens, self.position_coding_table[unique_codes - tokens * MAX_ACTION_LEN])
+        return F.embedding(inverse, rows)  # (B, T, EMBD_SIZE)
+
+    def _embed_codes(self, encoding_tokens, pos_emb):
+        """The summed embedding of tokens (U,) at positions whose encodings are pos_emb (U, EMBD_SIZE): (U,
+        EMBD_SIZE). The ops of 468d71c's full-size forward, in its order."""
+        event_type = (encoding_tokens >> 13) & 7
+        embedding_type = (encoding_tokens >> 10) & 7
+        player_idx = (encoding_tokens >> 8) & 3
+        tile_encoding = encoding_tokens & 0x7F
+        tsumogiri = (encoding_tokens >> 7) & 1
+        naki_idx = encoding_tokens & 0xFF
 
         # retrieve type embeddings if event_type is not EMPTY
         adjusted_embedding_type = torch.clamp(embedding_type - 1, min=0)
-        type_emb = self.type_embedding(adjusted_embedding_type)  # Shape: (B, T, EMBD_SIZE)
+        type_emb = self.type_embedding(adjusted_embedding_type)  # Shape: (U, EMBD_SIZE)
         mask = event_type != EventStateTypes.EMPTY
         type_emb = type_emb * mask.unsqueeze(-1).float()
 
         # retrieve tile embeddings if event_type is DISCARD or NEW_DORA
         # clamp tile_encoding to max 36
         adjusted_tile_encoding = torch.clamp(tile_encoding, max=36)
-        tile_emb = self.tile_embedding(adjusted_tile_encoding)  # Shape: (B, T, EMBD_SIZE)
+        tile_emb = self.tile_embedding(adjusted_tile_encoding)  # Shape: (U, EMBD_SIZE)
         mask = (event_type == EventStateTypes.DISCARD) | (event_type == EventStateTypes.NEW_DORA)
         tile_emb = tile_emb * mask.unsqueeze(-1).float()
 
         # Retrieve player encodings if event_type is DISCARD, DURING, or POST
         player_idx = player_idx.to(self.player_coding_table.device)
-        player_emb = self.player_coding_table[player_idx]  # Shape: (B, T, EMBD_SIZE)
+        player_emb = self.player_coding_table[player_idx]  # Shape: (U, EMBD_SIZE)
         mask = (
             (event_type == EventStateTypes.DISCARD)
             | (event_type == EventStateTypes.DURING)
@@ -328,30 +346,28 @@ class TokenEmbedder(nn.Module):
         player_emb = player_emb * mask.unsqueeze(-1).float()
 
         # tsumogiri embedding only if event_type is DISCARD and tsumogiri is 1
-        tsumogiri_emb = self.tsumogiri_embedding(torch.tensor([0], device=self.type_embedding.weight.device))  # Shape: (B, T, EMBD_SIZE)
+        tsumogiri_emb = self.tsumogiri_embedding(torch.tensor([0], device=self.type_embedding.weight.device))  # (1, E)
         mask = (event_type == EventStateTypes.DISCARD) & (tsumogiri == 1)
         tsumogiri_emb = tsumogiri_emb * mask.unsqueeze(-1).float()
 
-        # Retrieve position encodings (shape: (150, EMBD_SIZE)) if embedding type is not EMPTY
-        pos_emb = self.position_coding_table[: encoding_tokens_batch.size(1)]  # Shape: (T, EMBD_SIZE)
-        pos_emb = pos_emb.unsqueeze(0)  # Shape: (1, T, EMBD_SIZE)
+        # position encodings if embedding type is not EMPTY
         mask = event_type != EventStateTypes.EMPTY
         pos_emb = pos_emb * mask.unsqueeze(-1).float()
 
         # Retrieve during naki encodings if event_type is DURING and naki_idx is >= 3
         adjusted_during_naki_idx = torch.clamp(naki_idx, max=DURING_TURN_ACTION_DIM - 1)
-        during_naki_emb = self.during_naki_embedding(adjusted_during_naki_idx)  # Shape: (B, T, EMBD_SIZE)
+        during_naki_emb = self.during_naki_embedding(adjusted_during_naki_idx)  # Shape: (U, EMBD_SIZE)
         mask = (event_type == EventStateTypes.DURING) & (naki_idx >= 3)
         during_naki_emb = during_naki_emb * mask.unsqueeze(-1).float()
 
         # retrieve post naki encodings if event_type is POST and naki_idx is >= 2
         adjusted_post_naki_idx = torch.clamp(naki_idx, max=POST_TURN_ACTION_DIM - 1)
-        post_naki_emb = self.post_naki_embedding(adjusted_post_naki_idx)  # Shape: (B, T, EMBD_SIZE)
+        post_naki_emb = self.post_naki_embedding(adjusted_post_naki_idx)  # Shape: (U, EMBD_SIZE)
         mask = (event_type == EventStateTypes.POST) & (naki_idx >= 2)
         post_naki_emb = post_naki_emb * mask.unsqueeze(-1).float()
 
         x = (
-            self.empty_embedding
+            self.empty_embedding[0]
             + type_emb
             + tile_emb
             + player_emb
@@ -359,9 +375,10 @@ class TokenEmbedder(nn.Module):
             + pos_emb
             + during_naki_emb
             + post_naki_emb
-        )  # Shape: (B, T, EMBD_SIZE)
+        )  # Shape: (U, EMBD_SIZE)
 
         return x
+
 
 class EncoderBlock(nn.Module):
     def __init__(self, EMBD_SIZE, num_heads):
@@ -542,8 +559,11 @@ class MultiHeadAttention(nn.Module):
             attn_mask = attn_mask.unsqueeze(1)  # [B, 1, 1, T]
 
         dropout_p = self.attn_dropout_p if self.training else 0.0
-        # scaled_dot_product_attention: boolean mask True=attend matches our convention
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        if Q == 1:
+            out = self._single_query_attention(q, k, v, attn_mask, dropout_p)
+        else:
+            # scaled_dot_product_attention: boolean mask True=attend matches our convention
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
         # out: [B, H, Q, HS]
 
         # Guard: fully-masked positions produce NaN (same as original nan_to_num guard)
@@ -553,6 +573,26 @@ class MultiHeadAttention(nn.Module):
         out = self.proj(out)
         out = self.dropout(out)
         return out  # [B, Q, EMBD_SIZE]
+
+    @staticmethod
+    def _single_query_attention(q, k, v, attn_mask, dropout_p):
+        """SDPA for one query row, as broadcast multiply + sum (T-047 M1). In train mode SDPA takes its math path
+        (dropout_p > 0 rules out the CPU flash kernel) and, in this torch build without MKL, each of its bmm runs a
+        serial loop over the B*H [1, HS] x [HS, T] slices. With Q = 1 the scores are q . k per key, so
+        (q * k).sum(-1) and (a * v).sum over the keys compute the same function. As the math path: scale 1 / sqrt(HS),
+        masked keys get -inf, safe softmax (a fully masked row gives zero weights and finite gradients), dropout on the
+        contiguous [B, H, 1, T] weights (the same shape, so the same RNG draws).
+        q [B, H, 1, HS], k and v [B, H, T, HS], attn_mask [B, 1, 1, T] bool (True = attend) or None: [B, H, 1, HS]."""
+        scores = (q * k).sum(-1).unsqueeze(2) * (q.shape[-1] ** -0.5)  # [B, H, 1, T]
+        if attn_mask is not None:
+            empty = ~attn_mask.any(-1, keepdim=True)  # [B, 1, 1, 1]: a row with no key to attend
+            scores = scores.masked_fill(~(attn_mask | empty), float("-inf"))
+            weights = torch.softmax(scores, dim=-1).masked_fill(empty, 0.0)
+        else:
+            weights = torch.softmax(scores, dim=-1)
+        if dropout_p > 0.0:
+            weights = F.dropout(weights, dropout_p, True)
+        return (weights.transpose(-1, -2) * v).sum(2, keepdim=True)  # [B, H, 1, HS]
 
 
 class FeedForward(nn.Module):

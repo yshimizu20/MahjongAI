@@ -84,20 +84,34 @@ def shanten_after(hand37, slot: int) -> int:
     return _shanten.calculate_shanten_for_regular_hand(counts)
 
 
-def shanten_greedy(hand37: torch.Tensor, mask: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """Per discard sample: does "discard a legal tile leaving the lowest shanten, ties by the highest bias (then
-    the lowest slot)" pick the human discard? hand37 (N, 37): concealed counts after the draw, red fives in both
-    their kind and their red slot (x1 plane 0 of the discard tensor)."""
+def shanten_best(hand37: torch.Tensor, mask: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Per discard sample, the legal slots that leave the lowest shanten: bool (N, A). The costly, bias-free step of
+    shanten_greedy (T-047 S1: the validation workers compute it once per game). hand37 as in shanten_greedy."""
     mask = _legal(mask, y)
     assert hand37.shape == mask.shape, f"hand {tuple(hand37.shape)} vs mask {tuple(mask.shape)}"
-    bias = bias.tolist()
-    hits = torch.zeros(len(y), dtype=torch.bool)
+    best = torch.zeros(mask.shape, dtype=torch.bool)
     for i in range(len(y)):
         hand = hand37[i].round().long().tolist()
         assert sum(hand[:34]) % 3 == 2, f"sample {i}: {sum(hand[:34])} concealed tiles at a discard"
         legal = mask[i].nonzero().flatten().tolist()
         sh = {slot: shanten_after(hand, slot) for slot in legal}
-        best = min(sh.values())
-        pick = max((slot for slot in legal if sh[slot] == best), key=lambda slot: (bias[slot], -slot))
+        low = min(sh.values())
+        best[i, [slot for slot in legal if sh[slot] == low]] = True
+    return best
+
+
+def greedy_hits(best: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """Per sample: is y the pick among the `best` slots by the highest bias, then the lowest slot?"""
+    bias = bias.tolist()
+    hits = torch.zeros(len(y), dtype=torch.bool)
+    for i in range(len(y)):
+        pick = max(best[i].nonzero().flatten().tolist(), key=lambda slot: (bias[slot], -slot))
         hits[i] = pick == int(y[i])
     return hits
+
+
+def shanten_greedy(hand37: torch.Tensor, mask: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """Per discard sample: does "discard a legal tile leaving the lowest shanten, ties by the highest bias (then
+    the lowest slot)" pick the human discard? hand37 (N, 37): concealed counts after the draw, red fives in both
+    their kind and their red slot (x1 plane 0 of the discard tensor)."""
+    return greedy_hits(shanten_best(hand37, mask, y), y, bias)

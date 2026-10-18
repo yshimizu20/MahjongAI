@@ -26,10 +26,10 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 
-from MahjongAI.agents.encoder_conv import EncoderConvModel, TransformerTensorProcessor, build_game
-from MahjongAI.utils.baselines import fit_bias_prior, score_bias, shanten_greedy, uniform_legal
+from MahjongAI.agents.encoder_conv import EncoderConvModel, PrebuiltGame, TransformerTensorProcessor, build_game
+from MahjongAI.utils.baselines import fit_bias_prior, greedy_hits, score_bias, shanten_best, uniform_legal
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
-from MahjongAI.utils.game_workers import GameWorkers
+from MahjongAI.utils.game_workers import GameWorkers, _transportable
 
 # Root of the MahjongAI package: data paths resolve the same from any working directory.
 _PACKAGE_DIR = pathlib.Path(__file__).parent
@@ -42,7 +42,8 @@ TRAIN_YEARS = (2021,)
 # continues where it stopped
 DATA_SEED = 0
 MODEL_SEED = 0  # torch.manual_seed before the model is built
-TORCH_THREADS = 8  # T-011 T2: s/step with 2 data workers, 4: 0.324, 6: 0.330, 8: 0.316, 10: 0.341 threads
+TORCH_THREADS = 4  # T-047 W2 (after M1 + M2, DATA_WORKERS 4): s/step 4 threads 0.159, 6: 0.162 (T-011 T2 chose 8 with
+# 2 workers and the slower model)
 VAL_YEAR = "2022"  # time-forward validation: the week after the training year
 VAL_DAYS = tuple(f"202201{d:02d}" for d in range(1, 8))
 VAL_GAMES = 100  # the first VAL_GAMES accepted games of VAL_DAYS in a seeded order, held in RAM
@@ -66,11 +67,15 @@ SAVE_EVERY_STEPS = 500
 # T-011 D1: training games are parsed and tensor-built in DATA_WORKERS spawn processes, DATA_PREFETCH files ahead
 # per loader (0 workers = in the trainer, as before). Exact: same games, tensors, skips and loader state.
 # Timed s/step (10 threads): 0 workers 0.718, 1: 0.469, 2: 0.332, 3: 0.324 (within 2's spread) -> 2.
-DATA_WORKERS = 2
+# T-047 W2 (drain thread, M1 + M2; workers/threads): 2/8 0.243, 3/6 0.184, 4/4 0.159, 4/6 0.162, 6/2 0.178, 6/4 0.168,
+# 6/6 0.165, 8/4 0.170 -> 4 workers, 4 threads.
+DATA_WORKERS = 4
 DATA_PREFETCH = 8
 # T-011 P: the prior's games are parsed and built by their own pool of PRIOR_WORKERS (0 = in the trainer), closed
 # when the prior sample is read; the training workers have not started yet. Exact: same games, masks and labels.
-PRIOR_WORKERS = 8
+# T-047 S1: the validation set is built the same way, by a pool of PRIOR_WORKERS closed when it is read (VAL_BUILD:
+# PrebuiltGame plus the header's shanten step). The pool size comes from the core count (14 cores -> 12).
+PRIOR_WORKERS = max(1, (os.cpu_count() or 4) - 2)
 PRIOR_PREFETCH = 32
 MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)
 if torch.cuda.is_available():
@@ -117,8 +122,34 @@ def _next_game(loader: DataLoader):
     return loader.last_batch_files[0], halfturns[0], tokens[0]
 
 
+class ValGame(PrebuiltGame):
+    """A validation game: the PrebuiltGame plus the header's bias-free shanten step of its discard samples
+    (baselines.shanten_best, bool (n, 37) numpy), or the error that step raised (raised by baseline_header)."""
+
+    def __init__(self, game: PrebuiltGame, shanten_best=None, shanten_error=None):
+        super().__init__(game.rounds, game.skipped, game.build_error)
+        self.shanten_best, self.shanten_error = shanten_best, shanten_error
+
+
+def build_val_game(halfturns, tokens, processor_cls=None) -> ValGame:
+    """A validation worker's build (T-047 S1): build_game, then the shanten step of the discard samples. A game with a
+    build error or a tensor-level skip gets no shanten step: ValSet raises for it first, as the serial path does."""
+    game = build_game(halfturns, tokens, processor_cls)
+    if game.build_error is not None or game.skipped:
+        return ValGame(game)
+    try:
+        mask, y, hand37 = head_tensors(TransformerTensorProcessor(), game, None)["discard"]
+        return ValGame(game, shanten_best(hand37, mask, y).numpy())
+    except Exception as e:
+        return ValGame(game, shanten_error=_transportable(e, "header"))
+
+
+VAL_BUILD = build_val_game  # tests force a skip or a failure with a functools.partial of it
+
+
 class ValSet:
-    """The fixed validation games in RAM, with their per-head masks, labels and (discard) hands.
+    """The fixed validation games in RAM as PrebuiltGame objects (built once at load), with their per-head masks,
+    labels and (discard) hands.
 
     ids: game file basenames, in evaluation order. Every per-game list (here and in metrics.jsonl) follows `ids`;
     a head with no sample in a game has n = 0 and stays in the list, so the lists of every row align.
@@ -127,20 +158,29 @@ class ValSet:
     def __init__(self, files, games, processor: TransformerTensorProcessor):
         self.ids = [os.path.basename(f) for f in files]
         assert len(set(self.ids)) == len(self.ids), "duplicate validation game ids"
-        self.games = games  # [(halfturns, tokens)]
-        self.tensors = [head_tensors(processor, h, t) for h, t in games]  # per game: {head: (mask, y, hand37)}
+        assert all(isinstance(g, PrebuiltGame) for g in games), "validation games are PrebuiltGame objects"
+        self.games = games  # [PrebuiltGame]: unpacked by prepare_batches, never built again
+        self.tensors = [head_tensors(processor, g, None) for g in games]  # per game: {head: (mask, y, hand37)}
         _check_tensor_skips(processor, "the validation set", files)
 
     @classmethod
     def load(cls, log: RunLog) -> "ValSet":
-        loader = DataLoader(str(DATA_ROOT / VAL_YEAR), 1, log, days=VAL_DAYS, seed=VAL_SEED,
-                            expected_skips=EXPECTED_SKIPS, logged_skips=LOGGED_SKIPS)
-        assert loader.file_list, f"no validation games for {VAL_YEAR} {VAL_DAYS}"
-        log(f"Validation: first {VAL_GAMES} accepted games of {len(loader.file_list)} files "
-            f"({VAL_YEAR} {VAL_DAYS[0]}..{VAL_DAYS[-1]}, seed {VAL_SEED})")
-        games = [_next_game(loader) for _ in range(VAL_GAMES)]
-        log(f"  {VAL_GAMES} games from {loader.current_index} files; skipped {dict(loader.skipped)}")
-        return cls([f for f, _, _ in games], [(h, t) for _, h, t in games], TransformerTensorProcessor())
+        """The first VAL_GAMES accepted games, parsed and built (VAL_BUILD) by a pool of PRIOR_WORKERS (0 = in the
+        trainer), closed on every exit of the read."""
+        workers = GameWorkers(PRIOR_WORKERS, VAL_BUILD, window=PRIOR_PREFETCH) if PRIOR_WORKERS else None
+        try:
+            loader = DataLoader(str(DATA_ROOT / VAL_YEAR), 1, log, days=VAL_DAYS, seed=VAL_SEED,
+                                expected_skips=EXPECTED_SKIPS, logged_skips=LOGGED_SKIPS, workers=workers)
+            assert loader.file_list, f"no validation games for {VAL_YEAR} {VAL_DAYS}"
+            log(f"Validation: first {VAL_GAMES} accepted games of {len(loader.file_list)} files "
+                f"({VAL_YEAR} {VAL_DAYS[0]}..{VAL_DAYS[-1]}, seed {VAL_SEED})")
+            games = [_next_game(loader) for _ in range(VAL_GAMES)]
+            log(f"  {VAL_GAMES} games from {loader.current_index} files; skipped {dict(loader.skipped)}")
+        finally:
+            if workers is not None:
+                workers.close()
+        built = [g if workers is not None else VAL_BUILD(g, t) for _, g, t in games]
+        return cls([f for f, _, _ in games], built, TransformerTensorProcessor())
 
     def head_samples(self, head: str):
         """Per game (id, mask, y, hand37) of one head."""
@@ -148,12 +188,14 @@ class ValSet:
 
     @torch.no_grad()
     def evaluate(self, model) -> dict:
-        """{head: [(game_id, n, nll_sum, correct)]}, one game per forward call (bounds attention memory)."""
+        """{head: [(game_id, n, nll_sum, correct)]}, one PrebuiltGame per forward call (T-047 E1): the 468d71c
+        evaluation bit for bit, without building the game again. A multi-game call is not used: the batch size moves
+        logits by ~1e-7 (float reduction order), which can flip a top-1 tie."""
         model.eval()
         try:
             out = {h: [] for h in HEADS}
-            for gid, (halfturns, tokens), tensors in zip(self.ids, self.games, self.tensors):
-                results = model([halfturns], [tokens], sample=False)
+            for gid, game, tensors in zip(self.ids, self.games, self.tensors):
+                results = model([game], [None], sample=False)
                 for head in HEADS:
                     y = tensors[head][1]
                     if head not in results:
@@ -229,7 +271,7 @@ def baseline_header(val: ValSet, bias: dict) -> dict:
     out = {"uniform": {}, "prior": {}, "shanten_greedy": []}
     for head in HEADS:
         out["uniform"][head], out["prior"][head] = [], []
-        for gid, mask, y, hand37 in val.head_samples(head):
+        for game, (gid, mask, y, hand37) in zip(val.games, val.head_samples(head)):
             n = len(y)
             if n == 0:
                 out["uniform"][head].append([gid, 0, 0.0, 0.0])
@@ -242,7 +284,10 @@ def baseline_header(val: ValSet, bias: dict) -> dict:
             out["uniform"][head].append([gid, n, u_nll.sum().item(), u_p.sum().item()])
             out["prior"][head].append([gid, n, p_nll.sum().item(), int(p_hit.sum())])
             if head == "discard":
-                out["shanten_greedy"].append([gid, n, int(shanten_greedy(hand37, mask, y, bias[head]).sum())])
+                if game.shanten_error is not None:
+                    raise game.shanten_error
+                best = torch.from_numpy(game.shanten_best)
+                out["shanten_greedy"].append([gid, n, int(greedy_hits(best, y, bias[head]).sum())])
     return out
 
 
