@@ -108,8 +108,9 @@ def test_evaluate_equals_one_game_per_call(val_and_games, state):
 def test_tie_broken_by_a_two_game_call_keeps_its_one_game_count():
     """Codex stage-5 probe: synthetic features of two games (11 and 23 discard samples); the discard head scores two
     actions exactly equal for one sample when that game is run alone (a large head coefficient on the feature that a
-    two-game call moves by ~1e-7). With every label 0 the tie is a hit alone (argmax takes the first) and a miss in a
-    two-game call (no near-tie margin is needed). evaluate must give the one-game counts."""
+    two-game call moves). With every label 0 the tie is a hit alone (argmax takes the first) and a miss in a
+    two-game call. A forward pre-hook on discard_head makes the two-game difference (feature 0 + 1e-3) so it does not
+    depend on float rounding, which differs between platforms (Linux CI gave bit-identical features). evaluate must give the one-game counts."""
     threads = torch.get_num_threads()
     torch.set_num_threads(4)
     try:
@@ -130,22 +131,21 @@ def test_tie_broken_by_a_two_game_call_keeps_its_one_game_count():
                          for w in widths.values())
 
         m.tensor_processor.prepare_batches = prepare
-        states = []
-        hook = m.discard_head.register_forward_pre_hook(lambda mod, args: states.append(args[0].clone()))
-        with torch.no_grad():
-            m([0], [None])
-            m([0, 1], [None, None])
-        hook.remove()
-        single_state, batch_state = states
-        diff = batch_state[:ns[0]] - single_state
-        assert diff.abs().max() > 0, "a two-game call gives the same features: the case is not constructed"
-        i, j = divmod(int(diff.abs().argmax()), diff.shape[1])
-        slope = -256.0 if diff[i, j] > 0 else 256.0
+        eps = 1e-3
+
+        def marker(mod, args):
+            """Deterministic stand-in for rounding: feature 0 is 1.0 in a call of one game, 1.0 + eps in a larger one."""
+            x = args[0].clone()
+            x[:, 0] = 1.0 + (eps if len(x) > max(ns) else 0.0)
+            return (x,) + tuple(args[1:])
+
+        hook = m.discard_head.register_forward_pre_hook(marker)
+        slope = -256.0
         with torch.no_grad():
             m.discard_head.weight.zero_()
             m.discard_head.bias.fill_(-100.0)
-            m.discard_head.weight[0, j] = slope
-            m.discard_head.bias[0] = -slope * single_state[i, j]
+            m.discard_head.weight[0, 0] = slope
+            m.discard_head.bias[0] = -slope  # logit 0 is exactly 0 at feature 1.0, negative at 1.0 + eps
             m.discard_head.bias[1] = 0.0
             single = [int((m([k], [None])["discard"].logits.argmax(1) == 0).sum()) for k in range(2)]
             batch = m([0, 1], [None, None])["discard"].logits.argmax(1) == 0
@@ -156,7 +156,12 @@ def test_tie_broken_by_a_two_game_call_keeps_its_one_game_count():
         val.games, val.ids = [0, 1], ["a", "b"]
         val.tensors = [{h: (torch.ones(n, w), torch.zeros(n, dtype=torch.long), None) for h, w in widths.items()}
                        for n in ns]
+        calls = []
+        spy = m.register_forward_pre_hook(lambda mod, args, kwargs: calls.append(len(args[0])), with_kwargs=True)
         out = val.evaluate(m)
+        spy.remove()
+        hook.remove()
+        assert calls == [1, 1], f"evaluate made forward calls of {calls} games, not one game per call"
         assert [r[3] for r in out["discard"]] == single, f"top-1 counts {[r[3] for r in out['discard']]} vs {single}"
         assert m.training  # evaluate restores train mode
     finally:
