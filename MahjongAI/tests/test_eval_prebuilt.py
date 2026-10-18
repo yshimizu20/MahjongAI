@@ -1,6 +1,7 @@
-"""T-047 E1: ValSet.evaluate on PrebuiltGame objects, several games per forward call, gives the 468d71c evaluation
-(one game per call, tensors built from the parsed game): game ids, sample counts, labels and top-1 counts exactly, NLL
-sums within 1e-6 relative per head; on a trained state and on a constructed near tie."""
+"""T-047 E1: ValSet.evaluate on PrebuiltGame objects, one game per forward call, gives the 468d71c evaluation (one
+game per call, tensors built from the parsed game) bit for bit: game ids, sample counts, NLL sums and top-1 counts, at
+the init and a trained state. A constructed tie that a two-game call breaks (Codex stage-5 probe) keeps its one-game
+top-1 count."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -9,8 +10,7 @@ from MahjongAI import supervised_learning as SL
 from MahjongAI.agents.encoder_conv import EncoderConvModel, PrebuiltGame
 from MahjongAI.utils.dataloader import DataLoader
 
-N_VAL = 7  # validation games: chunks of 3 leave a remainder chunk of 1
-K = 3
+N_VAL = 7
 
 
 @torch.no_grad()
@@ -71,20 +71,18 @@ def _trained_model(train, steps=20):
 
 
 def _assert_rows_equal(got, ref):
-    """ids, n and top-1 counts exactly; NLL sums within 1e-6 relative per game and per head."""
+    """ids, n, NLL sums and top-1 counts bitwise equal, per game and per head."""
     assert got.keys() == ref.keys() == set(SL.HEADS)
     for head in SL.HEADS:
         assert [r[0] for r in got[head]] == [r[0] for r in ref[head]], f"{head}: game ids"
         assert [r[1] for r in got[head]] == [r[1] for r in ref[head]], f"{head}: sample counts"
         assert [r[3] for r in got[head]] == [r[3] for r in ref[head]], f"{head}: top-1 counts"
-        for a, b in zip(got[head], ref[head]):
-            assert a[2] == pytest.approx(b[2], rel=1e-6, abs=1e-9), f"{head} {a[0]}: NLL sum {a[2]} vs {b[2]}"
-        assert sum(r[2] for r in got[head]) == pytest.approx(sum(r[2] for r in ref[head]), rel=1e-6)
+        assert [r[2] for r in got[head]] == [r[2] for r in ref[head]], f"{head}: NLL sums"
 
 
 def _evaluate_both(model, val, parsed):
     ref = reference_evaluate(model, val.ids, [(h, t) for _, h, t in parsed], val.tensors)
-    return val.evaluate(model, games_per_forward=K), ref
+    return val.evaluate(model), ref
 
 
 def test_valset_holds_prebuilt_games_of_the_reference_order(val_and_games):
@@ -107,26 +105,59 @@ def test_evaluate_equals_one_game_per_call(val_and_games, state):
     assert model.training  # evaluate restores train mode
 
 
-def test_near_tie_is_evaluated_alone_and_equals_one_game_per_call(val_and_games):
-    """A trained model whose discard head scores two actions within ~1e-7 of each other wherever both are legal: the
-    near tie is detected, the game is re-run alone, and every row equals the reference exactly in n and top-1."""
-    val, parsed, train = val_and_games
-    model = _trained_model(train)
-    labels = torch.cat([t["discard"][1] for t in val.tensors])
-    a = int(torch.bincount(labels).argmax())  # the most frequent human discard: often the top logit
-    b = (a + 1) % 34
-    head = model.heads["discard"]
-    with torch.no_grad():
-        g = torch.Generator().manual_seed(0)
-        head.weight[b] = head.weight[a] + 1e-7 * torch.randn(head.weight.shape[1], generator=g)
-        head.bias[b] = head.bias[a] + 1e-8
-    before = val.tie_fallbacks
-    got, ref = _evaluate_both(model, val, parsed)
-    assert val.tie_fallbacks > before, "no near tie detected: the case is not constructed"
-    _assert_rows_equal(got, ref)
-    # the comparison sees a single top-1 change: flip one count by one and it fails
-    flipped = {h: list(rows) for h, rows in got.items()}
-    gid, n, nll, c = flipped["discard"][0]
-    flipped["discard"][0] = (gid, n, nll, c + 1 if c < n else c - 1)
-    with pytest.raises(AssertionError, match="top-1 counts"):
-        _assert_rows_equal(flipped, ref)
+def test_tie_broken_by_a_two_game_call_keeps_its_one_game_count():
+    """Codex stage-5 probe: synthetic features of two games (11 and 23 discard samples); the discard head scores two
+    actions exactly equal for one sample when that game is run alone (a large head coefficient on the feature that a
+    two-game call moves by ~1e-7). With every label 0 the tie is a hit alone (argmax takes the first) and a miss in a
+    two-game call (no near-tie margin is needed). evaluate must give the one-game counts."""
+    threads = torch.get_num_threads()
+    torch.set_num_threads(4)
+    try:
+        torch.manual_seed(0)
+        m = EncoderConvModel(verbose=False).eval()
+        ns = [11, 23]
+        g = torch.Generator().manual_seed(9)
+        x1 = torch.randn(sum(ns), 10, 37, 4, generator=g)
+        x2 = torch.randn(sum(ns), 7, 4, generator=g)
+        x3 = torch.randn(sum(ns), 7, generator=g)
+        tokens = torch.zeros(sum(ns), 150, dtype=torch.long)
+        y = torch.zeros(sum(ns), dtype=torch.long)
+        widths = {"during": 72, "discard": 37, "post": 154}
+
+        def prepare(ids, _):
+            ix = torch.cat([torch.arange(sum(ns[:j]), sum(ns[:j + 1])) for j in ids])
+            return tuple((tokens[ix], (x1[ix], x2[ix], x3[ix]), torch.ones(len(ix), w), y[ix], tokens[ix] != 0)
+                         for w in widths.values())
+
+        m.tensor_processor.prepare_batches = prepare
+        states = []
+        hook = m.discard_head.register_forward_pre_hook(lambda mod, args: states.append(args[0].clone()))
+        with torch.no_grad():
+            m([0], [None])
+            m([0, 1], [None, None])
+        hook.remove()
+        single_state, batch_state = states
+        diff = batch_state[:ns[0]] - single_state
+        assert diff.abs().max() > 0, "a two-game call gives the same features: the case is not constructed"
+        i, j = divmod(int(diff.abs().argmax()), diff.shape[1])
+        slope = -256.0 if diff[i, j] > 0 else 256.0
+        with torch.no_grad():
+            m.discard_head.weight.zero_()
+            m.discard_head.bias.fill_(-100.0)
+            m.discard_head.weight[0, j] = slope
+            m.discard_head.bias[0] = -slope * single_state[i, j]
+            m.discard_head.bias[1] = 0.0
+            single = [int((m([k], [None])["discard"].logits.argmax(1) == 0).sum()) for k in range(2)]
+            batch = m([0, 1], [None, None])["discard"].logits.argmax(1) == 0
+        assert single == [11, 23], f"one-game counts {single}: the singleton tie is not a hit"
+        assert [int(batch[:ns[0]].sum()), int(batch[ns[0]:].sum())] != single, "a two-game call keeps the counts"
+
+        val = SL.ValSet.__new__(SL.ValSet)
+        val.games, val.ids = [0, 1], ["a", "b"]
+        val.tensors = [{h: (torch.ones(n, w), torch.zeros(n, dtype=torch.long), None) for h, w in widths.items()}
+                       for n in ns]
+        out = val.evaluate(m)
+        assert [r[3] for r in out["discard"]] == single, f"top-1 counts {[r[3] for r in out['discard']]} vs {single}"
+        assert m.training  # evaluate restores train mode
+    finally:
+        torch.set_num_threads(threads)

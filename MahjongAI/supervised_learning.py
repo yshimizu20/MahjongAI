@@ -77,11 +77,6 @@ DATA_PREFETCH = 8
 # PrebuiltGame plus the header's shanten step). The pool size comes from the core count (14 cores -> 12).
 PRIOR_WORKERS = max(1, (os.cpu_count() or 4) - 2)
 PRIOR_PREFETCH = 32
-# T-047 E1: the validation games are held as PrebuiltGame objects and evaluated EVAL_GAMES_PER_FORWARD per forward call.
-# The batch size moves logits by ~1e-7 (float reduction order), so a game with a sample whose top-2 logit margin is below
-# EVAL_TIE_MARGIN is evaluated alone, as one game per call did: n, labels and top-1 counts equal one game per call.
-EVAL_GAMES_PER_FORWARD = 10
-EVAL_TIE_MARGIN = 1e-4
 MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -167,7 +162,6 @@ class ValSet:
         self.games = games  # [PrebuiltGame]: unpacked by prepare_batches, never built again
         self.tensors = [head_tensors(processor, g, None) for g in games]  # per game: {head: (mask, y, hand37)}
         _check_tensor_skips(processor, "the validation set", files)
-        self.tie_fallbacks = 0  # games evaluated alone because of a near tie (all evaluations)
 
     @classmethod
     def load(cls, log: RunLog) -> "ValSet":
@@ -192,50 +186,26 @@ class ValSet:
         """Per game (id, mask, y, hand37) of one head."""
         return [(gid, *t[head]) for gid, t in zip(self.ids, self.tensors)]
 
-    def _rows(self, model, idx) -> list:
-        """One forward call on the games `idx`: per game ({head: (game_id, n, nll_sum, correct)}, near_tie)."""
-        results = model([self.games[j] for j in idx], [None] * len(idx), sample=False)
-        out = [({}, False) for _ in idx]
-        for head in HEADS:
-            ns = [len(self.tensors[j][head][1]) for j in idx]
-            if head not in results:
-                assert sum(ns) == 0, f"{[self.ids[j] for j in idx]}: no {head} output for {sum(ns)} samples"
-                for rows, _ in out:
-                    rows[head] = None
-                continue
-            r = results[head]
-            assert r.y.numel() == sum(ns), f"{head}: {r.y.numel()} outputs for {sum(ns)} stored samples"
-            top2 = r.logits.topk(2, dim=1).values
-            near_tie = (top2[:, 0] - top2[:, 1]) < EVAL_TIE_MARGIN
-            hit = r.logits.argmax(dim=1) == r.y
-            start = 0
-            for k, (j, n) in enumerate(zip(idx, ns)):
-                gid, stop = self.ids[j], start + n
-                y = r.y[start:stop]
-                assert torch.equal(y.cpu(), self.tensors[j][head][1]), f"{gid}: {head} labels differ from the stored validation labels"
-                nll = F.cross_entropy(r.logits[start:stop].double(), y, reduction="sum").item() if n else 0.0
-                out[k][0][head] = (gid, n, nll, int(hit[start:stop].sum()))
-                out[k] = (out[k][0], out[k][1] or bool(near_tie[start:stop].any()))
-                start = stop
-        return out
-
     @torch.no_grad()
-    def evaluate(self, model, games_per_forward=None) -> dict:
-        """{head: [(game_id, n, nll_sum, correct)]}, games_per_forward (default EVAL_GAMES_PER_FORWARD) games per
-        forward call; a game with a near tie (top-2 margin < EVAL_TIE_MARGIN) in a multi-game call is evaluated
-        alone, so its rows are the one-game-per-call rows."""
-        k = games_per_forward or EVAL_GAMES_PER_FORWARD
+    def evaluate(self, model) -> dict:
+        """{head: [(game_id, n, nll_sum, correct)]}, one PrebuiltGame per forward call (T-047 E1): the 468d71c
+        evaluation bit for bit, without building the game again. A multi-game call is not used: the batch size moves
+        logits by ~1e-7 (float reduction order), which can flip a top-1 tie."""
         model.eval()
         try:
             out = {h: [] for h in HEADS}
-            for s in range(0, len(self.games), k):
-                idx = list(range(s, min(s + k, len(self.games))))
-                for j, (rows, near_tie) in zip(idx, self._rows(model, idx)):
-                    if near_tie and len(idx) > 1:
-                        self.tie_fallbacks += 1
-                        (rows, _), = self._rows(model, [j])
-                    for head in HEADS:
-                        out[head].append(rows[head] if rows[head] is not None else (self.ids[j], 0, 0.0, 0))
+            for gid, game, tensors in zip(self.ids, self.games, self.tensors):
+                results = model([game], [None], sample=False)
+                for head in HEADS:
+                    y = tensors[head][1]
+                    if head not in results:
+                        assert len(y) == 0, f"{gid}: no {head} output for {len(y)} samples"
+                        out[head].append((gid, 0, 0.0, 0))
+                        continue
+                    r = results[head]
+                    assert torch.equal(r.y.cpu(), y), f"{gid}: {head} labels differ from the stored validation labels"
+                    nll = F.cross_entropy(r.logits.double(), r.y, reduction="sum").item()
+                    out[head].append((gid, len(y), nll, int((r.logits.argmax(dim=1) == r.y).sum())))
             return out
         finally:
             model.train()

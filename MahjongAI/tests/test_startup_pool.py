@@ -312,7 +312,7 @@ def test_training_starts_with_one_pool_and_a_resume_never_refits_the_prior(tmp_p
 
 def test_combined_eval_consumes_the_pool_built_games(monkeypatch, wide_val_root):
     """E1 + S1: the pool-built validation games evaluate to the serial-built ones' rows exactly (counts, top-1, NLL)
-    at several games per call; the eval never builds a game again."""
+    at one game per call; the eval never builds a game again."""
     monkeypatch.setattr(SL, "DATA_ROOT", wide_val_root)
     serial, _ = _load(monkeypatch, 0, 9)
     pooled, _ = _load(monkeypatch, 3, 9)
@@ -320,4 +320,4 @@ def test_combined_eval_consumes_the_pool_built_games(monkeypatch, wide_val_root)
     model = SL.EncoderConvModel(verbose=False)
     import MahjongAI.agents.encoder_conv as EC
     monkeypatch.setattr(EC, "build_game", lambda *a, **k: (_ for _ in ()).throw(AssertionError("built again")))
-    assert serial.evaluate(model, games_per_forward=4) == pooled.evaluate(model, games_per_forward=4)
+    assert serial.evaluate(model) == pooled.evaluate(model)
