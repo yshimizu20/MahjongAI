@@ -277,6 +277,18 @@ def train_files_sha256(cluster: DataLoaderCluster) -> str:
     return h.hexdigest()
 
 
+def config_mismatch(saved: dict, current: dict) -> dict:
+    """{key: (saved, current)} of the run-identity keys that differ; total_steps may change on a resume (a run
+    extended past its budget), every other key (torch_threads too: it changes the float reduction order) must not."""
+    keys = sorted((saved.keys() | current.keys()) - {"total_steps"})
+    return {k: (saved.get(k, "<absent>"), current.get(k, "<absent>")) for k in keys
+            if k not in saved or k not in current or saved[k] != current[k]}
+
+
+def _mismatch_text(mismatch: dict) -> str:
+    return ", ".join(f"{k} {a!r} -> {b!r}" for k, (a, b) in mismatch.items())
+
+
 CHECKPOINT_RE = re.compile(r"step_(\d+)\.pt$")
 
 
@@ -330,16 +342,14 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
         "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": TORCH_THREADS,
     }
 
-    def identity(c: dict) -> dict:  # total_steps may change on a resume (a run extended past its budget)
-        return {k: v for k, v in c.items() if k != "total_steps"}
-
     current_step, rows, header = 0, [], None
     train_sums = {h: [0.0, 0] for h in HEADS}  # train-mode batch loss x n, n; since the last eval row
     latest_step, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
     if latest_checkpoint:
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=True)
-        assert identity(checkpoint["config"]) == identity(config), (
-            f"{latest_checkpoint} is from another run config:\n{checkpoint['config']}\nvs\n{config}")
+        mismatch = config_mismatch(checkpoint["config"], config)
+        assert not mismatch, (f"{latest_checkpoint} is from another run config: {_mismatch_text(mismatch)}; "
+                              "resume with the same config or start a new run dir")
         assert checkpoint["val_ids"] == val.ids, f"{latest_checkpoint}: validation games differ"
         if checkpoint["config"]["total_steps"] != total_steps:
             log(f"total_steps {checkpoint['config']['total_steps']} -> {total_steps} (cosine horizon recomputed)")
@@ -359,8 +369,9 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
         train_sums = {h: list(checkpoint["train_sums"][h]) for h in HEADS}
         header, _ = metrics.read()
         assert header is not None, f"{metrics.path} is missing: cannot resume a run without its header"
-        assert identity(header["config"]) == identity(config) and header["val_ids"] == val.ids, (
-            f"{metrics.path} header is from another run")
+        mismatch = config_mismatch(header["config"], config)
+        assert not mismatch and header["val_ids"] == val.ids, (
+            f"{metrics.path} header is from another run" + (f": {_mismatch_text(mismatch)}" if mismatch else ""))
         rows = metrics.truncate_after(current_step)
         log(f"Loaded checkpoint {latest_checkpoint}: resuming at step {current_step}; prior loaded "
             f"(no refit); data loader at {checkpoint['loader_state']}; metrics rows kept {[r['step'] for r in rows]}")
