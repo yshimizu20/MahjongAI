@@ -310,7 +310,10 @@ def test_state_net_state_dict_unchanged():
 
 def test_main_state_dict_loads_and_gives_same_outputs():
     """A state_dict saved from main's StateNet loads strictly into the new one: same outputs, and the same gradients
-    of every parameter and of the state inputs."""
+    of every parameter and of the state inputs. Compared in float64: the bias gradients sum ~60,750 terms, and in
+    float32 the result depends on the BLAS summation order (stock Conv1d is ~2e-5 off the float64 truth, the matmul
+    path ~2e-6; their difference passes on one CPU and fails on another). float64 removes that noise and keeps the
+    1e-6 tolerance meaningful: a wrong tap or bias moves a gradient by O(1)."""
     torch.manual_seed(0)
     old = ReferenceStateNet()
     buf = io.BytesIO()
@@ -318,9 +321,10 @@ def test_main_state_dict_loads_and_gives_same_outputs():
     buf.seek(0)
     new = StateNet()
     new.load_state_dict(torch.load(buf, weights_only=True), strict=True)
+    old, new = old.double(), new.double()
 
     def run(net):
-        states = tuple(t.clone().requires_grad_(True) for t in _random_states())
+        states = tuple(t.double().requires_grad_(True) for t in _random_states())
         out = net(states)
         net.zero_grad(set_to_none=True)
         out.square().sum().backward()
