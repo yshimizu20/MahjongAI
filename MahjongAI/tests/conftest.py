@@ -40,3 +40,17 @@ def small_roots(tmp_path):
     a = link_games([f for f in games if f.parent.parent.name < "20210401"], tmp_path / "A")
     b = link_games([f for f in games if f.parent.parent.name >= "20210401"], tmp_path / "B")
     return a, b
+
+
+def make_wide_val_root(root: pathlib.Path) -> pathlib.Path:
+    """A DATA_ROOT whose validation day has many games (T-047 E1 / S1): 2022/20220101 = the 25 games of 2021-01-01
+    (some of them expected skips), 2021 = every other 2021 fixture game."""
+    games = sorted(GATE_GAMES.glob("2021/*/*/*.log"))
+    link_games([f for f in games if f.parent.parent.name != "20210101"], root / "2021")
+    link_games([f for f in games if f.parent.parent.name == "20210101"], root / "2022", {"20210101": "20220101"})
+    return root
+
+
+@pytest.fixture
+def wide_val_root(tmp_path) -> pathlib.Path:
+    return make_wide_val_root(tmp_path / "data")
