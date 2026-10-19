@@ -404,18 +404,73 @@ def find_latest_checkpoint(checkpoint_dir: str):
     return max(found) if found else (0, None)
 
 
+def compile_head_core(model: EncoderConvModel):
+    """The training-only compiled copy of model.head_core (T-050): the per-head network after the eager preparation,
+    sampling, safety checks and unique step, through the loss; dynamic batch dimension. Inductor draws dropout from
+    the eager RNG (fallback_random), so sampled indices, dropout masks and the RNG state equal the eager path's. The
+    module itself stays eager: evaluation calls it, and checkpoints save its state_dict (no _orig_mod. keys)."""
+    import torch._inductor.config as inductor_config
+    inductor_config.fallback_random = True
+    return torch.compile(model.head_core, dynamic=True)
+
+
+def compile_counters() -> dict:
+    """The process's dynamo counters that show compile activity: frame conversions (total, ok: a failed one is an
+    eager fallback), graphs compiled, graph breaks (all reasons)."""
+    from torch._dynamo.utils import counters
+    return {"frames_total": counters["frames"]["total"], "frames_ok": counters["frames"]["ok"],
+            "graphs": counters["stats"]["unique_graphs"], "graph_breaks": sum(counters["graph_break"].values())}
+
+
+class CompileMonitor:
+    """Compile activity of the training callable since the run started in this process (T-050 R4). Expected: one
+    frame conversion and one graph per head, at that head's first update, every conversion ok, no graph break.
+    Anything else (a recompile, an eager fallback, a break) is `unexpected`; the trainer logs it at every eval."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled  # off (an eager run): update_done and report do nothing
+        self.base = compile_counters()
+        self.heads_seen = set()
+
+    def update_done(self, heads):
+        if self.enabled:
+            self.heads_seen.update(heads)
+
+    def report(self, log, step: int):
+        if self.enabled:
+            log(f"at step {step}: " + self.line())
+
+    def state(self) -> dict:
+        now = compile_counters()
+        d = {k: now[k] - self.base[k] for k in now}
+        n = len(self.heads_seen)
+        d["heads_seen"] = n
+        d["unexpected"] = (max(0, d["frames_total"] - n) + (d["frames_total"] - d["frames_ok"])
+                           + max(0, d["graphs"] - n) + d["graph_breaks"])
+        return d
+
+    def line(self) -> str:
+        d = self.state()
+        return (f"compile: frames {d['frames_ok']}/{d['frames_total']} ok, graphs {d['graphs']}, graph breaks "
+                f"{d['graph_breaks']}, heads seen {d['heads_seen']}; unexpected (recompile / fallback / break) "
+                f"{d['unexpected']}" + (" COMPILE-ALERT" if d["unexpected"] else ""))
+
+
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
-          save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None):
+          save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, compile_model=False):
+    """compile_model: training updates run the compiled per-head network (compile_head_core); the CLI turns it on
+    unless --no-compile. Off: the eager path of c7580b1."""
     workers = make_workers()
     try:
-        _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers)
+        _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
+               compile_model)
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
 
 
 def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int, save_every: int,
-           expect_prior_ce, expect_shanten, workers):
+           expect_prior_ce, expect_shanten, workers, compile_model=False):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
@@ -427,6 +482,10 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         batch_size = 2
     else:
         raise NotImplementedError(f"Model {model_name} not implemented.")
+    head_core = compile_head_core(model) if compile_model else None  # training only; evaluation calls `model`
+    monitor = CompileMonitor(enabled=compile_model)
+    log("torch.compile: " + ("on (the per-head network of training updates; evaluation eager)" if compile_model
+                             else "off (eager)"))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     warmup_steps = min(1000, total_steps // 10)  # a 300-step smoke must leave warmup; a 1,100-step run must not collapse
@@ -548,6 +607,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             f"{h} CE {heads[h]['ce']:.4f} (uniform {uniform_ce[h]:.4f}, prior {prior_ce[h]:.4f}) top1 {heads[h]['top1']:.3f} "
             f"n={heads[h]['n']}" + (f" train CE {heads[h]['train_ce']:.4f}" if heads[h]["train_ce"] is not None else "")
             for h in HEADS))
+        monitor.report(log, current_step)
         if current_step == 0:
             gaps = {h: heads[h]["ce"] - uniform_ce[h] for h in HEADS}
             log("row 0 gap to uniform-legal CE: " + " | ".join(f"{h} {gaps[h]:+.4f}" for h in HEADS)
@@ -590,7 +650,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         while current_step < total_steps:
             games, tokens = next(cluster)
             consumed += cluster.last_batch_files
-            results = model(games, tokens, sample=True) if games else None  # no games: every one was skipped
+            # no games: every one was skipped
+            results = model(games, tokens, sample=True, head_core=head_core) if games else None
             _check_tensor_skips(model.tensor_processor, f"the training batch after step {current_step}",
                                 cluster.last_batch_files)
             if not results:
@@ -617,6 +678,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             scheduler.step()
             current_step += 1
             consistent = True
+            monitor.update_done(results)
 
             for h, out in results.items():
                 train_sums[h][0] += out.loss.item() * out.y.numel()
@@ -668,6 +730,8 @@ if __name__ == "__main__":
                         help="stop unless the prior's val CE per head (during, discard, post) equals these within 1e-4")
     parser.add_argument("--expect-shanten", type=int, default=None, metavar="N",
                         help="stop unless the shanten-greedy discard hits on the val set equal N")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="train with the eager per-head network (the c7580b1 path); default: compiled (T-050)")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -686,11 +750,12 @@ if __name__ == "__main__":
     os.makedirs(run_dir, exist_ok=True)
     log = RunLog(os.path.join(run_dir, "train.log"))
     log(f"Training {args.model_name} for {args.max_steps} steps in {run_dir} (eval every {args.eval_every}, "
-        f"save every {args.save_every})" + (" [profiling on]" if args.profile else ""))
+        f"save every {args.save_every})" + (" [profiling on]" if args.profile else "")
+        + (" [--no-compile]" if args.no_compile else ""))
 
     def _run():
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
-              args.expect_prior_ce, args.expect_shanten)
+              args.expect_prior_ce, args.expect_shanten, compile_model=not args.no_compile)
 
     if args.profile:
         pr = cProfile.Profile()
