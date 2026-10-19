@@ -151,7 +151,13 @@ class EncoderConvModel(nn.Module):
         all_encoding_tokens_list: List[list[int]],
         sample=False,
         sample_size=2250,
+        head_core=None,
     ) -> dict:
+        """{head: HeadOutput} of a batch of games. head_core: the per-head network (default self.head_core, eager);
+        the trainer passes its compiled copy of it for training updates only, and evaluation calls the eager module
+        (T-050). Preparation, sampling, the device moves, the safety checks and the unique step of the token
+        embedder run here, eager, around it."""
+        core = self.head_core if head_core is None else head_core
         (
             tensors_during,
             tensors_discard,
@@ -194,53 +200,75 @@ class EncoderConvModel(nn.Module):
             y_tensor = y_tensor.to(device)
             padding_mask_batch = padding_mask_batch.to(device)
 
-            # Assertions
+            # Assertions, eager and before the per-head network: a compiled network turns tensor asserts into no-ops
+            # (T-050 P1). Same conditions and messages as before; the target check ran after the logits until T-050.
             assert torch.all((action_mask_batch == 0) | (action_mask_batch == 1)), "action_mask_batch must be binary"
             assert torch.any(action_mask_batch, dim=1).all(), "Each sample must have at least one allowed action"
+            assert torch.all(
+                action_mask_batch[torch.arange(y_tensor.size(0)), y_tensor] == 1
+            ), "Target action is masked out as invalid!"
+            check_negative_targets(y_tensor)
 
-            # Step 1: Embed history tokens
-            history_emb = self.token_embedder(encoding_tokens_batch)  # (B, 150, EMBD_SIZE)
+            # Step 1a: the unique (token, position) pairs of the history (eager: the output shape depends on the data)
+            unique_codes, inverse = self.token_embedder.unique_codes(encoding_tokens_batch)
 
-            # Step 2: State embedding
-            state_emb = self.state_net(state_obj_tensor_batch)  # (B, EMBD_SIZE)
-            state_emb = state_emb.unsqueeze(1)  # (B, 1, EMBD_SIZE)
-
-            # Step 3: Early fusion — concatenate history + state token
-            fused = torch.cat([history_emb, state_emb], dim=1)  # (B, 151, EMBD_SIZE)
-
-            # Step 4: Extend padding mask (state token is always valid)
-            B = padding_mask_batch.size(0)
-            state_mask = torch.ones(B, 1, dtype=torch.bool, device=padding_mask_batch.device)
-            fused_mask = torch.cat([padding_mask_batch, state_mask], dim=1)  # (B, 151)
-
-            # Step 5: Bidirectional self-attention (no causal mask). Only the state token reaches the heads, so the
-            # last block computes its row alone (keys / values still come from every position): exact, T-011
-            attn_mask = fused_mask.unsqueeze(1)  # (B, 1, 151)
-            x = fused
-            for i, block in enumerate(self.blocks):
-                x = block(x, attn_mask, state_row_only=(i == len(self.blocks) - 1))  # last: (B, 1, EMBD_SIZE)
-
-            # Step 6: Extract state token (last position), output head, loss
-            final_state = x[:, -1, :]  # (B, EMBD_SIZE)
-            final_state = self.ln_f(final_state)
-            logits = self.heads[head](final_state)
+            # Steps 1b-6: the per-head network, through the loss
+            logits, loss = core(head, unique_codes, inverse, *state_obj_tensor_batch, action_mask_batch, y_tensor,
+                                padding_mask_batch)
 
             assert (
                 logits.shape == action_mask_batch.shape
             ), f"Logits shape {logits.shape} and mask shape {action_mask_batch.shape} do not match."
-
-            # Verify target actions are not masked out
-            assert torch.all(
-                action_mask_batch[torch.arange(y_tensor.size(0)), y_tensor] == 1
-            ), "Target action is masked out as invalid!"
-
-            # Mask out invalid actions
-            logits = logits.masked_fill(action_mask_batch == 0, -1e9)
-
-            loss = F.cross_entropy(logits, y_tensor, reduction="mean")
             results[head] = HeadOutput(logits, loss, y_tensor)
 
         return results
+
+    def head_core(self, head, unique_codes, inverse, x1, x2, x3, action_mask_batch, y_tensor, padding_mask_batch):
+        """(masked logits (B, A), mean cross-entropy) of one head from the eager preparation: the unique history codes
+        and their inverse (TokenEmbedder.unique_codes), the state tensors, the binary action mask, the targets and the
+        padding mask. The function the trainer compiles (T-050): no tensor assert, check or raise in here (they run
+        eager in forward, before it), no data-dependent shape."""
+        # Step 1b: Embed history tokens
+        history_emb = self.token_embedder.embed_unique(unique_codes, inverse)  # (B, 150, EMBD_SIZE)
+
+        # Step 2: State embedding
+        state_emb = self.state_net((x1, x2, x3))  # (B, EMBD_SIZE)
+        state_emb = state_emb.unsqueeze(1)  # (B, 1, EMBD_SIZE)
+
+        # Step 3: Early fusion — concatenate history + state token
+        fused = torch.cat([history_emb, state_emb], dim=1)  # (B, 151, EMBD_SIZE)
+
+        # Step 4: Extend padding mask (state token is always valid)
+        B = padding_mask_batch.size(0)
+        state_mask = torch.ones(B, 1, dtype=torch.bool, device=padding_mask_batch.device)
+        fused_mask = torch.cat([padding_mask_batch, state_mask], dim=1)  # (B, 151)
+
+        # Step 5: Bidirectional self-attention (no causal mask). Only the state token reaches the heads, so the
+        # last block computes its row alone (keys / values still come from every position): exact, T-011
+        attn_mask = fused_mask.unsqueeze(1)  # (B, 1, 151)
+        x = fused
+        for i, block in enumerate(self.blocks):
+            x = block(x, attn_mask, state_row_only=(i == len(self.blocks) - 1))  # last: (B, 1, EMBD_SIZE)
+
+        # Step 6: Extract state token (last position), output head, loss
+        final_state = x[:, -1, :]  # (B, EMBD_SIZE)
+        final_state = self.ln_f(final_state)
+        logits = self.heads[head](final_state)
+
+        # Mask out invalid actions
+        logits = logits.masked_fill(action_mask_batch == 0, -1e9)
+
+        loss = F.cross_entropy(logits, y_tensor, reduction="mean")
+        return logits, loss
+
+
+def check_negative_targets(y_tensor):
+    """Raise as F.cross_entropy does for a negative target that is not its ignore_index (-100): eager, before the
+    per-head network, which may be compiled (T-050 P1). Such a target passes the target-legality check (it indexes
+    the mask from the end); a target >= the action count fails that check's indexing first, as before."""
+    bad = (y_tensor < 0) & (y_tensor != -100)
+    if bad.any():
+        raise IndexError(f"Target {int(y_tensor[bad][0])} is out of bounds.")
 
 
 class TokenEmbedder(nn.Module):
@@ -303,11 +331,25 @@ class TokenEmbedder(nn.Module):
         Returns:
             x: (B, 150, EMBD_SIZE) tensor of summed embeddings
         """
+        return self.embed_unique(*self.unique_codes(encoding_tokens_batch))  # (B, T, EMBD_SIZE)
+
+    def unique_codes(self, encoding_tokens_batch: torch.Tensor):
+        """(unique codes (U,), inverse (B, T)) of the (token, position) pairs: the eager step of forward (its output
+        shape depends on the data; T-050 keeps it out of the compiled network). Raises as the type embedding lookup
+        does for a token whose embedding type is out of its table (the lookup may run compiled)."""
         T = encoding_tokens_batch.size(1)
         assert T <= MAX_ACTION_LEN
         positions = torch.arange(T, device=encoding_tokens_batch.device)
         codes = encoding_tokens_batch * MAX_ACTION_LEN + positions  # (B, T): one code per (token, position)
         unique_codes, inverse = torch.unique(codes, return_inverse=True)  # (U,), (B, T)
+        type_idx = torch.clamp(((torch.div(unique_codes, MAX_ACTION_LEN, rounding_mode="floor") >> 10) & 7) - 1, min=0)
+        if (type_idx >= self.type_embedding.num_embeddings).any():
+            raise IndexError("index out of range in self")
+        return unique_codes, inverse
+
+    def embed_unique(self, unique_codes, inverse):
+        """The (B, T, EMBD_SIZE) embedding from unique_codes' output: each unique pair's summed embedding, gathered
+        back."""
         tokens = torch.div(unique_codes, MAX_ACTION_LEN, rounding_mode="floor")
         rows = self._embed_codes(tokens, self.position_coding_table[unique_codes - tokens * MAX_ACTION_LEN])
         return F.embedding(inverse, rows)  # (B, T, EMBD_SIZE)
