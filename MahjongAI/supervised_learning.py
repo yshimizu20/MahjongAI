@@ -15,6 +15,7 @@ import glob
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import pathlib
@@ -422,38 +423,101 @@ def compile_counters() -> dict:
             "graphs": counters["stats"]["unique_graphs"], "graph_breaks": sum(counters["graph_break"].values())}
 
 
+# dynamo's "recompiles" log (torch._logging artifact): one message per recompile, with the guard that failed on each
+# cached graph of the function. The monitor classifies each message (classify_recompile).
+RECOMPILE_LOGGER = "torch._dynamo.guards.__recompiles"
+_recompile_messages = []  # every recompile message of this process, in order
+
+
+class _RecompileSink(logging.Handler):
+    def emit(self, record):
+        _recompile_messages.append(record.getMessage())
+
+
+def _install_recompile_sink():
+    """Turn on dynamo's recompile log (it also prints to stderr) and collect its messages, once per process."""
+    logger = logging.getLogger(RECOMPILE_LOGGER)
+    if not any(isinstance(h, _RecompileSink) for h in logger.handlers):
+        torch._logging.set_logs(recompiles=True)
+        logger.addHandler(_RecompileSink())
+
+
+_GUARD_RE = re.compile(r"^\s*- \d+/\d+: (.*?)\s*(#.*)?$")
+_HEAD_GUARD_RE = re.compile(r"^L\['head'\] == '\w+'$")
+# the 0/1 specialization of the batch dimension (dynamo specializes a dimension of size 1): a graph compiled at
+# B >= 2 fails its "2 <= size" guard at B = 1; a graph compiled at B = 1 (static) fails its size guard at B >= 2
+_SIZE01_RES = (re.compile(r"^2 <= L\['\w+'\]\.size\(\)\[0\]$"),
+               re.compile(r"^tensor 'L\['\w+'\]' size mismatch at index 0\. expected 1, actual \d+$"))
+
+
+def recompile_guards(message: str) -> list:
+    """The failed guard of each cached graph, from one recompile message (comments dropped)."""
+    return [m.group(1) for m in map(_GUARD_RE.match, message.splitlines()) if m]
+
+
+def classify_recompile(message: str) -> str:
+    """'head': every cached graph failed only on its head (the first compile of another head); 'batch-size-1': one
+    cached graph failed on the 0/1 batch-size specialization, every other one on its head; 'other': anything else."""
+    guards = recompile_guards(message)
+    kinds = ["head" if _HEAD_GUARD_RE.match(g) else "size01" if any(r.match(g) for r in _SIZE01_RES) else "other"
+             for g in guards]
+    if not kinds or "other" in kinds or kinds.count("size01") > 1:
+        return "other"
+    return "batch-size-1" if "size01" in kinds else "head"
+
+
 class CompileMonitor:
     """Compile activity of the training callable since the run started in this process (T-050 R4). Expected: one
-    frame conversion and one graph per head, at that head's first update, every conversion ok, no graph break.
-    Anything else (a recompile, an eager fallback, a break) is `unexpected`; the trainer logs it at every eval."""
+    frame conversion and one graph per head, at that head's first update, plus at most one per head for the 0/1
+    specialization of the batch dimension (a head that has had both a 1-sample and a larger batch), every
+    conversion ok, no graph break. Every recompile is classified from dynamo's recompile log (classify_recompile)
+    and logged with its guards. Anything else (another recompile, a graph count above or below the expected one, an
+    eager fallback, a break) is `unexpected`; the trainer logs the line at every eval."""
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled  # off (an eager run): update_done and report do nothing
+        if enabled:
+            _install_recompile_sink()
         self.base = compile_counters()
-        self.heads_seen = set()
+        self.first_message = len(_recompile_messages)
+        self.reported = self.first_message
+        self.heads_seen, self.size1_heads, self.larger_heads = set(), set(), set()
 
-    def update_done(self, heads):
+    def update_done(self, results):
+        """results: the update's {head: HeadOutput}."""
         if self.enabled:
-            self.heads_seen.update(heads)
+            for h, out in results.items():
+                self.heads_seen.add(h)
+                (self.size1_heads if out.y.numel() == 1 else self.larger_heads).add(h)
 
     def report(self, log, step: int):
         if self.enabled:
+            for k in range(self.reported, len(_recompile_messages)):
+                message = _recompile_messages[k]
+                log(f"at step {step}: recompile {k - self.first_message + 1} ({classify_recompile(message)}): "
+                    + "; ".join(recompile_guards(message)))
+            self.reported = len(_recompile_messages)
             log(f"at step {step}: " + self.line())
 
     def state(self) -> dict:
         now = compile_counters()
         d = {k: now[k] - self.base[k] for k in now}
-        n = len(self.heads_seen)
-        d["heads_seen"] = n
-        d["unexpected"] = (max(0, d["frames_total"] - n) + (d["frames_total"] - d["frames_ok"])
-                           + max(0, d["graphs"] - n) + d["graph_breaks"])
+        kinds = [classify_recompile(m) for m in _recompile_messages[self.first_message:]]
+        both = len(self.size1_heads & self.larger_heads)
+        d["heads_seen"] = len(self.heads_seen)
+        d["size1_recompiles"] = kinds.count("batch-size-1")
+        d["expected_graphs"] = d["heads_seen"] + both
+        d["unexpected"] = (abs(d["frames_total"] - d["expected_graphs"]) + (d["frames_total"] - d["frames_ok"])
+                           + abs(d["graphs"] - d["expected_graphs"]) + d["graph_breaks"] + kinds.count("other")
+                           + abs(d["size1_recompiles"] - both))
         return d
 
     def line(self) -> str:
         d = self.state()
-        return (f"compile: frames {d['frames_ok']}/{d['frames_total']} ok, graphs {d['graphs']}, graph breaks "
-                f"{d['graph_breaks']}, heads seen {d['heads_seen']}; unexpected (recompile / fallback / break) "
-                f"{d['unexpected']}" + (" COMPILE-ALERT" if d["unexpected"] else ""))
+        return (f"compile: frames {d['frames_ok']}/{d['frames_total']} ok, graphs {d['graphs']} (expected "
+                f"{d['expected_graphs']}), graph breaks {d['graph_breaks']}, heads seen {d['heads_seen']}, batch-size-1 "
+                f"recompiles {d['size1_recompiles']}; unexpected (recompile / fallback / break) {d['unexpected']}"
+                + (" COMPILE-ALERT" if d["unexpected"] else ""))
 
 
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,

@@ -7,8 +7,11 @@ RNG state ("lockstep"): the frozen c7580b1 path (`reference_forward` below, verb
 (`model(..., head_core=model.head_core)`) and the compiled path (`model(..., head_core=compiled)`).
 
 - eager and split vs reference: bitwise (losses, logits, gradients, AdamW moments and updates, sampled indices, RNG state).
-- compiled vs reference: the [P8] rule per tensor, elementwise |a - b| <= ATOL + RTOL * |b| (b = reference); sampled
-  indices and RNG state equal (fatal, [R1]: inductor's fallback_random draws dropout from the eager RNG).
+- compiled vs reference: the [P8] rule per tensor, elementwise |a - b| <= atol + RTOL * |b| (b = reference), with the
+  atol scaled to the tensor (ATOL_SCALE * max |b| + ATOL_FLOOR: a fixed atol of 1e-5 passed every element of the tiny
+  AdamW second moments and small gradients, whatever their value; stage-5 review); sampled indices and RNG state equal
+  (fatal, [R1]: inductor's fallback_random draws dropout from the eager RNG). The comparator itself is tested: a
+  1e-3 relative error in any compared tensor fails it, and so does the valid-logit defect (the negative control).
 - every parameter gets a gradient > COVERAGE_MIN in some fixture, except STRUCTURAL_ZERO [R2].
 - inductor code runs in every compiled update (2 compiled graph calls per head: forward and backward), no eager
   fallback, no graph break [P5].
@@ -32,8 +35,14 @@ from MahjongAI.agents.encoder_conv import (MAX_ACTION_LEN, EncoderConvModel, Hea
                                            TransformerTensorProcessor, build_game, device)
 from MahjongAI.process_xml import process
 
-ATOL, RTOL = 1e-5, 1e-4  # [P8]
-COVERAGE_MIN = 1e-6
+# [P8], atol per tensor = ATOL_SCALE * max |reference| + ATOL_FLOOR. The floor only serves an all-zero reference: the
+# AdamW second moments of the embeddings peak near 1e-10, so a floor of 1e-12 would pass any of their values.
+ATOL_SCALE, ATOL_FLOOR, RTOL = 1e-4, 1e-30, 1e-4
+# The AdamW update divides by sqrt(v): where an element's gradient is near zero, a round-off difference of the
+# gradient becomes a relative difference of the update (measured on these fixtures: up to 6.1e-4 of the tensor's
+# largest update; the other tensors need at most 3.1e-6). The moments it is computed from are compared at ATOL_SCALE.
+ATOL_SCALE_UPDATE = 5e-3
+COVERAGE_MIN = 1e-8  # a covered parameter's largest gradient: above the structural-zero round-off (about 1e-10)
 # [R2] parameters whose loss gradient is zero by the math, so only float round-off reaches them:
 STRUCTURAL_ZERO = {
     # adds the same constant to the scores of every key of a query (q . (k + b) = q . k + q . b), and softmax over the
@@ -240,16 +249,28 @@ class RandpermLog:
 
 
 # ----------------------------------------------------------------------------------------------- comparison
-def check_close(a, b, where):
-    """[P8]: |a - b| <= ATOL + RTOL * |b| elementwise; on failure the max abs, max rel and worst index."""
+def tensor_atol(b, scale=ATOL_SCALE) -> float:
+    """The [P8] atol of a reference tensor: `scale` of its largest magnitude, plus ATOL_FLOOR."""
+    return scale * b.double().abs().max().item() + ATOL_FLOOR if b.numel() else ATOL_FLOOR
+
+
+def atol_scale(key: str) -> float:
+    return ATOL_SCALE_UPDATE if key == "delta" else ATOL_SCALE
+
+
+def check_close(a, b, where, scale=ATOL_SCALE):
+    """[P8]: |a - b| <= atol + RTOL * |b| elementwise, atol = tensor_atol(b, scale); on failure the max abs, max rel
+    and the worst index."""
     assert a.shape == b.shape and a.dtype == b.dtype, f"{where}: {a.shape} {a.dtype} vs {b.shape} {b.dtype}"
     a64, b64 = a.double(), b.double()
     diff = (a64 - b64).abs()
-    bad = diff > ATOL + RTOL * b64.abs()
+    atol = tensor_atol(b, scale)
+    bad = diff > atol + RTOL * b64.abs()
     if bad.any():
         rel = diff / b64.abs().clamp_min(1e-30)
         worst = tuple(int(i) for i in torch.nonzero(bad)[diff[bad].argmax()]) if diff.dim() else ()
-        raise AssertionError(f"{where}: {int(bad.sum())} of {diff.numel()} elements outside |a-b| <= {ATOL} + {RTOL}|b|;"
+        raise AssertionError(f"{where}: {int(bad.sum())} of {diff.numel()} elements outside |a-b| <= {atol:.3e} + "
+                             f"{RTOL}|b|;"
                              f" max abs {diff.max().item():.3e}, max rel {rel.max().item():.3e}, worst index {worst} "
                              f"(a {a64[worst].item():.6e}, b {b64[worst].item():.6e})")
 
@@ -258,10 +279,40 @@ def check_equal(a, b, where):
     assert a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b), f"{where}: not bitwise equal"
 
 
+MASKED_LOGIT = -1e9  # head_network's masked_fill value
+
+
+def check_logits(a, b, where):
+    """Masked logits: the same positions, bitwise MASKED_LOGIT; the valid logits by check_close, so their atol scales
+    with the valid logits (over the whole tensor, the -1e9 fill would make it 1e5)."""
+    assert a.shape == b.shape and a.dtype == b.dtype, f"{where}: {a.shape} {a.dtype} vs {b.shape} {b.dtype}"
+    masked = b == MASKED_LOGIT
+    check_equal(a == MASKED_LOGIT, masked, f"{where}: masked positions")
+    check_close(a[~masked], b[~masked], f"{where} (valid)")
+
+
+def check_structural_zero(rec, n, where):
+    """[R2] a STRUCTURAL_ZERO parameter: its gradient is float round-off in every arm (about 1e-10), so a relative
+    comparison is meaningless. Bounds instead, in each arm: |grad| and |clipped grad| <= COVERAGE_MIN, |exp_avg| <=
+    COVERAGE_MIN, exp_avg_sq <= COVERAGE_MIN ** 2; the AdamW update of a round-off gradient is round-off noise of up to
+    a few lr per step, so |update| <= 5 lr."""
+    bounds = {"grad": COVERAGE_MIN, "clipped": COVERAGE_MIN, "exp_avg": COVERAGE_MIN, "exp_avg_sq": COVERAGE_MIN ** 2,
+              "delta": 5 * SL.learning_rate}
+    for key, bound in bounds.items():
+        m = rec[key][n].abs().max().item()
+        assert m <= bound, f"{where}: structural zero {n}: max |{key}| {m:.3e} > {bound:.1e}"
+
+
 def compare(got, ref, arm, exact):
     """Every recorded tensor of one lockstep update: losses, logits, gradients (raw and clipped), AdamW moments and
-    parameter updates; the sampled indices and the RNG state after the update always bitwise."""
-    check = check_equal if exact else check_close
+    parameter updates; the sampled indices and the RNG state after the update always bitwise. Not exact: the
+    STRUCTURAL_ZERO parameters by their bounds (check_structural_zero), in both records."""
+    def check(a, b, where, key=None):
+        if exact:
+            check_equal(a, b, where)
+        else:
+            check_close(a, b, where, atol_scale(key))
+
     assert got["heads"] == ref["heads"], f"{arm}: heads {got['heads']} vs {ref['heads']}"
     assert got["no_grad"] == ref["no_grad"], f"{arm}: parameters without a gradient differ"
     assert len(got["draws"]) == len(ref["draws"]), f"{arm}: {len(got['draws'])} vs {len(ref['draws'])} randperm draws"
@@ -270,12 +321,26 @@ def compare(got, ref, arm, exact):
     check_equal(got["rng"], ref["rng"], f"{arm}: RNG state after the update")
     for h in ref["heads"]:
         check(got["loss"][h], ref["loss"][h], f"{arm}: {h} loss")
-        check(got["logits"][h], ref["logits"][h], f"{arm}: {h} logits")
+        if exact:
+            check_equal(got["logits"][h], ref["logits"][h], f"{arm}: {h} logits")
+        else:
+            check_logits(got["logits"][h], ref["logits"][h], f"{arm}: {h} logits")
         check_equal(got["y"][h], ref["y"][h], f"{arm}: {h} targets")
+    compare_parameters(got, ref, arm, check, exact)
+
+
+def compare_parameters(got, ref, arm, check, exact):
+    """compare(): the per-parameter tensors (gradients raw and clipped, AdamW moments and updates)."""
     for key in ("grad", "clipped", "exp_avg", "exp_avg_sq", "delta"):
         assert got[key].keys() == ref[key].keys(), f"{arm}: {key} names"
         for n in ref[key]:
-            check(got[key][n], ref[key][n], f"{arm}: {key} {n}")
+            if not exact and n in STRUCTURAL_ZERO:
+                continue
+            check(got[key][n], ref[key][n], f"{arm}: {key} {n}", key)
+    if not exact:
+        for n in STRUCTURAL_ZERO:
+            check_structural_zero(got, n, arm)
+            check_structural_zero(ref, n, f"{arm} reference")
 
 
 def lockstep_update(model, forward, state, opt_state, rng, batch, sample, sample_size):
@@ -542,9 +607,162 @@ def test_fully_masked_attention_row_compiled(setup):
     assert torch.isfinite(xc).all() and (ye[1] == ye[1, 0]).all()  # the masked row: the projection bias only
     check_close(yc, ye, "output")
     check_close(xc, xe, "input gradient")
+    scale = max(g.abs().max().item() for g in ge.values())
     for n in ge:
+        if n == "key_proj.bias":  # [R2] structural zero: round-off in both arms, bounded relative to the other grads
+            for arm, g in (("eager", ge[n]), ("compiled", gc[n])):
+                assert g.abs().max().item() <= 1e-6 * scale, f"{arm}: structural zero {n} |grad| {g.abs().max():.3e}"
+            continue
         check_close(gc[n], ge[n], f"grad {n}")
     check_equal(rc, re_, "RNG state")
+
+
+def reference_record(model, games, seed, updates=3):
+    """The reference's lockstep record of its `updates`-th update from the model's weights (non-initial weights and
+    AdamW state from the second update on; all heads, sample 40)."""
+    forward = arms(model, None)["reference"]
+    torch.manual_seed(seed)
+    state, opt_state, rng = {k: v.clone() for k, v in model.state_dict().items()}, None, torch.get_rng_state()
+    for _ in range(updates):
+        rec = lockstep_update(model, forward, state, opt_state, rng, games, True, 40)
+        state, opt_state, rng = rec["state"], rec["opt_state"], rec["rng"]
+    assert len(rec["heads"]) == 3
+    return rec
+
+
+def test_comparator_fails_on_small_errors(setup, games):
+    """The [P8] comparator can fail on every tensor it compares (stage-5 review: a fixed atol of 1e-5 passed any value
+    of the AdamW second moments and of small gradients, e.g. during_naki_embedding's). On a real reference record, a
+    relative error of 1e-3 in any one compared tensor of any parameter but the structural zeros fails it (1e-2 in the
+    AdamW update, whose atol scale is ATOL_SCALE_UPDATE), and so does a 1e-3 error of the valid logits or the loss of
+    any head. The dropped negative control (2), one parameter's gradient scaled by 1.01, fails compare() on
+    token_embedder.during_naki_embedding.weight."""
+    model, _ = setup
+    ref = reference_record(model, games, seed=13)
+    tried = 0
+    for key in ("grad", "clipped", "exp_avg", "exp_avg_sq", "delta"):
+        error = 1e-2 if key == "delta" else 1e-3
+        for n, b in ref[key].items():
+            if n in STRUCTURAL_ZERO:
+                continue
+            with pytest.raises(AssertionError, match="elements outside"):
+                check_close(b * (1 + error), b, f"{key} {n}", atol_scale(key))
+            tried += 1
+    for h in ref["heads"]:
+        b = ref["logits"][h]
+        assert (b == MASKED_LOGIT).any() and (b != MASKED_LOGIT).any()
+        with pytest.raises(AssertionError, match="elements outside"):
+            check_logits(torch.where(b == MASKED_LOGIT, b, b * (1 + 1e-3)), b, f"{h} logits")
+        with pytest.raises(AssertionError, match="elements outside"):
+            check_close(ref["loss"][h] * (1 + 1e-3), ref["loss"][h], f"{h} loss")
+    assert tried == 5 * (len(C7580B1_PARAMS) - len(STRUCTURAL_ZERO))
+    n = "token_embedder.during_naki_embedding.weight"
+    assert ref["grad"][n].abs().max().item() > COVERAGE_MIN
+    got = copy.deepcopy(ref)
+    got["grad"][n] = got["grad"][n] * 1.01
+    with pytest.raises(AssertionError, match=f"grad {re.escape(n)}: "):
+        compare(got, ref, "negative control (2)", exact=False)
+
+
+def test_negative_control_valid_logit_defect_fails_the_comparison(setup, games):
+    """[P9 (1)] the negative control, committed: the compiled path with a defect between its network and the loss
+    (the valid, unmasked logits scaled by 1 + 1e-3, the loss computed from them) fails the lockstep comparison with the
+    reference, while the same update without the defect passes it."""
+    model, compiled = setup
+
+    def defective(head, unique_codes, inverse, x1, x2, x3, action_mask_batch, y_tensor, padding_mask_batch):
+        logits, _ = compiled(head, unique_codes, inverse, x1, x2, x3, action_mask_batch, y_tensor, padding_mask_batch)
+        logits = torch.where(action_mask_batch == 1, logits * (1 + 1e-3), logits)
+        return logits, F.cross_entropy(logits, y_tensor, reduction="mean")
+
+    forwards = dict(arms(model, compiled), defective=lambda *a, **k: model(*a, head_core=defective, **k))
+    start = reference_record(model, games, seed=17, updates=2)
+    start = (start["state"], start["opt_state"], start["rng"])
+    rec = {arm: lockstep_update(model, forwards[arm], *start, games, True, 40)
+           for arm in ("reference", "compiled", "defective")}
+    compare(rec["compiled"], rec["reference"], "compiled", exact=False)
+    with pytest.raises(AssertionError, match="defective: .* (loss|logits): .* elements outside"):
+        compare(rec["defective"], rec["reference"], "defective", exact=False)
+
+
+B1_RECOMPILE = ("Recompiling function head_core in encoder_conv.py:231\n    triggered by the following guard failure(s):\n"
+                "    - 0/2: L['head'] == 'post'                                         \n"
+                "    - 0/1: 2 <= L['inverse'].size()[0]                                   # _dynamo/output_graph.py:463 in "
+                "init_ambient_guards\n    - 0/0: L['head'] == 'during'                                       ")
+
+
+@pytest.mark.parametrize("guards, kind", [
+    (["L['head'] == 'during'"], "head"),
+    (["L['head'] == 'during'", "L['head'] == 'discard'"], "head"),
+    (["L['head'] == 'post'", "2 <= L['inverse'].size()[0]                 # _dynamo/output_graph.py:463"],
+     "batch-size-1"),
+    (["tensor 'L['x1']' size mismatch at index 0. expected 1, actual 40"], "batch-size-1"),
+    (["2 <= L['inverse'].size()[0]", "2 <= L['x1'].size()[0]"], "other"),
+    (["tensor 'L['x1']' size mismatch at index 0. expected 40, actual 39"], "other"),
+    (["L['head'] == 'post'", "___check_obj_id(L['self']._modules['ln_f'].training, 4314100920)"], "other"),
+    ([], "other"),
+])
+def test_classify_recompile(guards, kind):
+    """The monitor's reading of dynamo's recompile message (one failed guard per cached graph): only another head's
+    first compile and the 0/1 batch-size specialization are expected."""
+    message = "Recompiling function head_core in x.py:1\n    triggered by the following guard failure(s):\n" + "".join(
+        f"    - 0/{k}: {g}\n" for k, g in enumerate(guards))
+    assert SL.recompile_guards(message) == [g.split("  #")[0].strip() for g in guards]
+    assert SL.classify_recompile(message) == kind
+    assert SL.classify_recompile(B1_RECOMPILE) == "batch-size-1"
+
+
+def test_compile_monitor_counts_recompiles_against_the_heads(games):
+    """[R4] the trainer's CompileMonitor in a fresh dynamo state (as in a training process): one graph per head; a
+    1-sample batch of a head adds one recompile, logged with its guard and classified batch-size-1, not unexpected,
+    and only once per head; any other recompile (here a compiled update in eval mode) is unexpected, and so is a head
+    that runs without a graph of this monitor's (graphs below the heads seen: a monitor started after the compiles)."""
+    torch._dynamo.reset()  # the module's compiled callable recompiles if it is used after this test
+    threads = torch.get_num_threads()
+    torch.set_num_threads(SL.TORCH_THREADS)
+    try:
+        torch.manual_seed(SL.MODEL_SEED)
+        model = EncoderConvModel(verbose=False).to(device).train()
+        head_core = SL.compile_head_core(model)
+        monitor, lines = SL.CompileMonitor(), []
+
+        def update(head=None, n=1, mon=monitor):
+            restore = one_head_batch(model, games, head, n) if head else None
+            try:
+                results = model(*games, sample=True, sample_size=40, head_core=head_core)
+                sum(o.loss for o in results.values()).backward()
+            finally:
+                if restore is not None:
+                    restore()
+            mon.update_done(results)
+            return {k: mon.state()[k] for k in ("graphs", "expected_graphs", "heads_seen", "size1_recompiles",
+                                                "unexpected")}
+
+        def want(graphs, expected, heads, size1, unexpected):
+            return dict(graphs=graphs, expected_graphs=expected, heads_seen=heads, size1_recompiles=size1,
+                        unexpected=unexpected)
+
+        assert update() == want(3, 3, 3, 0, 0)
+        assert update("discard") == want(4, 4, 3, 1, 0)
+        assert update() == want(4, 4, 3, 1, 0)
+        assert update("discard") == want(4, 4, 3, 1, 0)
+        monitor.report(lines.append, 4)
+        assert len(lines) == 4 and "COMPILE-ALERT" not in lines[-1], lines  # 3 recompiles (2 heads, 1 size), 1 line
+        kinds = [" recompile 1 (head)", " recompile 2 (head)", " recompile 3 (batch-size-1)"]
+        assert [ln.split(":")[1] for ln in lines[:3]] == kinds, lines
+        assert "2 <= L['inverse'].size()[0]" in lines[2]
+        late = SL.CompileMonitor()  # started after the compiles: its heads run graphs it did not see compiled
+        assert update(mon=late) == want(0, 3, 3, 0, 6)
+        model.eval()
+        try:
+            state = update("post", 8)
+        finally:
+            model.train()
+        assert state["graphs"] == 5 and state["unexpected"] == 3, state  # 1 frame over, 1 graph over, 1 "other"
+        monitor.report(lines.append, 5)
+        assert "(other): " in lines[-2] and lines[-1].endswith("COMPILE-ALERT"), lines[-2:]
+    finally:
+        torch.set_num_threads(threads)
 
 
 RESUME_STEPS, RESUME_FROM = 9, 4  # a compiled run to step 9 (checkpoints 4, 8, 9; a row every step)
@@ -579,6 +797,7 @@ def test_resume_compiled_to_eager_in_a_fresh_process(tmp_path, monkeypatch, trai
     compiled run logs its compile activity at every eval: one graph per head, nothing unexpected [R4]."""
     threads = torch.get_num_threads()
     a, b = tmp_path / "a", tmp_path / "b"
+    torch._dynamo.reset()  # the trainer's monitor counts compiles from a fresh dynamo state, as in a training process
     try:
         _train_in_this_process(monkeypatch, train_data_root, a, tmp_path / "a.log", compile_model=True)
         shutil.copytree(a, b)
@@ -591,10 +810,12 @@ def test_resume_compiled_to_eager_in_a_fresh_process(tmp_path, monkeypatch, trai
     log_a, log_b = open(tmp_path / "a.log").read(), open(tmp_path / "b.log").read()
     assert "torch.compile: on" in log_a and "torch.compile: off" in log_b
     assert f"resuming at step {RESUME_FROM};" in log_b, log_b[-2000:]
-    monitor = re.findall(r"at step (\d+): compile: .*heads seen (\d); unexpected .* (\d+)", log_a)
-    assert [int(s) for s, _, _ in monitor] == list(range(RESUME_STEPS + 1)), monitor
-    assert all(u == "0" for _, _, u in monitor) and "COMPILE-ALERT" not in log_a, monitor
-    assert monitor[-1][1] == "3"
+    monitor = re.findall(r"at step (\d+): compile: frames (\d+)/(\d+) ok, graphs (\d+) \(expected (\d+)\), graph breaks 0, "
+                         r"heads seen (\d), batch-size-1 recompiles (\d+); unexpected \(recompile / fallback / break\) "
+                         r"(\d+)", log_a)
+    assert [int(m[0]) for m in monitor] == list(range(RESUME_STEPS + 1)), monitor
+    assert all(m[7] == "0" for m in monitor) and "COMPILE-ALERT" not in log_a, monitor
+    assert monitor[-1][5] == "3" and monitor[-1][3] == monitor[-1][4] == "3", monitor[-1]
     ckpt = torch.load(a / "checkpoints" / f"step_{RESUME_FROM}.pt", weights_only=True)
     assert list(ckpt["model_state_dict"]) == C7580B1_STATE_KEYS
     EncoderConvModel(verbose=False).load_state_dict(ckpt["model_state_dict"], strict=True)
