@@ -1,11 +1,12 @@
 """T-050: the compiled per-head network of training updates (supervised_learning.compile_head_core).
 
 Bounded (one module-scoped compiled callable on two real fixture games, plus one small trainer run): it runs on the
-Linux CI as well, mandatory, never skipped. Every check compares three arms on the same weights, optimizer state and
+Linux CI as well, mandatory, never skipped. Every check compares the arms on the same weights, optimizer state and
 RNG state ("lockstep"): the frozen c7580b1 path (`reference_forward` below, verbatim), the eager path of this branch
-(`model(...)`, the --no-compile path) and the compiled path (`model(..., head_core=compiled)`).
+(`model(...)`, the evaluation and --no-compile path), the compiled path's split uncompiled
+(`model(..., head_core=model.head_core)`) and the compiled path (`model(..., head_core=compiled)`).
 
-- eager vs reference: bitwise (losses, logits, gradients, AdamW moments and updates, sampled indices, RNG state).
+- eager and split vs reference: bitwise (losses, logits, gradients, AdamW moments and updates, sampled indices, RNG state).
 - compiled vs reference: the [P8] rule per tensor, elementwise |a - b| <= ATOL + RTOL * |b| (b = reference); sampled
   indices and RNG state equal (fatal, [R1]: inductor's fallback_random draws dropout from the eager RNG).
 - every parameter gets a gradient > COVERAGE_MIN in some fixture, except STRUCTURAL_ZERO [R2].
@@ -278,7 +279,7 @@ def compare(got, ref, arm, exact):
 
 
 def lockstep_update(model, forward, state, opt_state, rng, batch, sample, sample_size):
-    """One training update from (weights, AdamW state, RNG state), recorded. forward: one of the three arms."""
+    """One training update from (weights, AdamW state, RNG state), recorded. forward: one of the arms."""
     model.load_state_dict(state)
     model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=SL.learning_rate)
@@ -344,6 +345,7 @@ def arms(model, compiled):
     return {
         "reference": lambda *a, **k: reference_forward(model, *a, **k),
         "eager": lambda *a, **k: model(*a, **k),
+        "split": lambda *a, **k: model(*a, head_core=model.head_core, **k),  # the compiled path's split, uncompiled
         "compiled": lambda *a, **k: model(*a, head_core=compiled, **k),
     }
 
@@ -422,6 +424,7 @@ def test_compiled_and_eager_match_c7580b1_in_lockstep(setup, games):
             else:
                 assert len(ref["draws"]) == draws and len(ref["heads"]) == 3, (len(ref["draws"]), ref["heads"])
             compare(rec["eager"], ref, f"update {k + 1} eager", exact=True)
+            compare(rec["split"], ref, f"update {k + 1} split (uncompiled head_core)", exact=True)
             compare(rec["compiled"], ref, f"update {k + 1} compiled", exact=False)
             for n, g in ref["grad"].items():
                 coverage[n] = max(coverage[n], g.abs().max().item())

@@ -153,11 +153,10 @@ class EncoderConvModel(nn.Module):
         sample_size=2250,
         head_core=None,
     ) -> dict:
-        """{head: HeadOutput} of a batch of games. head_core: the per-head network (default self.head_core, eager);
-        the trainer passes its compiled copy of it for training updates only, and evaluation calls the eager module
-        (T-050). Preparation, sampling, the device moves, the safety checks and the unique step of the token
-        embedder run here, eager, around it."""
-        core = self.head_core if head_core is None else head_core
+        """{head: HeadOutput} of a batch of games. head_core: None (evaluation, --no-compile): the c7580b1 path. Else
+        a compiled copy of self.head_core, which the trainer passes for training updates only (T-050): the unique step
+        of the token embedder then runs here, eager, and head_core does the rest. Preparation, sampling, the device
+        moves and the safety checks run here, eager, on both paths."""
         (
             tensors_during,
             tensors_discard,
@@ -209,12 +208,18 @@ class EncoderConvModel(nn.Module):
             ), "Target action is masked out as invalid!"
             check_negative_targets(y_tensor)
 
-            # Step 1a: the unique (token, position) pairs of the history (eager: the output shape depends on the data)
-            unique_codes, inverse = self.token_embedder.unique_codes(encoding_tokens_batch)
-
-            # Steps 1b-6: the per-head network, through the loss
-            logits, loss = core(head, unique_codes, inverse, *state_obj_tensor_batch, action_mask_batch, y_tensor,
-                                padding_mask_batch)
+            if head_core is None:
+                # Step 1: Embed history tokens
+                history_emb = self.token_embedder(encoding_tokens_batch)  # (B, 150, EMBD_SIZE)
+                # Steps 2-6
+                logits, loss = self.head_network(head, history_emb, *state_obj_tensor_batch, action_mask_batch,
+                                                 y_tensor, padding_mask_batch)
+            else:
+                # Step 1a: the unique (token, position) pairs of the history, eager (the shape depends on the data);
+                # steps 1b-6 in head_core
+                unique_codes, inverse = self.token_embedder.unique_codes(encoding_tokens_batch)
+                logits, loss = head_core(head, unique_codes, inverse, *state_obj_tensor_batch, action_mask_batch,
+                                         y_tensor, padding_mask_batch)
 
             assert (
                 logits.shape == action_mask_batch.shape
@@ -227,10 +232,12 @@ class EncoderConvModel(nn.Module):
         """(masked logits (B, A), mean cross-entropy) of one head from the eager preparation: the unique history codes
         and their inverse (TokenEmbedder.unique_codes), the state tensors, the binary action mask, the targets and the
         padding mask. The function the trainer compiles (T-050): no tensor assert, check or raise in here (they run
-        eager in forward, before it), no data-dependent shape."""
-        # Step 1b: Embed history tokens
-        history_emb = self.token_embedder.embed_unique(unique_codes, inverse)  # (B, 150, EMBD_SIZE)
+        eager in forward, before it), no data-dependent shape. The same ops as the eager path."""
+        history_emb = self.token_embedder(unique=(unique_codes, inverse))  # Step 1b: (B, 150, EMBD_SIZE)
+        return self.head_network(head, history_emb, x1, x2, x3, action_mask_batch, y_tensor, padding_mask_batch)
 
+    def head_network(self, head, history_emb, x1, x2, x3, action_mask_batch, y_tensor, padding_mask_batch):
+        """Steps 2-6 of one head: (masked logits (B, A), mean cross-entropy) from the history embedding."""
         # Step 2: State embedding
         state_emb = self.state_net((x1, x2, x3))  # (B, EMBD_SIZE)
         state_emb = state_emb.unsqueeze(1)  # (B, 1, EMBD_SIZE)
@@ -315,7 +322,7 @@ class TokenEmbedder(nn.Module):
 
         return encoding.requires_grad_(False)  # Ensure non-trainable
 
-    def forward(self, encoding_tokens_batch: torch.tensor):
+    def forward(self, encoding_tokens_batch: torch.tensor = None, *, unique=None):
         """
         Converts encoding tokens to embeddings (no attention blocks).
 
@@ -327,11 +334,15 @@ class TokenEmbedder(nn.Module):
 
         Args:
             encoding_tokens_batch: (B, 150) tensor of encoding tokens
+            unique: instead of the tokens, unique_codes' output (unique codes, inverse) for them: only the embedding
+                step runs (the per-head network calls the module so, after the eager unique step: T-050)
 
         Returns:
             x: (B, 150, EMBD_SIZE) tensor of summed embeddings
         """
-        return self.embed_unique(*self.unique_codes(encoding_tokens_batch))  # (B, T, EMBD_SIZE)
+        if unique is None:
+            unique = self.unique_codes(encoding_tokens_batch)
+        return self.embed_unique(*unique)  # (B, T, EMBD_SIZE)
 
     def unique_codes(self, encoding_tokens_batch: torch.Tensor):
         """(unique codes (U,), inverse (B, T)) of the (token, position) pairs: the eager step of forward (its output
