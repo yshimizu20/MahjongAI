@@ -54,3 +54,13 @@ def make_wide_val_root(root: pathlib.Path) -> pathlib.Path:
 @pytest.fixture
 def wide_val_root(tmp_path) -> pathlib.Path:
     return make_wide_val_root(tmp_path / "data")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """A skipped test fails the run (T-050 G4: every test, the compile tests included, is mandatory; the CI runs
+    this suite): exit status 1 and the count, unless the run already failed."""
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    skipped = len(reporter.stats.get("skipped", [])) if reporter is not None else 0
+    if skipped and session.exitstatus == 0:
+        reporter.write_line(f"FAIL: {skipped} test(s) skipped; every test is mandatory (conftest.py)", red=True)
+        session.exitstatus = 1

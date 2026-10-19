@@ -45,4 +45,5 @@ jobs:
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
       run: |
-        cd MahjongAI/tests/; pytest
+        # -rs: the reason of any skip; conftest.py fails the run on a skip
+        cd MahjongAI/tests/; pytest -rs
