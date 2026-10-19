@@ -27,7 +27,16 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install flake8 pytest
+        # the Linux CPU wheel of the pinned torch (T-050: torch.compile tests), before requirements.txt pins it
+        pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - name: Show the torch build and the compiler toolchain
+      run: |
+        python -c "import torch; print(torch.__version__); print(torch.__config__.show())"
+        gcc --version
+        printf '#include <omp.h>\n#include <stdio.h>\nint main(){printf("OpenMP %%d threads\\n", omp_get_max_threads());return 0;}\n' > omp_check.c
+        gcc -fopenmp omp_check.c -o omp_check && ./omp_check
+        rm -f omp_check.c omp_check
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names

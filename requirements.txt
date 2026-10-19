@@ -1,5 +1,5 @@
 numpy
-torch
+torch==2.5.1  # exact pin (T-050): torch.compile output and the CI build; CI installs the CPU wheel first
 mahjong==2.0.0  # exact pin: a new release may reassign yaku ids / names (utils/mahjong_version.py, T-036)
 requests
 matplotlib  # run_report figure (plan T-005)
