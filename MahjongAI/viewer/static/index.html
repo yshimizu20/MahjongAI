@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mahjong game viewer</title>
+<link rel="stylesheet" href="tiles.css">
+</head>
+<body>
+<header id="controls">
+  <div class="group">
+    <label>日付 <input id="date" type="text" size="9" placeholder="20220101"></label>
+    <button id="list-games" title="list the games of that day">一覧</button>
+    <select id="game-select" title="game"><option value="">(game)</option></select>
+    <select id="fixture-select" title="sample and fixture logs"><option value="">(fixtures)</option></select>
+    <label class="file">JSON <input id="json-file" type="file" accept=".json,application/json"></label>
+  </div>
+  <div class="group">
+    <label>局 <select id="round-select"></select></label>
+    <button id="first" title="first point (Home)">⏮</button>
+    <button id="prev-discard" title="previous discard (↑)">◀◀</button>
+    <button id="prev" title="previous point (←)">◀</button>
+    <span id="step-label" class="mono">–</span>
+    <button id="next" title="next point (→)">▶</button>
+    <button id="next-discard" title="next discard (↓)">▶▶</button>
+    <button id="last" title="round result (End)">⏭</button>
+    <button id="play" title="play / pause (space)">▶ play</button>
+    <input id="speed" type="range" min="80" max="2000" step="20" value="500" title="ms per point">
+  </div>
+  <div class="group">
+    <label>視点 <select id="pov"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></label>
+    <label><input id="open-hands" type="checkbox" checked> 全員の手牌を公開</label>
+  </div>
+  <div id="status" class="status"></div>
+</header>
+<main id="layout">
+  <section id="table" class="table">
+    <div class="seat pos-0" data-pos="0"></div>
+    <div class="seat pos-1" data-pos="1"></div>
+    <div class="seat pos-2" data-pos="2"></div>
+    <div class="seat pos-3" data-pos="3"></div>
+    <div id="center" class="center"></div>
+    <div id="doras" class="doras"></div>
+  </section>
+  <aside id="panel" class="panel"><div class="hint">Pick a game: a day's list, a fixture, or an exported JSON file.</div></aside>
+</main>
+<script src="viewer.js"></script>
+</body>
+</html>
