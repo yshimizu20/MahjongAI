@@ -56,13 +56,13 @@ def test_kan_by_another_seat_still_asserts(monkeypatch):
         process(KAKAN)
     last = traceback.extract_tb(e.value.__traceback__)[-1]
     where = (os.path.basename(last.filename), last.name, last.lineno)
-    assert where == ("process_xml.py", "process", kan_label_assert_line())
+    assert where == ("process_xml.py", "_process_round", kan_label_assert_line())
 
 
 def kan_label_assert_line():
-    """1-based line of the ankan / kakan label assert in process_xml.process: the assert right after the reject call
+    """1-based line of the ankan / kakan label assert in process_xml._process_round: the assert right after the reject call
     in the `if naki.is_ankan() or naki.is_kakan():` arm."""
-    lines, start = inspect.getsourcelines(process_xml.process)
+    lines, start = inspect.getsourcelines(process_xml._process_round)
     i = next(k for k, line in enumerate(lines) if line.strip() == "if naki.is_ankan() or naki.is_kakan():")
     assert lines[i + 1].strip() == "_reject_after_own_discard(curr_halfturn, player)"
     assert lines[i + 2].strip() == "assert isinstance(curr_halfturn, DuringTurn) and curr_halfturn.player == player"
