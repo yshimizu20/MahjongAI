@@ -262,13 +262,14 @@ def check_game(game: dict, xr: list, all_halfturns: list, rounds_events: list, o
 
 
 def check_log(path: str, model=None, game: dict = None) -> dict:
-    """Export `path` (unless `game` is given) and run every check; returns the game."""
+    """Export `path` (unless `game` is given) and run every check; returns the game. A self-play game.log is parsed
+    with the admission filters off, as the exporter parses it."""
     if game is None:
         game = export.export_game(path, model)
     with open(path, "rb") as f:
         raw = f.read().decode("utf-8", "replace")
     xr = gates.xml_rounds(gates.kept_xml(raw)[0])
-    all_halfturns, _ = process(path)
+    all_halfturns, _ = process(path, admission=export.selfplay_meta(path) is None)
     _, rounds_events = _get_rounds(path)
     n = check_game(game, xr, all_halfturns, rounds_events)
     print(f"G2 ok: {game['source']}: {len(game['rounds'])} rounds, {n} steps, complete={game['complete']}")

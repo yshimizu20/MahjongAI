@@ -5,6 +5,12 @@ DISPLAY state: all four hands as 136-ids, ponds in discard order, melds, scores,
 halfturns give the MODEL state; the two streams are zipped decision point by decision point (the snapshot boundary
 table of the plan) and every deciding seat gets the model's masked distribution next to what happened.
 
+A self-play game (T-053: `game.log` beside the engine's `meta.json` + `decisions.json`) takes the sidecar instead:
+every decision shows the distribution of the seat's OWN player at play time (a model's softmax(logits / T), greedy's
+one-hot, uniform's flat), its choice, whether it was sampled and what the round did with it; the names are the
+`meta.json` seat labels. While a game plays, `export_live_round` exports the engine's own events with the same
+`export_round`, up to the last decision point whose outcome is final.
+
     python -m MahjongAI.viewer.export <log> --ckpt <pt> --out game.json
 """
 import argparse
@@ -15,7 +21,9 @@ from typing import Optional
 
 from MahjongAI.agents.encoder_conv import TransformerTensorProcessor
 from MahjongAI.draw import RED_CHI_VARIANT, Naki
-from MahjongAI.process_xml import InvalidGameException, _get_rounds, process
+from MahjongAI.engine.game import GO_TYPE
+from MahjongAI.gameinfo import GameInfo
+from MahjongAI.process_xml import InvalidGameException, _get_rounds, process, process_events
 from MahjongAI.turn import DiscardTurn, DuringTurn, HalfTurn, PostTurn
 from MahjongAI.utils.constants import REMAINING_TSUMO, TILE2IDX
 from MahjongAI.viewer import infer
@@ -254,12 +262,40 @@ def _actual(turn: HalfTurn, seat: int) -> dict:
     return {"status": "unknown", "action": None}
 
 
-def _decision(model, turn: HalfTurn, tokens: list, seat: int) -> dict:
+class Unsettled(Exception):
+    """A decision point whose outcome is not final yet (live mode) or a self-play decision without its record."""
+
+
+def _played(record: dict, head: str, legal: list) -> dict:
+    """The decision as the seat's own player made it, from its sidecar record [C11]: the play-time distribution
+    (`candidates`), the top action when it is unique, the choice, sampled or not, and what the round did with it."""
+    assert record["kind"] == head and record["offer"] == legal, (
+        f"sidecar record k={record['k']} ({record['kind']}, offer {record['offer']}) vs the parse ({head}, {legal})")
+    probs = {k: float(p) for k, p in record["candidates"].items()}
+    assert sorted(int(k) for k in probs) == legal, f"sidecar record k={record['k']}: candidates {sorted(probs)}"
+    best = max(probs.values())
+    tops = [int(k) for k, p in probs.items() if p == best]
+    return {"probs": probs, "model_top": action(head, tops[0]) if len(tops) == 1 else None,
+            "player": {"label": record["player"], "chosen": action(head, record["chosen"]),
+                       "sampled": bool(record["sampled"]), "resolved": record["resolved"]["outcome"]}}
+
+
+def _decision(model, turn: HalfTurn, tokens: list, seat: int, records: Optional[dict] = None,
+              index: Optional[int] = None) -> dict:
+    """records: the round's sidecar ((halfturn index, seat) -> record) of a self-play game, `index` the halfturn's
+    index: the decision then shows the seat's own player, never `model`; only a forced move may lack a record."""
     sample = infer.build_sample(turn, tokens, seat)
     assert sample is not None, f"seat {seat} has no decision at {turn!r}"
     legal = [int(i) for i in sample.mask[0].nonzero().flatten().tolist()]
     out = {"seat": seat, "head": sample.head, "legal": [action(sample.head, i) for i in legal],
            "logits": {}, "probs": {}, "model_top": None, "actual": _actual(turn, seat)}
+    if records is not None:
+        record = records.get((index, seat))
+        if record is not None and record["resolved"] is not None:
+            out.update(_played(record, sample.head, legal))
+            return out
+        if record is not None or len(legal) > 1:
+            raise Unsettled(f"seat {seat} at halfturn {index}: sidecar record {'unresolved' if record else 'missing'}")
     if len(legal) == 1:  # a forced move: no model call
         out["logits"], out["probs"] = {str(legal[0]): 0.0}, {str(legal[0]): 1.0}
         out["model_top"] = action(sample.head, legal[0])
@@ -326,70 +362,151 @@ def _next_turn(halfturns: list, hi: int, cls, seat: int) -> HalfTurn:
     return turn
 
 
-def export_round(events: list, halfturns: list, tokens: list, model) -> dict:
-    """One round: the display replay of `events` zipped with the parser's `halfturns`; both streams are consumed."""
+def export_round(events: list, halfturns: list, tokens: list, model, records: Optional[dict] = None,
+                 settled: Optional[int] = None) -> dict:
+    """One round: the display replay of `events` zipped with the parser's `halfturns`; both streams are consumed.
+    records: the round's self-play sidecar (`sidecar_by_round`). settled (live mode, an unfinished round): only the
+    decision points of the first `settled` halfturns whose records are resolved; the export stops at the first
+    other one, so it is a prefix of the round's final export."""
     assert events[0]["event"] == "INIT"
     table = TableState(events[0]["attr"])
     steps, results, hi = [], [], 0
 
     def step(kind, actor, turn):
+        index = len(steps)  # one step per halfturn, in order
+        if settled is not None and index >= settled:
+            raise Unsettled(f"halfturn {index} is the last one built")
         snap = table.snapshot(kind, actor)
-        snap["decisions"] = [_decision(model, turn, tokens, p) for p in infer.deciding_seats(turn)]
+        snap["decisions"] = [_decision(model, turn, tokens, p, records, index) for p in infer.deciding_seats(turn)]
         steps.append(snap)
 
-    for event in events[1:]:
-        tag, attr = event["event"], event["attr"]
-        if tag in ("AGARI", "RYUUKYOKU"):
-            results.append(_result(event))
-            continue
-        assert not results, f"event {tag} after the round's result"
-        if tag == "DORA":
-            table.dora(int(attr["hai"]))
-        elif tag == "REACH":
-            table.reach(int(attr["who"]), int(attr["step"]))
-        elif tag == "N":
-            seat, naki = int(attr["who"]), Naki(int(attr["m"]))
-            table.call(seat, naki)
-            if naki.is_kakan():
+    def done(round_results):
+        return {"index": table.round_index, "honba": events[0]["attr"]["seed"].split(",")[1],
+                "oya": table.oya, "steps": steps, "results": round_results}
+
+    try:
+        for event in events[1:]:
+            tag, attr = event["event"], event["attr"]
+            if tag in ("AGARI", "RYUUKYOKU"):
+                results.append(_result(event))
+                continue
+            assert not results, f"event {tag} after the round's result"
+            if tag == "DORA":
+                table.dora(int(attr["hai"]))
+            elif tag == "REACH":
+                table.reach(int(attr["who"]), int(attr["step"]))
+            elif tag == "N":
+                seat, naki = int(attr["who"]), Naki(int(attr["m"]))
+                table.call(seat, naki)
+                if naki.is_kakan():
+                    step("post", seat, _next_turn(halfturns, hi, PostTurn, seat))
+                    hi += 1
+            elif tag[0] in "TUVW":
+                seat, tile = "TUVW".index(tag[0]), int(tag[1:])
+                table.draw(seat, tile)
+                step("during", seat, _next_turn(halfturns, hi, DuringTurn, seat))
+                hi += 1
+            elif tag[0] in "DEFG":
+                seat, tile = "DEFG".index(tag[0]), int(tag[1:])
+                turn = _next_turn(halfturns, hi, DiscardTurn, seat)
+                assert turn.discarded_tile == tile, f"discard {tile} by {seat} vs {turn!r}"
+                step("discard", seat, turn)
+                hi += 1
+                table.discard(seat, tile)
                 step("post", seat, _next_turn(halfturns, hi, PostTurn, seat))
                 hi += 1
-        elif tag[0] in "TUVW":
-            seat, tile = "TUVW".index(tag[0]), int(tag[1:])
-            table.draw(seat, tile)
-            step("during", seat, _next_turn(halfturns, hi, DuringTurn, seat))
-            hi += 1
-        elif tag[0] in "DEFG":
-            seat, tile = "DEFG".index(tag[0]), int(tag[1:])
-            turn = _next_turn(halfturns, hi, DiscardTurn, seat)
-            assert turn.discarded_tile == tile, f"discard {tile} by {seat} vs {turn!r}"
-            step("discard", seat, turn)
-            hi += 1
-            table.discard(seat, tile)
-            step("post", seat, _next_turn(halfturns, hi, PostTurn, seat))
-            hi += 1
-        else:
-            raise ValueError(f"unknown event {tag}")
+            else:
+                raise ValueError(f"unknown event {tag}")
+    except Unsettled:
+        if settled is None:
+            raise
+        return done([])
+    if settled is not None:
+        return done([])
     assert hi == len(halfturns), f"{len(halfturns) - hi} parser halfturns not matched by the display replay"
-    return {"index": table.round_index, "honba": events[0]["attr"]["seed"].split(",")[1],
-            "oya": table.oya, "steps": steps, "results": results}
+    return done(results)
+
+
+def selfplay_meta(path: str) -> Optional[dict]:
+    """meta.json when `path` is a self-play game.log (engine/game.py GameRecord.save: meta.json with `generated` and
+    decisions.json beside it), else None."""
+    meta_path = os.path.join(os.path.dirname(os.path.abspath(path)), "meta.json")
+    if os.path.basename(path) != "game.log" or not os.path.isfile(meta_path):
+        return None
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    return meta if meta.get("generated") else None
+
+
+def selfplay_sidecar(path: str) -> Optional[tuple]:
+    """(meta, decisions) when `path` is a self-play game.log (`selfplay_meta`), else None."""
+    meta = selfplay_meta(path)
+    if meta is None:
+        return None
+    with open(os.path.join(os.path.dirname(os.path.abspath(path)), "decisions.json"), encoding="utf-8") as f:
+        return meta, json.load(f)
+
+
+def sidecar_by_round(decisions: list) -> dict:
+    """kyoku -> {(halfturn index, seat): record}; a key with two records raises."""
+    out = {}
+    for rec in decisions:
+        rnd = out.setdefault(rec["kyoku"], {})
+        key = (rec["halfturn"], rec["seat"])
+        assert key not in rnd, f"two sidecar records for round {rec['kyoku']} (halfturn, seat) {key}"
+        rnd[key] = rec
+    return out
+
+
+def export_live_round(events: list, decisions: list, finished: bool, model=None) -> dict:
+    """One round of a self-play game while it plays, from the engine's own events (Round.events as parser event
+    dicts) and its sidecar records so far: a finished round as `export_game` exports it from the saved log; an
+    unfinished one (process_events pending mode) up to its last settled point: the last halfturn the parser built
+    can still change (the call or ron that answers a discard, the action after a draw), so it is left out."""
+    gameinfo = GameInfo(GO_TYPE)
+    records = next(iter(sidecar_by_round(decisions).values()), {})
+    if finished:
+        halfturns, tokens = process_events(gameinfo, [events], admission=False)
+        return export_round(events, halfturns[0], tokens[0], model, records)
+    halfturns, tokens, due = process_events(gameinfo, [events], pending=True, admission=False)
+    assert due is not None, "an unfinished round with its result"
+    return export_round(events, halfturns[0], tokens[0], model, records, settled=max(0, len(halfturns[0]) - 1))
 
 
 def export_game(path: str, model) -> dict:
-    """The trajectory JSON of one log; raises InvalidGameException as `process` does."""
-    all_halfturns, all_tokens = process(path)
+    """The trajectory JSON of one log; raises InvalidGameException as `process` does. A self-play game.log takes its
+    sidecar (`selfplay_sidecar`): admission filters off, names from meta.json, decisions from the records."""
+    sidecar = selfplay_sidecar(path)
+    all_halfturns, all_tokens = process(path, admission=sidecar is None)
     gameinfo, rounds = _get_rounds(path)
     assert len(rounds) == len(all_halfturns), (len(rounds), len(all_halfturns))
     with open(path, "rb") as f:
         n_inits = f.read().count(b"<INIT ")
+    by_round = sidecar_by_round(sidecar[1]) if sidecar else {}
+    # the sidecar is keyed by kyoku (INIT ordinal), the rounds below by their kept index: equal only with no round cut
+    assert not (sidecar and n_inits != len(rounds)), f"a self-play game with {n_inits - len(rounds)} rounds dropped"
     out = {
-        "source": os.path.basename(path),
-        "players": _player_names(path),
+        "source": selfplay_source(path) if sidecar else os.path.basename(path),
+        "players": [s["label"] for s in sidecar[0]["seats"]] if sidecar else _player_names(path),
         "tonnan": bool(gameinfo.tonnan()),
         "complete": n_inits == len(rounds),
         "rounds_dropped": n_inits - len(rounds),
-        "rounds": [export_round(e, h, t, model) for e, h, t in zip(rounds, all_halfturns, all_tokens)],
+        "rounds": [export_round(e, h, t, model, by_round.get(i, {}) if sidecar else None)
+                   for i, (e, h, t) in enumerate(zip(rounds, all_halfturns, all_tokens))],
     }
+    if sidecar:
+        out["selfplay"] = selfplay_summary(sidecar[0])
     return out
+
+
+def selfplay_source(path: str) -> str:
+    """A self-play game's name: its folder (every game is a game.log)."""
+    return os.path.basename(os.path.dirname(os.path.abspath(path)))
+
+
+def selfplay_summary(meta: dict) -> dict:
+    return {"seed": meta["seed"], "temperature": meta["temperature"], "final_scores": meta.get("final_scores"),
+            "placements": meta.get("placements")}
 
 
 def main(argv=None) -> Optional[int]:

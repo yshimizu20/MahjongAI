@@ -180,3 +180,6 @@ task/
 
 # training runs (plan T-005): train.log, metrics.jsonl, checkpoints
 runs/
+
+# self-play games saved by the viewer (T-053)
+MahjongAI/viewer/selfplay_games/

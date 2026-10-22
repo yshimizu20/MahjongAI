@@ -31,6 +31,19 @@
     <label>視点 <select id="pov"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></label>
     <label><input id="open-hands" type="checkbox" checked> 全員の手牌を公開</label>
   </div>
+  <div class="group" id="selfplay">
+    <select id="selfplay-select" title="saved self-play games"><option value="">(self-play)</option></select>
+    <span title="new self-play game: the player of each seat">対局</span>
+    <select class="sp-seat" title="seat 0"><option>model</option><option>greedy</option><option>uniform</option></select>
+    <select class="sp-seat" title="seat 1"><option>model</option><option>greedy</option><option>uniform</option></select>
+    <select class="sp-seat" title="seat 2"><option>model</option><option>greedy</option><option>uniform</option></select>
+    <select class="sp-seat" title="seat 3"><option>model</option><option>greedy</option><option>uniform</option></select>
+    <input id="sp-ckpt" type="text" size="14" placeholder="ckpt (blank: server's)" title="checkpoint of the model seats">
+    <label>seed <input id="sp-seed" type="number" min="0" step="1" value="0"></label>
+    <label>T <input id="sp-temp" type="number" min="0" max="10" step="0.1" value="0"></label>
+    <button id="sp-start" title="start a self-play game">Start</button>
+    <label><input id="sp-follow" type="checkbox" checked> follow</label>
+  </div>
   <div id="status" class="status"></div>
 </header>
 <main id="layout">

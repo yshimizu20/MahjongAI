@@ -23,7 +23,7 @@ import subprocess
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from MahjongAI.gameinfo import GameInfo
 from MahjongAI.engine import scoring
@@ -106,15 +106,20 @@ class Game:
     """players[seat] plays seat `seat` for the whole game; `seed` fixes the walls (one random.Random stream) and
     is also what the players were reseeded with by the caller. meta.json carries `seats`: the complete player
     specification per seat (players.py `describe`: kind, checkpoint path + sha256, temperature, seed), which the
-    replay audit rebuilds exactly (players.from_description)."""
+    replay audit rebuilds exactly (players.from_description).
+    observer(rnd, finished): an optional progress hook (the viewer's live follow), called in the playing thread with
+    the round in play before every player call (finished=False: rnd.events / rnd.decisions so far) and once the
+    round's XML is final (finished=True, after the game's `owari` is set on the last round)."""
 
-    def __init__(self, players: Sequence, labels: Sequence[str], seed: int, temperature: float = 0.0):
+    def __init__(self, players: Sequence, labels: Sequence[str], seed: int, temperature: float = 0.0,
+                 observer: Optional[Callable[[Round, bool], None]] = None):
         assert len(players) == 4 and len(labels) == 4
         self.players = list(players)
         self.labels = list(labels)
         self.seed = int(seed)
         self.temperature = temperature
         self.gameinfo = GameInfo(GO_TYPE)
+        self.observer = observer
 
     def play(self) -> GameRecord:
         t0 = time.perf_counter()
@@ -136,6 +141,8 @@ class Game:
                 final = final_scores(outcome.scores, outcome.kyotaku)
                 rnd.events[-1][1]["owari"] = scoring.owari_attr(final)
             rounds_xml.append(rnd.xml())
+            if self.observer is not None:
+                self.observer(rnd, True)
             spec = nxt
         xml = header(self.labels, self.seed) + "".join(rounds_xml) + "</mjloggm>"
         meta = {"generated": True, "engine": "MahjongAI.engine (T-053)", "players": self.labels, "seed": self.seed,
@@ -151,6 +158,8 @@ class Game:
         try:
             point = next(gen)
             while True:
+                if self.observer is not None:
+                    self.observer(rnd, False)
                 choice = self.players[point.seat](point.halfturn, point.tokens, point.seat)
                 point = gen.send(choice)
         except StopIteration as stop:

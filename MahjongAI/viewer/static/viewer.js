@@ -1,6 +1,10 @@
 /* Game viewer (T-052): renders one trajectory JSON (viewer/export.py) step by step. Vanilla JS, no build step.
    The reducer (`reduce`) is pure: (view, action) -> view; `render` draws a view. Every string from a game reaches
-   the DOM as a text node (never innerHTML), and a game is validated (`validateGame`) before it is shown. */
+   the DOM as a text node (never innerHTML), and a game is validated (`validateGame`) before it is shown.
+   Self-play (T-053): the page starts a game (POST /api/selfplay), polls its new decision points every second and
+   merges them into the same trajectory shape (`mergeLive`, pure), so the live game is drawn by the same `render`;
+   with "follow" the cursor moves to the newest point. A self-play decision carries `player`: the seat's own
+   player, its play-time distribution (`probs`) and its choice. */
 "use strict";
 
 const KIND_FILE = [].concat(
@@ -104,6 +108,10 @@ function validateGame(game) {
         obj(d.actual, `${dp}.actual`);
         if (!["executed", "observed_pass", "unknown"].includes(d.actual.status)) bad(`${dp}.actual.status`, "is not a status");
         if (d.actual.action !== null) act(d.actual.action, `${dp}.actual.action`);
+        if (d.player !== undefined) {
+          obj(d.player, `${dp}.player`); str(d.player.label, `${dp}.player.label`); act(d.player.chosen, `${dp}.player.chosen`);
+          bool(d.player.sampled, `${dp}.player.sampled`); str(d.player.resolved, `${dp}.player.resolved`);
+        }
       });
     });
     arr(r.results, `${rp}.results`).forEach((x, xi) => {
@@ -133,30 +141,34 @@ const view = { game: null, round: 0, step: 0, pov: 0, open: true, playing: false
 let timer = null;
 
 function stepsOf(v) { return v.game ? v.game.rounds[v.round].steps : []; }
-function clampStep(v, s) { return Math.max(0, Math.min(stepsOf(v).length, s)); }  // steps.length = the result view
+// the last position of a round: steps.length is its result view; a round without a result (in play) ends at its last step
+function endOf(r) { return r.results.length ? r.steps.length : r.steps.length - 1; }
+function clampStep(v, s) { return v.game ? Math.max(0, Math.min(endOf(v.game.rounds[v.round]), s)) : 0; }
 
 function reduce(v, a) {
   const n = Object.assign({}, v);
   switch (a.type) {
     case "load": n.game = a.game; n.round = 0; n.step = 0; n.playing = false; break;
+    case "update": n.game = a.game; n.round = Math.min(n.round, a.game.rounds.length - 1); n.step = clampStep(n, n.step); break;
+    case "goto": n.round = Math.max(0, Math.min(n.game.rounds.length - 1, a.round)); n.step = clampStep(n, a.step); break;
     case "round": n.round = Math.max(0, Math.min(n.game.rounds.length - 1, a.round)); n.step = 0; break;
     case "step": n.step = clampStep(n, a.step); break;
     case "next": {
-      if (n.step < stepsOf(n).length) n.step += 1;
+      if (n.step < endOf(n.game.rounds[n.round])) n.step += 1;
       else if (n.round < n.game.rounds.length - 1) { n.round += 1; n.step = 0; }
       else n.playing = false;
       break;
     }
     case "prev": {
       if (n.step > 0) n.step -= 1;
-      else if (n.round > 0) { n.round -= 1; n.step = stepsOf(n).length; }
+      else if (n.round > 0) { n.round -= 1; n.step = endOf(n.game.rounds[n.round]); }
       break;
     }
     case "nextDiscard": {
       const s = stepsOf(n);
       let i = n.step + 1;
       while (i < s.length && s[i].kind !== "discard") i += 1;
-      n.step = Math.min(i, s.length);
+      n.step = clampStep(n, i);
       break;
     }
     case "prevDiscard": {
@@ -248,6 +260,11 @@ function renderPond(pond) {
   return p;
 }
 
+function pickOf(d) {  // the deciding player's choice: a self-play seat's own pick, else the viewer model's top
+  if (d.player) return d.player.chosen.idx;
+  return d.model_top ? d.model_top.idx : null;
+}
+
 function discardDecision(step, seat) {
   return step.decisions.find((d) => d.seat === seat && d.head === "discard") || null;
 }
@@ -260,7 +277,7 @@ function renderHandRow(v, g, step, seat, isPov, results) {
   const open = v.open || isPov || !!results;
   const drawn = step.drawn && step.drawn.seat === seat ? step.drawn.tile : null;
   const dec = open ? discardDecision(step, seat) : null;
-  const top = dec && dec.model_top ? dec.model_top.idx : null;
+  const top = dec ? pickOf(dec) : null;
   const actual = dec && dec.actual.action ? dec.actual.action.idx : null;
   const tiles = step.hands[seat].filter((t) => t !== drawn);
   const place = (id, parent) => {
@@ -326,9 +343,10 @@ function renderPanel(v, g, step, results) {
 }
 
 function matchMark(d) {
-  if (!d.model_top || d.actual.status === "unknown") return null;
+  const pick = pickOf(d);
+  if (pick === null || d.actual.status === "unknown") return null;
   const actualIdx = d.actual.action ? d.actual.action.idx : 0;  // observed pass = index 0 on during / post
-  return d.model_top.idx === actualIdx;
+  return pick === actualIdx;
 }
 
 function renderDecision(d, g, step) {
@@ -340,7 +358,7 @@ function renderDecision(d, g, step) {
   const rows = d.legal.map((a) => ({ a, p: d.probs[String(a.idx)] || 0, logit: d.logits[String(a.idx)] }))
     .sort((x, y) => y.p - x.p);
   const bars = el("div", "bars");
-  const top = d.model_top ? d.model_top.idx : null;
+  const top = pickOf(d);
   const actual = d.actual.action ? d.actual.action.idx : (d.actual.status === "observed_pass" ? 0 : null);
   const show = rows.slice(0, 5);
   const other = rows.slice(5).reduce((s, r) => s + r.p, 0);
@@ -364,8 +382,14 @@ function renderDecision(d, g, step) {
   box.appendChild(bars);
   const verdict = el("div", "verdict");
   const forced = d.legal.length === 1;
-  verdict.appendChild(el("span", "", forced ? "forced: " : "model: "));
-  verdict.appendChild(el("span", "model", d.model_top ? d.model_top.name : "(no model)"));
+  if (d.player) {  // self-play: the seat's own player chose; its distribution is the bars
+    verdict.appendChild(el("span", "player", `${forced ? "forced" : d.player.label}: `));
+    verdict.appendChild(el("span", "model", d.player.chosen.name + (d.player.sampled ? " (sampled)" : "")));
+    if (d.player.resolved === "preempted") verdict.appendChild(el("span", "", "(pre-empted)"));
+  } else {
+    verdict.appendChild(el("span", "", forced ? "forced: " : "model: "));
+    verdict.appendChild(el("span", "model", d.model_top ? d.model_top.name : "(no model)"));
+  }
   verdict.appendChild(el("span", "", "· log: "));
   const actualText = d.actual.status === "executed" ? d.actual.action.name
     : d.actual.status === "observed_pass" ? "pass" : "? (pre-empted)";
@@ -496,6 +520,111 @@ async function listGames() {
   }
 }
 
+/* ---- self-play: start, poll, merge ---- */
+// mergeLive(game, snap): the trajectory after one poll. snap.steps are the decision points from the page's count on,
+// each {round, step}; snap.total the game's count; snap.rounds the headers of every round so far. Pure; a gap or an
+// overlap between polls (the page's count + the new points != the game's) throws.
+function mergeLive(game, snap) {
+  const have = game.rounds.reduce((n, r) => n + r.steps.length, 0);
+  if (have + snap.steps.length !== snap.total) {
+    throw new Error(`self-play poll: the page has ${have} points + ${snap.steps.length} new, the game ${snap.total}`);
+  }
+  const rounds = snap.rounds.map((h, i) => ({ index: h.index, honba: h.honba, oya: h.oya, results: h.results,
+    steps: game.rounds[i] ? game.rounds[i].steps.slice() : [] }));
+  snap.steps.forEach(({ round, step }) => rounds[round].steps.push(step));
+  return Object.assign({}, game, { source: snap.source, players: snap.players, rounds, complete: snap.status === "done" });
+}
+
+// the part of a live game the table can show: every round with a decision point (the round just dealt has none yet)
+function shownPart(game) {
+  const rounds = game.rounds.filter((r) => r.steps.length > 0);
+  return rounds.length === game.rounds.length ? game : Object.assign({}, game, { rounds });
+}
+
+// followTarget(game, finishedBefore): where "follow" goes in the shown part of a live game. A round that finished since
+// the last poll (more rounds with a result than finishedBefore): the last such round's result view, so a follower sees
+// it before the next round's points; else the last position of the last round (its result once the game is over).
+function followTarget(game, finishedBefore) {
+  const finished = game.rounds.filter((r) => r.results.length > 0);
+  const r = finished.length > finishedBefore ? finished[finished.length - 1] : game.rounds[game.rounds.length - 1];
+  return { round: game.rounds.indexOf(r), step: endOf(r) };
+}
+
+function finishedRounds(game) { return game.rounds.filter((r) => r.results.length > 0).length; }
+
+const live = { id: null, gen: -1, game: null, status: null };
+
+function liveSeats() {
+  const ckpt = document.getElementById("sp-ckpt").value.trim();
+  return Array.from(document.querySelectorAll(".sp-seat")).map((sel) => (sel.value === "model" && ckpt ? `model:${ckpt}` : sel.value));
+}
+
+async function startSelfplay() {
+  const body = { seats: liveSeats(), seed: Number(document.getElementById("sp-seed").value),
+    temperature: Number(document.getElementById("sp-temp").value) };
+  let id;
+  try {
+    const r = await fetch("/api/selfplay", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const answer = await r.json();
+    if (!r.ok) throw new Error(answer.error || `${r.status}`);
+    id = answer.id;
+  } catch (e) {
+    setStatus(`error: ${e.message}`, true);
+    return;
+  }
+  setPlaying(false);
+  const gen = beginLoad();  // a game picked later supersedes the live one (its polls stop)
+  Object.assign(live, { id, gen, status: "queued",
+    game: { source: id, players: body.seats, tonnan: true, complete: false, rounds_dropped: 0, rounds: [] } });
+  setStatus(`self-play ${id}: queued`);
+  pollSelfplay(gen);
+}
+
+async function pollSelfplay(gen) {
+  if (gen !== loadGen) return;
+  let snap;
+  try {
+    const since = live.game.rounds.reduce((n, r) => n + r.steps.length, 0);
+    snap = await fetchJson(`/api/selfplay/${encodeURIComponent(live.id)}?since=${since}`);
+    if (gen !== loadGen) return;
+    const finishedBefore = finishedRounds(live.game);
+    live.game = mergeLive(live.game, snap);
+    live.status = snap.status;
+    showLive(finishedBefore);
+  } catch (e) {
+    if (gen === loadGen) setStatus(`self-play ${live.id}: error: ${e.message}`, true);
+    return;
+  }
+  const points = live.game.rounds.reduce((n, r) => n + r.steps.length, 0);
+  if (snap.status === "queued" || snap.status === "running") {
+    setStatus(`self-play ${live.id}: ${snap.status} · ${points} points · ${live.game.rounds.length} rounds`);
+    setTimeout(() => pollSelfplay(gen), 1000);
+  } else if (snap.status === "done") {
+    setStatus(`self-play ${live.id}: done · ${points} points · saved ${snap.path}`);
+    listSelfplay();
+  } else {
+    setStatus(`self-play ${live.id}: ${snap.status}: ${snap.error}`, true);
+  }
+}
+
+function showLive(finishedBefore) {
+  const game = shownPart(live.game);
+  if (!game.rounds.length) return;
+  validateGame(game);
+  const follow = document.getElementById("sp-follow").checked;
+  dispatch({ type: view.game && view.game.source === game.source ? "update" : "load", game });
+  if (follow) dispatch(Object.assign({ type: "goto" }, followTarget(game, finishedBefore)));
+}
+
+async function listSelfplay() {
+  try {
+    const body = await fetchJson("/api/selfplay");
+    fillSelect(document.getElementById("selfplay-select"), body.games);
+  } catch (e) {
+    /* self-play off on this server: the picker stays empty */
+  }
+}
+
 function setPlaying(on) {
   dispatch({ type: "play", playing: on });
   if (timer) { clearInterval(timer); timer = null; }
@@ -514,6 +643,8 @@ function bind() {
   $("date").onkeydown = (e) => { if (e.key === "Enter") listGames(); };
   $("game-select").onchange = (e) => loadGamePath(e.target.value);
   $("fixture-select").onchange = (e) => loadGamePath(e.target.value);
+  $("selfplay-select").onchange = (e) => loadGamePath(e.target.value);
+  $("sp-start").onclick = startSelfplay;
   $("json-file").onchange = (e) => { if (e.target.files[0]) loadJsonFile(e.target.files[0]); };
   $("round-select").onchange = (e) => dispatch({ type: "round", round: Number(e.target.value) });
   $("first").onclick = () => dispatch({ type: "step", step: 0 });
@@ -535,11 +666,14 @@ function bind() {
     else if (e.key === "End") dispatch({ type: "step", step: Infinity });
   });
   fetchJson("/api/fixtures").then((b) => fillSelect($("fixture-select"), b.games)).catch(() => {});
+  listSelfplay();
 }
 
 if (typeof window !== "undefined" && typeof document !== "undefined" && document.getElementById("table")) {
   bind();
   render(view);
-  window.viewerState = () => ({ source: view.game ? view.game.source : null, round: view.round, step: view.step, loadGen });
+  window.viewerState = () => ({ source: view.game ? view.game.source : null, round: view.round, step: view.step, loadGen,
+    live: live.id, liveStatus: live.status });
+  window.viewerGame = () => view.game;
 }
-if (typeof module !== "undefined") module.exports = { reduce, tileFile, tileName, slotOf, matchMark, validateGame };
+if (typeof module !== "undefined") module.exports = { reduce, tileFile, tileName, slotOf, matchMark, validateGame, mergeLive, shownPart, followTarget };

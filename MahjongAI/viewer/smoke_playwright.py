@@ -5,7 +5,12 @@ kan-dora fixture, steps forward through every decision point of every round (to 
 back, changes round, rotates the POV, toggles the hands, loads an exported JSON file, curls each API route, and
 asserts 0 console / page errors and every tile image loaded. Also: a rapid A-then-B game switch keeps B (R3), two
 nine-round games relabel the round picker (R4), an imported JSON with hostile strings renders them as text (R1), an
-invalid JSON is refused with its field path, and a malformed log is a JSON 400 (R9). Screenshots go to --shots.
+invalid JSON is refused with its field path, and a malformed log is a JSON 400 (R9). T-053: a self-play game started
+from the page's form (model x2 + greedy + uniform; greedy / uniform x2 without --ckpt) is followed live (the step label
+advances while it plays; a result view shows only for a finished round, and follow shows at least one finished
+round's result during play and the last one at the end), stepped back and forth after it ends, equals the saved
+game's /api/game export, and is listed under self-play; the game is saved under <shots>/selfplay. Screenshots go to
+--shots.
 
     python -m MahjongAI.viewer.smoke_playwright [--ckpt pt] [--port 8766] [--shots dir] [--data-root dir]
 """
@@ -16,6 +21,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -109,13 +115,85 @@ def api_error(base: str, path: str) -> tuple:
     raise AssertionError(f"{path} was served")
 
 
+def selfplay_scenario(page, base: str, shots: str, has_ckpt: bool, log) -> dict:
+    """Start a game from the form, follow it live, step it after the end; returns what was seen."""
+    seats = ["model", "model", "greedy", "uniform"] if has_ckpt else ["greedy", "uniform", "greedy", "uniform"]
+    for i, kind in enumerate(seats):
+        page.select_option(f".sp-seat >> nth={i}", kind)
+    page.fill("#sp-seed", "7")
+    page.fill("#sp-temp", "0")
+    page.check("#sp-follow")
+    t0 = time.perf_counter()
+    page.click("#sp-start")
+    seen = []  # (round, step label) each time it changed while the game was running
+    results_seen = set()  # rounds whose result view follow showed during play
+    state = page.evaluate("window.viewerState()")
+    while time.perf_counter() - t0 < 600:
+        state = page.evaluate("window.viewerState()")
+        if state["liveStatus"] in ("done", "error"):
+            break
+        if state["liveStatus"] == "running" and state["source"] == state["live"]:
+            here = (state["round"], step_label(page))
+            if here[1].startswith("結果"):  # a result view: only for a round that has its result
+                n_results = page.evaluate(f"window.viewerGame().rounds[{here[0]}].results.length")
+                assert n_results > 0, f"result view of round {here[0]} in play, without a result: {here}"
+                results_seen.add(here[0])
+            if not seen or seen[-1] != here:
+                seen.append(here)
+                if len(seen) == 2:
+                    page.screenshot(path=os.path.join(shots, "selfplay_live.png"))
+        page.wait_for_timeout(250)
+    wall = time.perf_counter() - t0
+    assert state["liveStatus"] == "done", (state, status(page))
+    assert len(seen) >= 3, f"the step label advanced {len(seen) - 1} times during play: {seen}"
+    assert results_seen, f"follow never showed a finished round's result during play: {seen}"
+    log(f"  self-play {state['live']} ({', '.join(seats)}): done in {wall:.1f} s; followed live, the step label "
+        f"advanced {len(seen) - 1} times during play: {seen[0]} -> {seen[-1]}; finished rounds whose result "
+        f"follow showed during play: {sorted(results_seen)}")
+    game_id = state["live"]
+    end = (state["round"], step_label(page))
+    assert end[1].startswith("結果"), f"follow did not end on the last round's result: {end}"
+    for _ in range(12):
+        page.click("#prev")
+    back = (page.evaluate("window.viewerState()")["round"], step_label(page))
+    assert back != end, (back, end)
+    for _ in range(12):
+        page.click("#next")
+    assert (page.evaluate("window.viewerState()")["round"], step_label(page)) == end, step_label(page)
+    page.select_option("#round-select", "0")
+    page.keyboard.press("End")
+    assert step_label(page).startswith("結果"), step_label(page)
+    page.keyboard.press("Home")
+    assert step_label(page).startswith("1 /"), step_label(page)
+    page.screenshot(path=os.path.join(shots, "selfplay_after_end.png"))
+    log(f"  self-play after the end: back 12 to {back}, forward 12 to {end}, round 0 result and first point")
+    live_rounds = json.loads(page.evaluate("JSON.stringify(window.viewerGame().rounds)"))
+    snap = json.load(urllib.request.urlopen(f"{base}/api/selfplay/{game_id}?since=0"))
+    with urllib.request.urlopen(f"{base}/api/game?path={urllib.request.quote(snap['path'])}") as r:
+        saved = json.load(r)
+    assert live_rounds == saved["rounds"], "the live game differs from the saved game's export"
+    n_steps = sum(len(r["steps"]) for r in saved["rounds"])
+    log(f"  self-play live game == /api/game export of {snap['path']}: {len(saved['rounds'])} rounds, "
+        f"{n_steps} decision points")
+    page.wait_for_function("document.querySelectorAll('#selfplay-select option').length > 1")
+    page.select_option("#selfplay-select", snap["path"])
+    page.wait_for_function(f"document.querySelector('#status').textContent.startsWith({json.dumps(game_id)})")
+    for _ in range(5):
+        page.click("#next")
+    assert step_label(page).startswith("6 /"), step_label(page)
+    log(f"  self-play picker: {game_id} reloaded from disk and stepped")
+    return {"selfplay_wall_s": wall, "selfplay_labels": len(seen), "selfplay_steps": n_steps}
+
+
 def run(port: int, ckpt: str, shots: str, data_root: str = server.DEFAULT_DATA_ROOT, log=print) -> dict:
     from playwright.sync_api import sync_playwright
 
     os.makedirs(shots, exist_ok=True)
     model = infer.load_model(ckpt) if ckpt else None
     tmp = tempfile.mkdtemp()
-    httpd = server.make_server(model, data_root, port, extra_roots=(tmp,))
+    # the followed self-play game is kept next to the screenshots
+    httpd = server.make_server(model, data_root, port, extra_roots=(tmp,), selfplay_dir=os.path.join(shots, "selfplay"),
+                               ckpt=ckpt)
     store = httpd.RequestHandlerClass.keywords["store"]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -257,6 +335,8 @@ def run(port: int, ckpt: str, shots: str, data_root: str = server.DEFAULT_DATA_R
             assert HOSTILE + " yaku" in page.text_content("#panel .result"), page.text_content("#panel .result")
             assert page.evaluate("window.__pwned") is None
             log("  hostile JSON: reason, name, yaku and limit rendered as text; window.__pwned undefined")
+
+            report.update(selfplay_scenario(page, base, shots, bool(ckpt), log))
 
             n_img, n_bad = images_loaded(page)
             report.update({"images": n_img, "images_not_loaded": n_bad})
