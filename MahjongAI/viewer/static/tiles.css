@@ -19,6 +19,8 @@ html, body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1
 #controls button.on { background: var(--accent); color: #000; }
 #controls select, #controls input[type=text] { background: #1b1e22; color: var(--ink); border: 1px solid #555; border-radius: 4px; padding: 3px 4px; max-width: 260px; }
 #controls label.file input { width: 180px; }
+#controls input[type=number] { width: 5em; background: #1b1e22; color: var(--ink); border: 1px solid #555; border-radius: 4px; padding: 3px 4px; }
+.verdict .player { color: var(--model); }
 .mono { font-family: ui-monospace, Menlo, monospace; min-width: 9ch; text-align: center; display: inline-block; }
 .status { color: #f0b; min-height: 1em; }
 .status.err { color: #ff6b6b; }

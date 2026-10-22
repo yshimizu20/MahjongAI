@@ -24,6 +24,23 @@ python -m MahjongAI.viewer.server --ckpt task/plans/T-051-long-run/run/checkpoin
 - **Controls.** ← → one decision point, ↑ ↓ one discard, space play / pause (speed slider), Home / End; 局 picks the
   round; the last position of a round is its result (winner, yaku, score deltas).
 
+- **Self-play (T-053).** The 対局 row starts a game between four players: pick `model` (the server's `--ckpt`, or
+  the checkpoint typed in the ckpt box: it must be in `--ckpt`'s directory or under a `--ckpt-root <dir>`),
+  `greedy` (shanten-greedy, never calls) or `uniform` per seat, a seed and a temperature T (0 = argmax), then Start.
+  With `follow` on, the table jumps to each new decision point as it is played (the finished rounds plus the round
+  in play; a round that just finished shows its result until the next poll); after the end, step it with the
+  controls above like a log. At a self-play decision the panel shows that seat's own player: its distribution at
+  play time (the model's softmax(logits / T) at T > 0, softmax(logits) at T = 0 where it plays the argmax;
+  greedy's one-hot; uniform's flat), its choice (`(sampled)` for a model seat at T > 0 and for a uniform seat at
+  every T) and `(pre-empted)` when a higher-priority call won. Every finished game is saved to `--selfplay-dir`
+  (default `MahjongAI/viewer/selfplay_games/`, git-ignored) as `<time>_<seed>/` (`game.log` + `decisions.json` +
+  `meta.json`) and listed in the `(self-play)` picker, also after a server restart; a game that fails leaves
+  `error.json` in its folder instead and is not listed. API: `POST /api/selfplay
+  {"seats": ["model", "model", "greedy", "uniform"], "seed": 7, "temperature": 0}`, then
+  `GET /api/selfplay/<id>?since=<k>`; `GET /api/selfplay` lists the saved games. Many games without the page:
+  `python -m MahjongAI.engine.match --seats model:<pt> greedy model:<pt> greedy --games 20 --out-dir <dir>`
+  (four space-separated specs; `--workers N` for N processes).
+
 Checks: `python -m MahjongAI.viewer.viewer_lib --test` (display-state invariants: hand counts, tile ownership, the
 gates replay, logged actions, pond order / flags / callers; every corruption raises in the check it names);
 `python -m MahjongAI.viewer.viewer_lib --parity --ckpt <pt> <log>...` (the viewer's per-sample inference equals the

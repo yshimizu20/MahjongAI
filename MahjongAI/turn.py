@@ -50,7 +50,7 @@ class DiscardTurn(HalfTurn):
         self,
         player: int,
         stateObj: StateObject,
-        discarded_tile: int,  # 0-135
+        discarded_tile: Optional[int],  # 0-135; None for a pending discard (process_xml.process_events)
         encoding_idx: int,
         is_riichi_declaration: bool = False,
         after_call: Optional[Naki] = None,

@@ -1399,12 +1399,13 @@ def auto_play_runs(raw: str) -> list:
     return best
 
 
-def count_game(path, H, T, C, tp):
+def count_game(path, H, T, C, tp, admission=True):
     """Add every counter of one parsed game (H = halfturns per round, T = tokens per round) to C. A game with a <BYE>
-    is counted on its kept part only (kept_xml, T-044)."""
+    is counted on its kept part only (kept_xml, T-044). admission=False (a generated game, T-053): the parser did not
+    apply the admission filter, so the auto-play oracle does not count."""
     raw, truncated = kept_xml(open(path, "rb").read().decode("utf-8", "ignore"))
     C["bye_truncated_games"] += int(truncated)
-    if max(auto_play_runs(raw)) >= AUTO_PLAY_RUN_ORACLE:  # T-043: the parser must have rejected this game
+    if admission and max(auto_play_runs(raw)) >= AUTO_PLAY_RUN_ORACLE:  # T-043: the parser must have rejected this game
         C["auto_played_accepted"] += 1
     ag = re.findall(r'<AGARI [^>]*?who="(\d)"[^>]*?fromWho="(\d)"', raw)
     C["xml_tsumo"] += sum(1 for w, fw in ag if w == fw)
@@ -1657,12 +1658,13 @@ def index_checks(C):
     C["index_spill_into_pon"] += sum(1 for k, v in idx_map.items() if 83 <= k <= 119 and any(x[0] == "chi" for x in v))
 
 
-def run(files, tp=None):
+def run(files, tp=None, admission=True):
+    """admission=False: generated games (T-053), parsed without the Tenhou admission filter."""
     tp = tp or TransformerTensorProcessor()
     C = collections.Counter()
     for f in files:
         try:
-            H, T = process(f)
+            H, T = process(f, admission=admission)
         except InvalidGameException as e:
             C["skipped_invalid"] += 1
             if e.msg == "North round":  # 0 in 2.2M games: name the file, never hide it in skipped_invalid
@@ -1682,7 +1684,7 @@ def run(files, tp=None):
             print(f"parse error in {f}: {type(e).__name__}: {str(e)[:200]}")
             continue
         C["games"] += 1
-        count_game(f, H, T, C, tp)
+        count_game(f, H, T, C, tp, admission)
     index_checks(C)
     return C
 
@@ -2530,7 +2532,7 @@ def self_test():
         def patched(melds):
             loc = sys._getframe(1).f_locals
             ev = loc.get("eventtype", "")
-            here = ev and ev[0] in "TUVW" and (len(loc["all_halfturns"]), loc["remaining_tsumo"]) == target
+            here = ev and ev[0] in "TUVW" and (loc["round_index"], loc["remaining_tsumo"]) == target
             return fake if here else kans_on_table(melds)
         return patched
 
@@ -3086,7 +3088,7 @@ def self_test():
         ron, parse = sys._getframe(1), sys._getframe(2)
         rnd, i, seat = DECLINED_MULTI_YAKU
         if (ron.f_code.co_name == "evaluate_ron" and ron.f_locals.get("p") == seat
-                and len(parse.f_locals.get("all_halfturns", ())) == rnd and len(parse.f_locals.get("halfturns", ())) == i):
+                and parse.f_locals.get("round_index") == rnd and len(parse.f_locals.get("halfturns", ())) == i):
             assert out is not None and len(out) >= 2, out
             seen["dropped"] = out
             return out[:-1]
