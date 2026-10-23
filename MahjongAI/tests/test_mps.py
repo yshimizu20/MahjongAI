@@ -9,8 +9,10 @@ its gradient is zero by math and both devices give rounding noise (~1e-11) whose
 Eval: the val rows of an MPS run (computed on the trainer's CPU copy) equal a CPU model's val of the same weights.
 Resume [R6]: an MPS positions-mode run with dropout on, killed after an eval row and resumed. Its data path (read
 and sample hashes, loader and batcher states, RNG states, row counters) equals the unbroken MPS run exactly; its
-weights and val CE are within 10 x the measured run-to-run noise of two unbroken MPS runs (nn.Embedding backward on
-MPS is not deterministic on torch 2.5.1). A resume without the optimizer state or the MPS RNG state must fail that.
+checkpoints are compared in full: the same keys at every level, every value exact except the weights, the Adam moments
+and the train loss sums, which (with the val CE) are within 10 x the measured run-to-run noise of two unbroken MPS runs
+(nn.Embedding backward on MPS is not deterministic on torch 2.5.1). A resume without the optimizer state or the MPS RNG
+state, and a final checkpoint without its optimizer state or prior, with wrong Adam moments or train sums, must fail.
 Load [R14]: an MPS checkpoint loads on the CPU in the viewer (infer.load_model) and the self-play player
 (ModelPlayer); their logits equal the CPU model of the same weights."""
 import glob
@@ -18,6 +20,7 @@ import json
 import math
 import os
 import re
+import shutil
 
 import pytest
 import torch
@@ -135,9 +138,13 @@ def mps_root(tmp_path_factory):
 
 # MPS backward (nn.Embedding) is not deterministic on torch 2.5.1; user decision 2026-10-22: tolerance vs the
 # measured run-to-run noise. Two unbroken MPS runs differ by ~1e-8 after one step, so a resumed MPS run is held to
-# NOISE_TIMES x the unbroken-vs-unbroken difference at the same step (plus an absolute floor); its data path and RNG
-# states stay exact.
-NOISE_TIMES, WEIGHT_FLOOR, CE_FLOOR = 10, 1e-6, 1e-5
+# NOISE_TIMES x the unbroken-vs-unbroken difference at the same step (plus an absolute floor) for the values MPS
+# training moves (weights, Adam moments, train loss sums, val CE); every other checkpoint value is exact.
+# The floors are each quantity's float32 rounding scale (a draw where the two unbroken runs agree exactly must not
+# fail a resume). Measured noise at step 12: weight 1.5e-6, exp_avg 9.3e-9, exp_avg_sq 2.9e-11, train loss sums 0
+# (steps 4 and 8: sums of ~1e3; one float32 ulp of a batch loss x its rows is ~1e-4).
+NOISE_TIMES, CE_FLOOR = 10, 1e-5
+FLOORS = {"weight": 1e-6, "exp_avg": 1e-7, "exp_avg_sq": 1e-10, "train_loss": 1e-3}
 
 
 def _kill_and_resume(tmp_path, mp, root, name, patch=None):
@@ -174,23 +181,73 @@ def mps_runs(tmp_path_factory, mps_root):
     return tmp_path
 
 
-def run_diffs(root, x, y, step=12) -> dict:
-    """Run x vs run y at `step`: max |weight diff| (step_<step>.pt) and per-head |val CE diff| (row <step>)."""
-    sx, sy = (torch.load(root / r / "checkpoints" / f"step_{step}.pt", map_location="cpu",
-                         weights_only=True)["model_state_dict"] for r in (x, y))
-    rx, ry = ({r["step"]: r for r in SL.Metrics(str(root / name / "metrics.jsonl")).read()[1]}[step]
-              for name in (x, y))
-    for name, weights, row in ((x, sx, rx), (y, sy, ry)):
-        assert_finite(f"weight in {name}/step_{step}.pt", weights.items())
-        assert_finite(f"val CE in {name} row {step}", ((h, row["heads"][h]["ce"]) for h in SL.HEADS))
-    return {"weight": nan_max((sx[k].double() - sy[k].double()).abs().max().item() for k in sx),
-            "ce": {h: abs(rx["heads"][h]["ce"] - ry["heads"][h]["ce"]) for h in SL.HEADS}}
+def noise_class(path: tuple):
+    """The noise class of a checkpoint value (its key path), or None: an exact value."""
+    if path[0] == "model_state_dict":
+        return "weight"
+    if path[:2] == ("optimizer_state_dict", "state") and path[-1] in ("exp_avg", "exp_avg_sq"):
+        return path[-1]
+    if path[0] == "train_sums" and path[-1] == 0:  # [loss x n, n]: the loss sum
+        return "train_loss"
+    return None
+
+
+def checkpoint_diffs(x: dict, y: dict, names=("x", "y")) -> dict:
+    """{"mismatch": [...], noise class: max |diff|} of two checkpoints: the key sets equal at every level (the
+    optimizer and scheduler states, prior_bias and train_sums included), every value exact but the noisy ones
+    (noise_class), which must be finite (an AssertionError otherwise)."""
+    out = {"mismatch": [], **{c: 0.0 for c in FLOORS}}
+
+    def walk(a, b, path):
+        where = ".".join(map(str, path))
+        if isinstance(a, dict) or isinstance(b, dict):
+            if not (isinstance(a, dict) and isinstance(b, dict) and a.keys() == b.keys()):
+                keys = [sorted(map(str, v)) if isinstance(v, dict) else type(v).__name__ for v in (a, b)]
+                out["mismatch"].append(f"{where or '<top>'}: keys {keys[0]} vs {keys[1]}")
+                return
+            for k in a:
+                walk(a[k], b[k], path + (k,))
+        elif isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+            if not (isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)) and len(a) == len(b)):
+                out["mismatch"].append(f"{where}: {a!r:.80} vs {b!r:.80}")
+                return
+            for i, (u, v) in enumerate(zip(a, b)):
+                walk(u, v, path + (i,))
+        elif torch.is_tensor(a) != torch.is_tensor(b) or torch.is_tensor(a) and (a.dtype, a.shape) != (b.dtype, b.shape):
+            out["mismatch"].append(f"{where}: type, dtype or shape differs")
+        elif (cls := noise_class(path)) is not None:
+            for name, v in zip(names, (a, b)):
+                assert_finite(f"{cls} in {name}", [(where, v)])
+            d = (a.double() - b.double()).abs().max().item() if torch.is_tensor(a) else abs(a - b)
+            out[cls] = max(out[cls], d)
+        elif not (torch.equal(a, b) if torch.is_tensor(a) else type(a) is type(b) and a == b):
+            out["mismatch"].append(f"{where}: differs")
+
+    walk(x, y, ())
+    return out
+
+
+def run_diffs(x, y, step=12) -> dict:
+    """Run dir x vs run dir y at `step`: checkpoint_diffs of step_<step>.pt, and "ce": per-head |val CE diff| of row
+    <step> (empty when the step has no row)."""
+    paths = [d / "checkpoints" / f"step_{step}.pt" for d in (x, y)]
+    names = [f"{p.parent.parent.name}/{p.name}" for p in paths]
+    diffs = checkpoint_diffs(*(torch.load(p, map_location="cpu", weights_only=True) for p in paths), names)
+    rows = [{r["step"]: r for r in SL.Metrics(str(d / "metrics.jsonl")).read()[1]}.get(step) for d in (x, y)]
+    assert (rows[0] is None) == (rows[1] is None), f"row {step} in one run only"
+    diffs["ce"] = {}
+    if rows[0] is not None:
+        for name, row in zip(names, rows):
+            assert_finite(f"val CE in {name} row {step}", ((h, row["heads"][h]["ce"]) for h in SL.HEADS))
+        diffs["ce"] = {h: abs(rows[0]["heads"][h]["ce"] - rows[1]["heads"][h]["ce"]) for h in SL.HEADS}
+    return diffs
 
 
 def within_noise(diffs: dict, noise: dict) -> bool:
-    """Every diff <= NOISE_TIMES x the run-to-run noise of the same quantity + its absolute floor."""
-    return diffs["weight"] <= NOISE_TIMES * noise["weight"] + WEIGHT_FLOOR and all(
-        diffs["ce"][h] <= NOISE_TIMES * noise["ce"][h] + CE_FLOOR for h in SL.HEADS)
+    """No exact value differs, and every noisy one <= NOISE_TIMES x the run-to-run noise of the same quantity + its
+    absolute floor."""
+    return not diffs["mismatch"] and all(diffs[c] <= NOISE_TIMES * noise[c] + FLOORS[c] for c in FLOORS) and all(
+        diffs["ce"][h] <= NOISE_TIMES * noise["ce"][h] + CE_FLOOR for h in diffs["ce"])
 
 
 def test_run_diffs_fails_on_a_nan_weight(tmp_path):
@@ -201,24 +258,61 @@ def test_run_diffs_fails_on_a_nan_weight(tmp_path):
         weights = {"a": torch.tensor([1.0, 2.0]), "b": torch.tensor([last])}
         torch.save({"model_state_dict": weights}, tmp_path / name / "checkpoints" / "step_12.pt")
         (tmp_path / name / "metrics.jsonl").write_text(json.dumps({"type": "header"}) + "\n" + json.dumps(row) + "\n")
-    assert run_diffs(tmp_path, "x", "x")["weight"] == 0
-    with pytest.raises(AssertionError, match=r"non-finite weight in y/step_12.pt: \['b'\]"):
-        run_diffs(tmp_path, "x", "y")
+    assert run_diffs(tmp_path / "x", tmp_path / "x")["weight"] == 0
+    with pytest.raises(AssertionError, match=r"non-finite weight in y/step_12.pt: \['model_state_dict.b'\]"):
+        run_diffs(tmp_path / "x", tmp_path / "y")
 
 
 def test_mps_resume_is_within_the_run_to_run_noise(mps_runs):
+    """Every checkpoint of the resumed run (4 and 8 before the kill, 12 after the resume) against the unbroken run's:
+    the complete schema, exact values exact, noisy values within the noise of the two unbroken runs at that step."""
     ckpt = torch.load(mps_runs / "a" / "checkpoints" / "step_12.pt", map_location="cpu", weights_only=True)
     assert ckpt["config"]["device"] == "mps" and "mps_rng_state" in ckpt
-    noise, resumed = run_diffs(mps_runs, "a", "c"), run_diffs(mps_runs, "a", "b")
-    print(f"\nMPS step 12, unbroken vs unbroken (noise): {noise}\nMPS step 12, resumed vs unbroken: {resumed}")
-    assert within_noise(resumed, noise), (resumed, noise)
+    for step in (4, 8, 12):
+        noise = run_diffs(mps_runs / "a", mps_runs / "c", step)
+        resumed = run_diffs(mps_runs / "a", mps_runs / "b", step)
+        print(f"\nMPS step {step}, unbroken vs unbroken (noise): {noise}\nMPS step {step}, resumed vs unbroken: {resumed}")
+        assert not noise["mismatch"], noise["mismatch"]
+        assert within_noise(resumed, noise), (step, resumed, noise)
 
 
 @pytest.mark.parametrize("broken", ["no_opt", "no_rng"])
 def test_the_noise_check_fails_a_broken_resume(mps_runs, broken):
-    noise, diffs = run_diffs(mps_runs, "a", "c"), run_diffs(mps_runs, "a", broken)
+    noise, diffs = run_diffs(mps_runs / "a", mps_runs / "c"), run_diffs(mps_runs / "a", mps_runs / broken)
     print(f"\nMPS step 12, {broken} resume vs unbroken: {diffs} (noise {noise})")
     assert not within_noise(diffs, noise), (broken, diffs, noise)
+
+
+def _scale_largest_exp_avg(state):
+    k = max(state, key=lambda i: state[i]["exp_avg"].abs().max().item())
+    state[k]["exp_avg"].mul_(2.0)
+
+
+def _zero_an_exp_avg_sq(state):
+    state[max(state)]["exp_avg_sq"].zero_()
+
+
+DOCTORS = {"no_optimizer_state": lambda c: c.pop("optimizer_state_dict"),
+           "scaled_exp_avg": lambda c: _scale_largest_exp_avg(c["optimizer_state_dict"]["state"]),
+           "zeroed_exp_avg_sq": lambda c: _zero_an_exp_avg_sq(c["optimizer_state_dict"]["state"]),
+           "no_prior_bias": lambda c: c.pop("prior_bias"),
+           "train_sums_off": lambda c: c["train_sums"]["discard"].__setitem__(1, c["train_sums"]["discard"][1] + 1)}
+
+
+@pytest.mark.parametrize("doctor", sorted(DOCTORS))
+def test_the_checkpoint_comparison_fails_a_doctored_resumed_checkpoint(mps_runs, tmp_path, doctor):
+    """The resumed run's final checkpoint with a state a resume would need missing or wrong (weights, val rows and
+    data path untouched, so the weight / CE checks alone pass it) must fail the comparison (Codex round 2)."""
+    step = 12 if doctor != "train_sums_off" else 8  # step 12 is an eval step: its train sums are zero
+    shutil.copytree(mps_runs / "b", tmp_path / "doctored")
+    path = tmp_path / "doctored" / "checkpoints" / f"step_{step}.pt"
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    DOCTORS[doctor](ckpt)
+    torch.save(ckpt, path)
+    noise, diffs = run_diffs(mps_runs / "a", mps_runs / "c", step), run_diffs(mps_runs / "a", tmp_path / "doctored", step)
+    print(f"\nMPS step {step}, resumed run with {doctor} vs unbroken: {diffs} (noise {noise})")
+    assert diffs["weight"] <= NOISE_TIMES * noise["weight"] + FLOORS["weight"]  # the weight check alone passes it
+    assert not within_noise(diffs, noise), (doctor, diffs, noise)
 
 
 def test_mps_resume_repeats_the_data_path_of_the_unbroken_mps_run(mps_runs):
