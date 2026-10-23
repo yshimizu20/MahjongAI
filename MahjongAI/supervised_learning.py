@@ -2,6 +2,12 @@
 
 Run from the repo root as a module: python -m MahjongAI.supervised_learning encoder_conv 12000 --run-dir runs/T-005
 
+Batch modes (T-055): `games` (the default) feeds the model 2-game batches, each head capped at 2,250 sampled rows;
+`positions` (--batch-mode positions) feeds it fixed-size per-head steps from utils/position_batcher.py (one game per
+draw, rows carried over). --device mps trains on the Apple GPU; validation always runs on the CPU (a CPU copy of
+the model, float64 CE), so val numbers do not depend on the device. A resume must use the same mode, sizes and
+device. The header records the git commit; the inputs and the feature code are assumed fixed within a run.
+
 Step semantics: row s of metrics.jsonl = the model after s optimizer updates; row 0 = before any update. A step that
 is both an eval and a save step evals (row written) first, then saves. The final step is always both.
 
@@ -11,6 +17,7 @@ change; a config written before T-010 has no architecture keys and reads as 64 x
 and a checkpoint step that is an eval step without a row is evaluated first.
 """
 import argparse
+import copy
 import cProfile
 import glob
 import hashlib
@@ -21,6 +28,7 @@ import os
 import pathlib
 import pstats
 import re
+import subprocess
 from datetime import datetime
 from typing import NamedTuple
 
@@ -32,6 +40,7 @@ from MahjongAI.agents.encoder_conv import (EMBD_SIZE, LEGACY_ARCH, N_LAYERS, Enc
 from MahjongAI.utils.baselines import fit_bias_prior, greedy_hits, score_bias, shanten_best, uniform_legal
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
 from MahjongAI.utils.game_workers import GameWorkers, _transportable
+from MahjongAI.utils.position_batcher import DEFAULT_SIZES, PositionBatcher
 
 # Root of the MahjongAI package: data paths resolve the same from any working directory.
 _PACKAGE_DIR = pathlib.Path(__file__).parent
@@ -80,12 +89,10 @@ DATA_PREFETCH = 8
 PRIOR_WORKERS = max(1, (os.cpu_count() or 4) - 2)
 PRIOR_PREFETCH = 32
 MAX_BATCHES_WITHOUT_UPDATE = 50  # consecutive empty / sample-less batches before the run aborts (data failure)
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-# elif torch.backends.mps.is_available():
-#     device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+BATCH_MODES = ("games", "positions")
+DEVICES = ("cpu", "mps")
+# T-055: the run-identity keys of a config written before T-055 (2-game batches on the CPU)
+LEGACY_RUN = {"batch_mode": "games", "position_sizes": None, "device": "cpu"}
 
 
 class RunLog:
@@ -95,7 +102,7 @@ class RunLog:
         self.path = path
 
     def __call__(self, message: str):
-        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {message}"  # ms: T-055 step timing
         print(line, flush=True)
         with open(self.path, "a") as f:
             f.write(line + "\n")
@@ -377,11 +384,17 @@ def with_legacy_arch(config: dict) -> dict:
     return {**config, **LEGACY_ARCH, "n_params": count_parameters(**LEGACY_ARCH)}
 
 
+def with_legacy_run(config: dict) -> dict:
+    """with_legacy_arch, and the LEGACY_RUN value of each T-055 key the config does not have (games, cpu)."""
+    return {**LEGACY_RUN, **with_legacy_arch(config)}
+
+
 def config_mismatch(saved: dict, current: dict) -> dict:
     """{key: (saved, current)} of the run-identity keys that differ; total_steps may change on a resume (a run
     extended past its budget), every other key (torch_threads too: it changes the float reduction order) must not.
-    A config without architecture keys reads as 64 x 1 (with_legacy_arch)."""
-    saved, current = with_legacy_arch(saved), with_legacy_arch(current)
+    A config without architecture keys reads as 64 x 1 (with_legacy_arch), one without T-055 keys as games mode on
+    the CPU (with_legacy_run)."""
+    saved, current = with_legacy_run(saved), with_legacy_run(current)
     keys = sorted((saved.keys() | current.keys()) - {"total_steps"})
     return {k: (saved.get(k, "<absent>"), current.get(k, "<absent>")) for k in keys
             if k not in saved or k not in current or saved[k] != current[k]}
@@ -389,6 +402,31 @@ def config_mismatch(saved: dict, current: dict) -> dict:
 
 def _mismatch_text(mismatch: dict) -> str:
     return ", ".join(f"{k} {a!r} -> {b!r}" for k, (a, b) in mismatch.items())
+
+
+def git_commit() -> str:
+    """The code's git commit (`-dirty` when tracked files changed), or None outside a git checkout."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(_PACKAGE_DIR), *args], capture_output=True, text=True, check=True).stdout
+    try:
+        dirty = git("status", "--porcelain", "--untracked-files=no").strip()
+        return git("rev-parse", "HEAD").strip() + ("-dirty" if dirty else "")
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def rng_state(device: torch.device) -> dict:
+    """The torch RNG states a step draws from: the CPU generator, and the MPS one (dropout on the GPU)."""
+    state = {"torch_rng_state": torch.get_rng_state()}
+    if device.type == "mps":
+        state["mps_rng_state"] = torch.mps.get_rng_state()
+    return state
+
+
+def set_rng_state(state: dict, device: torch.device):
+    torch.set_rng_state(state["torch_rng_state"])
+    if device.type == "mps":
+        torch.mps.set_rng_state(state["mps_rng_state"])
 
 
 def make_workers():
@@ -418,12 +456,19 @@ def find_latest_checkpoint(checkpoint_dir: str):
 
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, embd_size: int = EMBD_SIZE,
-          n_layers: int = N_LAYERS, row0_tol: float = None):
+          n_layers: int = N_LAYERS, row0_tol: float = None, batch_mode: str = "games", position_sizes: dict = None,
+          device: str = "cpu"):
+    """position_sizes: {head: rows per step} of positions mode (default DEFAULT_SIZES); games mode takes none."""
     row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
+    assert batch_mode in BATCH_MODES and device in DEVICES, (batch_mode, device)
+    if batch_mode == "positions":
+        position_sizes = {h: (position_sizes or DEFAULT_SIZES)[h] for h in HEADS}
+    assert batch_mode == "positions" or position_sizes is None, "position sizes are a positions-mode setting"
+    assert device != "mps" or torch.backends.mps.is_available(), "--device mps: this machine has no MPS backend"
     workers = make_workers()
     try:
         _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
-               embd_size, n_layers, row0_tol)
+               embd_size, n_layers, row0_tol, batch_mode, position_sizes, torch.device(device))
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
@@ -431,7 +476,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
 
 def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int, save_every: int,
            expect_prior_ce, expect_shanten, workers, embd_size: int, n_layers: int,
-           row0_tol: float):
+           row0_tol: float, batch_mode: str, position_sizes, device: torch.device):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
@@ -439,8 +484,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
 
     if model_name == "encoder_conv":
         torch.manual_seed(MODEL_SEED)
-        model = EncoderConvModel(n_layers=n_layers, embd_size=embd_size).to(device)
-        batch_size = 2
+        model = EncoderConvModel(n_layers=n_layers, embd_size=embd_size).to(device)  # moved before the optimizer
+        batch_size = 2 if batch_mode == "games" else 1
     else:
         raise NotImplementedError(f"Model {model_name} not implemented.")
     # T-010 G0: the built model has the asked architecture (its real dims, not the arguments) and the parameter count
@@ -451,6 +496,10 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     expected_params = count_parameters(embd_size, n_layers)
     assert n_params == expected_params, f"{n_params} parameters, expected {expected_params}"
     log(f"model {model_name}: embd_size {embd_size}, n_layers {n_layers}, {n_params:,} parameters")
+    log(f"batch mode {batch_mode}" + (f" {position_sizes}" if position_sizes else "") + f", device {device}")
+    # validation runs on the CPU: the model itself on a CPU run, else a CPU copy (deepcopy: no RNG draw) whose weights
+    # are refreshed before each eval
+    eval_model = model if device.type == "cpu" else copy.deepcopy(model).to("cpu")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     warmup_steps = min(1000, total_steps // 10)  # a 300-step smoke must leave warmup; a 1,100-step run must not collapse
@@ -464,6 +513,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
 
     cluster = train_cluster(log, batch_size, workers)
     dataloaders = cluster.dataloaders
+    batcher = PositionBatcher(cluster, position_sizes) if batch_mode == "positions" else None
     val = ValSet.load(log)
     train_ids = {os.path.basename(f) for dl in dataloaders for f in dl.file_list}
     assert not train_ids & set(val.ids), f"train and validation games overlap: {sorted(train_ids & set(val.ids))[:5]}"
@@ -476,13 +526,14 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         "prior_games": PRIOR_GAMES, "prior_seed": PRIOR_SEED, "prior_l2": PRIOR_L2,
         "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": TORCH_THREADS,
         "embd_size": embd_size, "n_layers": n_layers, "n_params": n_params,
+        "batch_mode": batch_mode, "position_sizes": position_sizes, "device": device.type,
     }
 
     current_step, rows, header = 0, [], None
     train_sums = {h: [0.0, 0] for h in HEADS}  # train-mode batch loss x n, n; since the last eval row
     latest_step, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
     if latest_checkpoint:
-        checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=True)
+        checkpoint = torch.load(latest_checkpoint, map_location="cpu", weights_only=True)
         mismatch = config_mismatch(checkpoint["config"], config)
         assert not mismatch, (f"{latest_checkpoint} is from another run config: {_mismatch_text(mismatch)}; "
                               "resume with the same config or start a new run dir")
@@ -490,7 +541,10 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         if checkpoint["config"]["total_steps"] != total_steps:
             log(f"total_steps {checkpoint['config']['total_steps']} -> {total_steps} (cosine horizon recomputed)")
         model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])  # moves its state to the parameters' device
+        misplaced = {k for state in optimizer.state.values() for k, v in state.items()
+                     if torch.is_tensor(v) and k != "step" and v.device.type != device.type}
+        assert not misplaced, f"optimizer state {sorted(misplaced)} is not on {device} after the load"
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         # The optimizer state restores the LR of the saved schedule; recompute it on THIS run's horizon
         # (total_steps may have changed) so the first resumed update already uses it.
@@ -498,7 +552,9 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             group["lr"] = base_lr * lr_lambda(scheduler.last_epoch)
         scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
         cluster.load_state_dict(checkpoint["loader_state"])
-        torch.set_rng_state(checkpoint["torch_rng_state"])
+        if batcher is not None:
+            batcher.load_state_dict(checkpoint["batcher_state"])
+        set_rng_state(checkpoint, device)
         current_step = checkpoint["current_step"]
         assert current_step == latest_step, f"{latest_checkpoint} holds step {current_step}"
         bias = {h: checkpoint["prior_bias"][h] for h in HEADS}
@@ -547,7 +603,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         if os.path.exists(metrics.path):
             log(f"{metrics.path} exists without a checkpoint: overwritten")
         metrics.start({"type": "header", "config": config, "val_ids": val.ids, "started": datetime.now().isoformat(),
-                       "prior_bias": {h: bias[h].tolist() for h in HEADS}, **baselines})
+                       "git_commit": git_commit(), "prior_bias": {h: bias[h].tolist() for h in HEADS}, **baselines})
 
     def is_eval_step(s: int) -> bool:
         return s % eval_every == 0 or s == total_steps
@@ -558,7 +614,9 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     def evaluate():
         """Row `current_step`: val per head and game, mean train CE since the last row. Row 0 is written only if
         it passes the uniform-legal check, so a restart after that stop checks it again."""
-        per_game = val.evaluate(model)
+        if eval_model is not model:
+            eval_model.load_state_dict(model.state_dict())
+        per_game = val.evaluate(eval_model)
         heads = {}
         for h in HEADS:
             g = per_game[h]
@@ -580,53 +638,72 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             assert all(abs(v) <= row0_tol for v in gaps.values()), f"row 0 is not near uniform-legal: {gaps}"
         bad = {h: heads[h]["ce"] for h in HEADS if not math.isfinite(heads[h]["ce"])}
         assert not bad, f"non-finite val CE at step {current_step}: {bad}"
-        metrics.append({"type": "eval", "step": current_step, "total_steps": total_steps,
-                        "lr": optimizer.param_groups[0]["lr"], "heads": heads})
+        row = {"type": "eval", "step": current_step, "total_steps": total_steps,
+               "lr": optimizer.param_groups[0]["lr"], "heads": heads}
+        if batcher is not None:
+            row["positions"] = batcher.report()
+            log(f"step {current_step} | positions: games admitted {row['positions']['games_admitted']}, buffered "
+                f"{row['positions']['buffered']}, max buffered since the last row {row['positions']['max_buffered']}")
+        metrics.append(row)
         for h in HEADS:  # reset only once the row is on disk: a stop before keeps the sums in the checkpoint
             train_sums[h] = [0.0, 0]
+        if batcher is not None:
+            batcher.reset_max_buffered()
 
     def save_checkpoint():
-        """Everything a resume needs, written atomically (*.tmp, then os.replace)."""
+        """Everything a resume needs, written atomically (*.tmp, then os.replace). A stop between a positions-mode
+        step's forward and its commit saves the RNG state from before that forward (step_rng): with the step's rows
+        still buffered, the resume repeats the step as an unstopped run does."""
         path = os.path.join(checkpoint_dir, f"step_{current_step}.pt")
-        torch.save({
+        state = {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "current_step": current_step,
             "loader_state": cluster.state_dict(),
             "prior_bias": bias,
-            "torch_rng_state": torch.get_rng_state(),
+            **(step_rng or rng_state(device)),
             "train_sums": train_sums,
             "config": config,
             "val_ids": val.ids,
-        }, path + ".tmp")
+        }
+        if batcher is not None:
+            state["batcher_state"] = batcher.state_dict()
+        torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
+        processor = model.tensor_processor if batcher is None else batcher.processor
         log(f"Checkpoint saved at {path}; skipped games: {dict(cluster.skipped())}; "
-            f"skipped samples: {dict(model.tensor_processor.skipped)}")
+            f"skipped samples: {dict(processor.skipped)}")
 
     # total_steps counts optimizer UPDATES: a batch without samples does not consume the budget, so the
     # cosine horizon and the number of updates agree. A persistent data failure aborts.
     batches_without_update = 0
     consistent = True  # False only between optimizer.step() and current_step += 1: no checkpoint from there
+    step_rng = None  # positions mode: the RNG state before the forward of a step not committed yet
     try:
         if is_eval_step(current_step) and not any(r["step"] == current_step for r in rows):
             evaluate()  # row 0 of a fresh run, or the row a stop / kill lost after its checkpoint
         consumed = []  # the files of the batches drawn since the last update, in order (a no-sample batch included)
         while current_step < total_steps:
-            games, tokens = next(cluster)
-            consumed += cluster.last_batch_files
-            results = model(games, tokens, sample=True) if games else None  # no games: every one was skipped
-            _check_tensor_skips(model.tensor_processor, f"the training batch after step {current_step}",
-                                cluster.last_batch_files)
-            if not results:
-                batches_without_update += 1
-                if batches_without_update >= MAX_BATCHES_WITHOUT_UPDATE:
-                    raise RuntimeError(
-                        f"{batches_without_update} consecutive batches gave no training sample at step {current_step} "
-                        f"(skipped games: {dict(cluster.skipped())}); check the data"
-                    )
-                continue
-            batches_without_update = 0
+            if batcher is None:
+                games, tokens = next(cluster)
+                consumed += cluster.last_batch_files
+                results = model(games, tokens, sample=True) if games else None  # no games: every one was skipped
+                _check_tensor_skips(model.tensor_processor, f"the training batch after step {current_step}",
+                                    cluster.last_batch_files)
+                if not results:
+                    batches_without_update += 1
+                    if batches_without_update >= MAX_BATCHES_WITHOUT_UPDATE:
+                        raise RuntimeError(
+                            f"{batches_without_update} consecutive batches gave no training sample at step "
+                            f"{current_step} (skipped games: {dict(cluster.skipped())}); check the data"
+                        )
+                    continue
+                batches_without_update = 0
+            else:  # positions mode: the step's rows stay buffered until commit, after optimizer.step()
+                batches = batcher.peek()
+                step_rng = rng_state(device)
+                results = model.forward_heads(batches)
 
             total_loss = sum(out.loss for out in results.values())
             if not torch.isfinite(total_loss):  # before backward: the weights a stop saves are clean
@@ -640,14 +717,21 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             consistent = False
             optimizer.step()
             scheduler.step()
+            if batcher is not None:
+                read, sample_digest = batcher.commit()
             current_step += 1
             consistent = True
+            step_rng = None
 
             for h, out in results.items():
                 train_sums[h][0] += out.loss.item() * out.y.numel()
                 train_sums[h][1] += out.y.numel()
+            if batcher is None:
+                trace = f" | files {batch_files_hash(consumed)}"
+            else:  # the files admitted since the last update, and the provenance of the rows this update trained on
+                trace = f" | read {batch_files_hash(read)} | sample {sample_digest}"
             log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results)
-                + f" | files {batch_files_hash(consumed)}")
+                + trace)
             consumed = []
 
             if is_eval_step(current_step):
@@ -665,6 +749,13 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             log("no checkpoint: the stop came inside an optimizer update")
         raise
     log("Training completed.")
+
+
+def parse_position_sizes(text: str) -> dict:
+    values = [int(v) for v in text.split(",")]
+    if len(values) != len(HEADS) or min(values) <= 0:
+        raise argparse.ArgumentTypeError(f"--position-sizes needs {len(HEADS)} positive counts ({','.join(HEADS)})")
+    return dict(zip(HEADS, values))
 
 
 def parse_expect_prior_ce(text: str):
@@ -698,6 +789,13 @@ if __name__ == "__main__":
     parser.add_argument("--row0-tol", type=float, default=None, metavar="T",
                         help=f"row-0 |val CE - uniform-legal CE| limit per head (default {UNIFORM_ROW0_TOL}); a wider "
                              "init model starts further from uniform (T-010 128x2: post -0.069)")
+    parser.add_argument("--batch-mode", choices=BATCH_MODES, default="games",
+                        help="games: 2-game batches, sampled per head (default); positions: fixed rows per head and "
+                             "step, carried over (T-055)")
+    parser.add_argument("--position-sizes", type=parse_position_sizes, default=None, metavar="U,D,P",
+                        help="positions mode: rows per step of the during, discard, post heads (default "
+                             f"{','.join(str(DEFAULT_SIZES[h]) for h in HEADS)})")
+    parser.add_argument("--device", choices=DEVICES, default="cpu", help="training device (validation: the CPU)")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -711,17 +809,21 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     assert args.eval_every > 0 and args.save_every > 0
+    if args.position_sizes is not None and args.batch_mode != "positions":
+        parser.error("--position-sizes needs --batch-mode positions")
 
     run_dir = args.run_dir or os.path.join("runs", f"{args.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(run_dir, exist_ok=True)
     log = RunLog(os.path.join(run_dir, "train.log"))
     log(f"Training {args.model_name} for {args.max_steps} steps in {run_dir} (eval every {args.eval_every}, "
-        f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers})"
+        f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers}, batch mode "
+        f"{args.batch_mode}, device {args.device})"
         + (" [profiling on]" if args.profile else ""))
 
     def _run():
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
-              args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol)
+              args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol,
+              args.batch_mode, args.position_sizes, args.device)
 
     if args.profile:
         pr = cProfile.Profile()
