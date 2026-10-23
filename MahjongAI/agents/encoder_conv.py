@@ -39,10 +39,12 @@ N_X1_PLANES = 10
 # x3 scalars: remaining_tsumo/70, kyotaku/4, honba/8, rounds_remaining/8 (0 in an extension round), then the round
 # wind (bakaze) one-hot E, S, W (no North slot: 0 North rounds in 2.2M games; process_xml rejects one, T-038)
 N_X3 = 7
-EMBD_SIZE = 64
+EMBD_SIZE = 64  # the default width; a model's own width is EncoderConvModel(embd_size=...) (T-010)
 N_HEADS = 8
 N_LAYERS = 1
 DROPOUT_RATIO = 0.2
+# The architecture keys of a run config (T-010). A config written before T-010 has neither key: a 64 x 1 model.
+LEGACY_ARCH = {"embd_size": 64, "n_layers": 1}
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -52,16 +54,35 @@ else:
     device = torch.device("cpu")
 
 
+def arch_of(config: dict) -> dict:
+    """{"embd_size", "n_layers"} of a run config: LEGACY_ARCH when it has neither key (written before T-010)."""
+    present = [k for k in LEGACY_ARCH if k in config]
+    if not present:
+        return dict(LEGACY_ARCH)
+    assert len(present) == len(LEGACY_ARCH), f"config has {present} of the architecture keys {list(LEGACY_ARCH)}"
+    return {k: config[k] for k in LEGACY_ARCH}
+
+
+def count_parameters(embd_size=EMBD_SIZE, n_layers=N_LAYERS) -> int:
+    """Parameter count of EncoderConvModel(n_layers, embd_size), built on the meta device: no memory, no draw from
+    the torch RNG (so a trainer can call it between seeding and training)."""
+    with torch.device("meta"):
+        model = EncoderConvModel(n_layers=n_layers, embd_size=embd_size, verbose=False)
+    return sum(p.numel() for p in model.parameters())
+
+
 class EncoderConvModel(nn.Module):
-    def __init__(self, n_layers=N_LAYERS, verbose=True):
+    def __init__(self, n_layers=N_LAYERS, embd_size=EMBD_SIZE, verbose=True):
         super().__init__()
-        self.token_embedder = TokenEmbedder()
-        self.blocks = nn.Sequential(*[EncoderBlock(EMBD_SIZE, N_HEADS) for _ in range(n_layers)])
-        self.state_net = StateNet()
-        self.ln_f = nn.LayerNorm(EMBD_SIZE)
-        self.discard_head = nn.Linear(EMBD_SIZE, DISCARD_ACTION_DIM)
-        self.during_head = nn.Linear(EMBD_SIZE, DURING_TURN_ACTION_DIM)
-        self.post_head = nn.Linear(EMBD_SIZE, POST_TURN_ACTION_DIM)
+        assert embd_size % N_HEADS == 0 and embd_size % 2 == 0, f"embd_size {embd_size}: N_HEADS {N_HEADS} must divide it"
+        self.embd_size = embd_size
+        self.token_embedder = TokenEmbedder(embd_size)
+        self.blocks = nn.Sequential(*[EncoderBlock(embd_size, N_HEADS) for _ in range(n_layers)])
+        self.state_net = StateNet(embd_size)
+        self.ln_f = nn.LayerNorm(embd_size)
+        self.discard_head = nn.Linear(embd_size, DISCARD_ACTION_DIM)
+        self.during_head = nn.Linear(embd_size, DURING_TURN_ACTION_DIM)
+        self.post_head = nn.Linear(embd_size, POST_TURN_ACTION_DIM)
         self.heads = {
             "discard": self.discard_head,
             "during": self.during_head,
@@ -74,6 +95,16 @@ class EncoderConvModel(nn.Module):
         if verbose:
             self.print_model_summary()
 
+    @classmethod
+    def from_checkpoint(cls, checkpoint: dict) -> "EncoderConvModel":
+        """The model of a loaded checkpoint dict, weights loaded strictly: the architecture from its config (64 x 1
+        when the config or its architecture keys are absent), the `_orig_mod.` prefix of a torch.compile'd model's
+        state_dict stripped. Built on the CPU in train mode, as the constructor leaves it."""
+        model = cls(**arch_of(checkpoint.get("config") or {}), verbose=False)
+        state = {k.replace("_orig_mod.", ""): v for k, v in checkpoint["model_state_dict"].items()}
+        model.load_state_dict(state)
+        return model
+
     def print_model_summary(self):
         def count(module):
             return sum(p.numel() for p in module.parameters())
@@ -84,18 +115,18 @@ class EncoderConvModel(nn.Module):
         print("\n" + "=" * 70)
         print("ENCODER-ONLY (EARLY FUSION) MODEL CONFIGURATION")
         print("=" * 70)
-        n_layers = len(self.blocks)
-        print(f"  EMBD_SIZE={EMBD_SIZE}, N_HEADS={N_HEADS}, N_LAYERS={n_layers}")
+        n_layers, E = len(self.blocks), self.embd_size
+        print(f"  EMBD_SIZE={E}, N_HEADS={N_HEADS}, N_LAYERS={n_layers}")
         print(f"  Discard actions={DISCARD_ACTION_DIM}, During actions={DURING_TURN_ACTION_DIM}, Post actions={POST_TURN_ACTION_DIM}")
         print("=" * 70)
 
         print("\nTOKEN EMBEDDER")
         print("-" * 70)
-        print(f"  {'Embedding: type (4→64):':<45}{count(te.type_embedding):>10,}")
-        print(f"  {'Embedding: tile (37→64):':<45}{count(te.tile_embedding):>10,}")
-        print(f"  {'Embedding: tsumogiri (1→64):':<45}{count(te.tsumogiri_embedding):>10,}")
-        print(f"  {f'Embedding: during_naki ({DURING_TURN_ACTION_DIM}→64):':<45}{count(te.during_naki_embedding):>10,}")
-        print(f"  {'Embedding: post_naki (154→64):':<45}{count(te.post_naki_embedding):>10,}")
+        print(f"  {f'Embedding: type (4→{E}):':<45}{count(te.type_embedding):>10,}")
+        print(f"  {f'Embedding: tile (37→{E}):':<45}{count(te.tile_embedding):>10,}")
+        print(f"  {f'Embedding: tsumogiri (1→{E}):':<45}{count(te.tsumogiri_embedding):>10,}")
+        print(f"  {f'Embedding: during_naki ({DURING_TURN_ACTION_DIM}→{E}):':<45}{count(te.during_naki_embedding):>10,}")
+        print(f"  {f'Embedding: post_naki (154→{E}):':<45}{count(te.post_naki_embedding):>10,}")
         print(f"  {'Position/player coding (non-trainable):':<45}{'0':>10}")
         print(f"  {'TokenEmbedder subtotal:':<45}{count(te):>10,}")
 
@@ -115,16 +146,16 @@ class EncoderConvModel(nn.Module):
         print(f"  {f'Linear honors_fc1 ({N_X1_PLANES * 28}→32):':<45}{count(sn.honors_fc1):>10,}")
         print(f"  {'Linear honors_fc2 (32→16):':<45}{count(sn.honors_fc2):>10,}")
         print(f"  {f'Linear reds_fc ({N_X1_PLANES * 12}→8):':<45}{count(sn.reds_fc):>10,}")
-        print(f"  {f'Linear fc_main_1 ({sn.fc_main_1.in_features}→64):':<45}{count(sn.fc_main_1):>10,}")
-        print(f"  {'Linear fc_main_2 (64→64):':<45}{count(sn.fc_main_2):>10,}")
+        print(f"  {f'Linear fc_main_1 ({sn.fc_main_1.in_features}→{E}):':<45}{count(sn.fc_main_1):>10,}")
+        print(f"  {f'Linear fc_main_2 ({E}→{E}):':<45}{count(sn.fc_main_2):>10,}")
         print(f"  {'StateNet subtotal:':<45}{count(sn):>10,}")
 
         print("\nOUTPUT HEADS")
         print("-" * 70)
-        print(f"  {'ln_f LayerNorm(64):':<45}{count(self.ln_f):>10,}")
-        print(f"  {f'discard_head Linear(64→{DISCARD_ACTION_DIM}):':<45}{count(self.discard_head):>10,}")
-        print(f"  {f'during_head Linear(64→{DURING_TURN_ACTION_DIM}):':<45}{count(self.during_head):>10,}")
-        print(f"  {f'post_head Linear(64→{POST_TURN_ACTION_DIM}):':<45}{count(self.post_head):>10,}")
+        print(f"  {f'ln_f LayerNorm({E}):':<45}{count(self.ln_f):>10,}")
+        print(f"  {f'discard_head Linear({E}→{DISCARD_ACTION_DIM}):':<45}{count(self.discard_head):>10,}")
+        print(f"  {f'during_head Linear({E}→{DURING_TURN_ACTION_DIM}):':<45}{count(self.during_head):>10,}")
+        print(f"  {f'post_head Linear({E}→{POST_TURN_ACTION_DIM}):':<45}{count(self.post_head):>10,}")
 
         total = count(self)
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -246,33 +277,33 @@ class EncoderConvModel(nn.Module):
 class TokenEmbedder(nn.Module):
     """Converts encoding tokens to summed embeddings (no attention blocks)."""
 
-    def __init__(self):
+    def __init__(self, embd_size=EMBD_SIZE):
         super().__init__()
 
-        self.register_buffer("empty_embedding", torch.zeros((1, 1, EMBD_SIZE)))
-        self.type_embedding = nn.Embedding(4, EMBD_SIZE)  # embedding_type: 1-4
-        self.tile_embedding = nn.Embedding(37, EMBD_SIZE)  # tile_encoding: 0-36
-        self.tsumogiri_embedding = nn.Embedding(1, EMBD_SIZE)
-        self.during_naki_embedding = nn.Embedding(DURING_TURN_ACTION_DIM, EMBD_SIZE)
-        self.post_naki_embedding = nn.Embedding(POST_TURN_ACTION_DIM, EMBD_SIZE)
+        self.register_buffer("empty_embedding", torch.zeros((1, 1, embd_size)))
+        self.type_embedding = nn.Embedding(4, embd_size)  # embedding_type: 1-4
+        self.tile_embedding = nn.Embedding(37, embd_size)  # tile_encoding: 0-36
+        self.tsumogiri_embedding = nn.Embedding(1, embd_size)
+        self.during_naki_embedding = nn.Embedding(DURING_TURN_ACTION_DIM, embd_size)
+        self.post_naki_embedding = nn.Embedding(POST_TURN_ACTION_DIM, embd_size)
 
-        self.register_buffer("position_coding_table", self._get_position_encoding())
-        self.register_buffer("player_coding_table", self._get_player_encoding())
+        self.register_buffer("position_coding_table", self._get_position_encoding(embd_size))
+        self.register_buffer("player_coding_table", self._get_player_encoding(embd_size))
 
     @staticmethod
-    def _get_position_encoding():
+    def _get_position_encoding(embd_size=EMBD_SIZE):
         position = torch.arange(MAX_ACTION_LEN).unsqueeze(1).float()
-        div_term = torch.exp(torch.arange(0, EMBD_SIZE, 2).float() * -(np.log(10000.0) / EMBD_SIZE))
-        pos_encoding = torch.zeros(MAX_ACTION_LEN, EMBD_SIZE)
+        div_term = torch.exp(torch.arange(0, embd_size, 2).float() * -(np.log(10000.0) / embd_size))
+        pos_encoding = torch.zeros(MAX_ACTION_LEN, embd_size)
         pos_encoding[:, 0::2] = torch.sin(position * div_term)
         pos_encoding[:, 1::2] = torch.cos(position * div_term)
         return pos_encoding.requires_grad_(False)  # Ensure non-trainable
 
     @staticmethod
-    def _get_player_encoding():
-        encoding = torch.empty((4, EMBD_SIZE), dtype=torch.float32)
+    def _get_player_encoding(embd_size=EMBD_SIZE):
+        encoding = torch.empty((4, embd_size), dtype=torch.float32)
 
-        base = torch.pow(10000, torch.arange(0, EMBD_SIZE, 2, dtype=torch.float32) / EMBD_SIZE)
+        base = torch.pow(10000, torch.arange(0, embd_size, 2, dtype=torch.float32) / embd_size)
 
         player_numbers = torch.arange(4).float()
         angle_rads = player_numbers * (2 * np.pi) / 4
@@ -381,13 +412,13 @@ class TokenEmbedder(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, EMBD_SIZE, num_heads):
+    def __init__(self, embd_size, num_heads):
         super().__init__()
-        head_size = EMBD_SIZE // num_heads
-        self.self_attention = MultiHeadAttention(num_heads, head_size)
-        self.ffwd = FeedForward(EMBD_SIZE)
-        self.ln1 = nn.LayerNorm(EMBD_SIZE)
-        self.ln2 = nn.LayerNorm(EMBD_SIZE)
+        head_size = embd_size // num_heads
+        self.self_attention = MultiHeadAttention(num_heads, head_size, embd_size)
+        self.ffwd = FeedForward(embd_size)
+        self.ln1 = nn.LayerNorm(embd_size)
+        self.ln2 = nn.LayerNorm(embd_size)
 
     def forward(self, x, attn_mask, state_row_only=False):
         """
@@ -420,7 +451,7 @@ def conv1d_k3_rank_major(x: torch.Tensor, conv: nn.Conv1d) -> torch.Tensor:
 
 
 class StateNet(nn.Module):
-    def __init__(self):
+    def __init__(self, embd_size=EMBD_SIZE):
         super(StateNet, self).__init__()
 
         C, K = N_X1_PLANES, 4
@@ -454,8 +485,8 @@ class StateNet(nn.Module):
         combined_features = suits_features + honors_features + reds_features + raw_x1_features
 
         # Main network to combine with x2 and x3
-        self.fc_main_1 = nn.Linear(combined_features + 7 * 4 + N_X3, EMBD_SIZE)  # 1520 + 28 + 7 = 1555
-        self.fc_main_2 = nn.Linear(EMBD_SIZE, EMBD_SIZE)
+        self.fc_main_1 = nn.Linear(combined_features + 7 * 4 + N_X3, embd_size)  # 1520 + 28 + 7 = 1555
+        self.fc_main_2 = nn.Linear(embd_size, embd_size)
         self.relu_fc_main = nn.ReLU()
 
     def forward(self, state_obj):
@@ -524,15 +555,15 @@ class StateNet(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
+    def __init__(self, num_heads, head_size, embd_size=EMBD_SIZE):
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
         # Fused projections for all heads at once
-        self.key_proj = nn.Linear(EMBD_SIZE, num_heads * head_size, bias=True)
-        self.query_proj = nn.Linear(EMBD_SIZE, num_heads * head_size, bias=True)
-        self.value_proj = nn.Linear(EMBD_SIZE, num_heads * head_size, bias=True)
-        self.proj = nn.Linear(num_heads * head_size, EMBD_SIZE)
+        self.key_proj = nn.Linear(embd_size, num_heads * head_size, bias=True)
+        self.query_proj = nn.Linear(embd_size, num_heads * head_size, bias=True)
+        self.value_proj = nn.Linear(embd_size, num_heads * head_size, bias=True)
+        self.proj = nn.Linear(num_heads * head_size, embd_size)
         self.dropout = nn.Dropout(DROPOUT_RATIO)
         self.attn_dropout_p = DROPOUT_RATIO
 
@@ -596,12 +627,12 @@ class MultiHeadAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, EMBD_SIZE):
+    def __init__(self, embd_size):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(EMBD_SIZE, 4 * EMBD_SIZE),
+            nn.Linear(embd_size, 4 * embd_size),
             nn.GELU(),
-            nn.Linear(4 * EMBD_SIZE, EMBD_SIZE),
+            nn.Linear(4 * embd_size, embd_size),
             nn.Dropout(DROPOUT_RATIO),
         )
 

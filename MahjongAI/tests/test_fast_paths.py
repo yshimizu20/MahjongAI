@@ -12,9 +12,9 @@ from MahjongAI.agents.encoder_conv import (DROPOUT_RATIO, EMBD_SIZE, N_HEADS, N_
 from MahjongAI.process_xml import process
 
 
-def _padded_batch(B=6, T=151, seed=0):
+def _padded_batch(B=6, T=151, seed=0, embd_size=EMBD_SIZE):
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(B, T, EMBD_SIZE, generator=g)
+    x = torch.randn(B, T, embd_size, generator=g)
     valid = torch.randint(1, T, (B,), generator=g)
     mask = torch.arange(T).unsqueeze(0) < valid.unsqueeze(1)
     mask[:, -1] = True  # the state token is always valid
@@ -28,16 +28,17 @@ def _no_dropout(block):
     block.self_attention.attn_dropout_p = 0.0
 
 
+@pytest.mark.parametrize("embd_size", [EMBD_SIZE, 128])
 @pytest.mark.parametrize("mode", ["eval", "train_p0"])
-def test_state_row_only_equals_full_last_row(mode):
+def test_state_row_only_equals_full_last_row(mode, embd_size):
     torch.manual_seed(0)
-    block = EncoderBlock(EMBD_SIZE, N_HEADS)
+    block = EncoderBlock(embd_size, N_HEADS)
     if mode == "eval":
         block.eval()
     else:  # train mode takes the math attention kernel with the mask; dropout off so both paths are deterministic
         block.train()
         _no_dropout(block)
-    x, mask = _padded_batch()
+    x, mask = _padded_batch(embd_size=embd_size)
 
     full = block(x, mask)[:, -1:]
     full.sum().backward()
@@ -47,7 +48,7 @@ def test_state_row_only_equals_full_last_row(mode):
     fast = block(x, mask, state_row_only=True)
     fast.sum().backward()
 
-    assert fast.shape == (x.shape[0], 1, EMBD_SIZE)
+    assert fast.shape == (x.shape[0], 1, embd_size)
     torch.testing.assert_close(fast, full, atol=1e-6, rtol=1e-5)
     for n, p in block.named_parameters():
         torch.testing.assert_close(p.grad, grads_full[n], atol=1e-6, rtol=1e-5, msg=f"grad {n}")
@@ -133,13 +134,14 @@ def _assert_same(a, b):
         torch.testing.assert_close(par_a[n], par_b[n], atol=1e-6, rtol=1e-5, msg=f"grad {n}")
 
 
+@pytest.mark.parametrize("embd_size", [EMBD_SIZE, 128])
 @pytest.mark.parametrize("n_layers", [1, 2])
 @pytest.mark.parametrize("mode", ["eval", "train_p0"])
-def test_model_fast_path_equals_full_blocks(games, n_layers, mode):
+def test_model_fast_path_equals_full_blocks(games, n_layers, mode, embd_size):
     """The whole model on real games: outputs, input-embedding gradients and every parameter gradient equal the
     reference that runs every block on all rows. With 2 layers only the last block takes the state-row path."""
     torch.manual_seed(0)
-    model = EncoderConvModel(n_layers=n_layers, verbose=False)
+    model = EncoderConvModel(n_layers=n_layers, embd_size=embd_size, verbose=False)
     if mode == "eval":
         model.eval()
     else:
@@ -155,7 +157,7 @@ def test_model_fast_path_equals_full_blocks(games, n_layers, mode):
         reference = _run(model, games)
 
     # per head call: blocks 0 .. n-2 return every row (T + 1 = 151), the last one the state row only
-    assert shapes == ([(151, EMBD_SIZE)] * (n_layers - 1) + [(1, EMBD_SIZE)]) * 3, shapes
+    assert shapes == ([(151, embd_size)] * (n_layers - 1) + [(1, embd_size)]) * 3, shapes
     _assert_same(fast, reference)
 
 

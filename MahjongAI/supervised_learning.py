@@ -7,7 +7,8 @@ is both an eval and a save step evals (row written) first, then saves. The final
 
 Run dir: train.log, metrics.jsonl (a header row, then one row per eval), checkpoints/step_<s>.pt. Starting again on
 the same run dir resumes from its latest checkpoint: the run config and the val ids must match (total_steps may
-change), rows of a later step are dropped, and a checkpoint step that is an eval step without a row is evaluated first.
+change; a config written before T-010 has no architecture keys and reads as 64 x 1), rows of a later step are dropped,
+and a checkpoint step that is an eval step without a row is evaluated first.
 """
 import argparse
 import cProfile
@@ -26,7 +27,8 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 
-from MahjongAI.agents.encoder_conv import EncoderConvModel, PrebuiltGame, TransformerTensorProcessor, build_game
+from MahjongAI.agents.encoder_conv import (EMBD_SIZE, LEGACY_ARCH, N_LAYERS, EncoderConvModel, PrebuiltGame,
+                                           TransformerTensorProcessor, build_game, count_parameters)
 from MahjongAI.utils.baselines import fit_bias_prior, greedy_hits, score_bias, shanten_best, uniform_legal
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
 from MahjongAI.utils.game_workers import GameWorkers, _transportable
@@ -367,9 +369,19 @@ def batch_files_hash(files) -> str:
     return hashlib.sha256("\n".join(os.path.basename(f) for f in files).encode()).hexdigest()[:12]
 
 
+def with_legacy_arch(config: dict) -> dict:
+    """The config with the architecture keys of a pre-T-010 run (64 x 1 and its parameter count) when it has neither
+    embd_size nor n_layers; any other config unchanged (a config WITH them must match exactly)."""
+    if any(k in config for k in LEGACY_ARCH):
+        return config
+    return {**config, **LEGACY_ARCH, "n_params": count_parameters(**LEGACY_ARCH)}
+
+
 def config_mismatch(saved: dict, current: dict) -> dict:
     """{key: (saved, current)} of the run-identity keys that differ; total_steps may change on a resume (a run
-    extended past its budget), every other key (torch_threads too: it changes the float reduction order) must not."""
+    extended past its budget), every other key (torch_threads too: it changes the float reduction order) must not.
+    A config without architecture keys reads as 64 x 1 (with_legacy_arch)."""
+    saved, current = with_legacy_arch(saved), with_legacy_arch(current)
     keys = sorted((saved.keys() | current.keys()) - {"total_steps"})
     return {k: (saved.get(k, "<absent>"), current.get(k, "<absent>")) for k in keys
             if k not in saved or k not in current or saved[k] != current[k]}
@@ -405,17 +417,21 @@ def find_latest_checkpoint(checkpoint_dir: str):
 
 
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
-          save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None):
+          save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, embd_size: int = EMBD_SIZE,
+          n_layers: int = N_LAYERS, row0_tol: float = None):
+    row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
     workers = make_workers()
     try:
-        _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers)
+        _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
+               embd_size, n_layers, row0_tol)
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
 
 
 def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int, save_every: int,
-           expect_prior_ce, expect_shanten, workers):
+           expect_prior_ce, expect_shanten, workers, embd_size: int, n_layers: int,
+           row0_tol: float):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
@@ -423,10 +439,18 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
 
     if model_name == "encoder_conv":
         torch.manual_seed(MODEL_SEED)
-        model = EncoderConvModel().to(device)
+        model = EncoderConvModel(n_layers=n_layers, embd_size=embd_size).to(device)
         batch_size = 2
     else:
         raise NotImplementedError(f"Model {model_name} not implemented.")
+    # T-010 G0: the built model has the asked architecture (its real dims, not the arguments) and the parameter count
+    # of that architecture, which the header records
+    n_params = sum(p.numel() for p in model.parameters())
+    assert (model.ln_f.normalized_shape, len(model.blocks)) == ((embd_size,), n_layers), (
+        f"built ln_f {model.ln_f.normalized_shape} x {len(model.blocks)} blocks, asked {embd_size} x {n_layers}")
+    expected_params = count_parameters(embd_size, n_layers)
+    assert n_params == expected_params, f"{n_params} parameters, expected {expected_params}"
+    log(f"model {model_name}: embd_size {embd_size}, n_layers {n_layers}, {n_params:,} parameters")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     warmup_steps = min(1000, total_steps // 10)  # a 300-step smoke must leave warmup; a 1,100-step run must not collapse
@@ -451,6 +475,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         "val_year": VAL_YEAR, "val_days": list(VAL_DAYS), "val_games": VAL_GAMES, "val_seed": VAL_SEED,
         "prior_games": PRIOR_GAMES, "prior_seed": PRIOR_SEED, "prior_l2": PRIOR_L2,
         "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": TORCH_THREADS,
+        "embd_size": embd_size, "n_layers": n_layers, "n_params": n_params,
     }
 
     current_step, rows, header = 0, [], None
@@ -551,8 +576,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         if current_step == 0:
             gaps = {h: heads[h]["ce"] - uniform_ce[h] for h in HEADS}
             log("row 0 gap to uniform-legal CE: " + " | ".join(f"{h} {gaps[h]:+.4f}" for h in HEADS)
-                + f" (|gap| <= {UNIFORM_ROW0_TOL} required)")
-            assert all(abs(v) <= UNIFORM_ROW0_TOL for v in gaps.values()), f"row 0 is not near uniform-legal: {gaps}"
+                + f" (|gap| <= {row0_tol} required)")
+            assert all(abs(v) <= row0_tol for v in gaps.values()), f"row 0 is not near uniform-legal: {gaps}"
         bad = {h: heads[h]["ce"] for h in HEADS if not math.isfinite(heads[h]["ce"])}
         assert not bad, f"non-finite val CE at step {current_step}: {bad}"
         metrics.append({"type": "eval", "step": current_step, "total_steps": total_steps,
@@ -668,6 +693,11 @@ if __name__ == "__main__":
                         help="stop unless the prior's val CE per head (during, discard, post) equals these within 1e-4")
     parser.add_argument("--expect-shanten", type=int, default=None, metavar="N",
                         help="stop unless the shanten-greedy discard hits on the val set equal N")
+    parser.add_argument("--embd-size", type=int, default=EMBD_SIZE, help="model width (T-010)")
+    parser.add_argument("--n-layers", type=int, default=N_LAYERS, help="encoder blocks (T-010)")
+    parser.add_argument("--row0-tol", type=float, default=None, metavar="T",
+                        help=f"row-0 |val CE - uniform-legal CE| limit per head (default {UNIFORM_ROW0_TOL}); a wider "
+                             "init model starts further from uniform (T-010 128x2: post -0.069)")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -686,11 +716,12 @@ if __name__ == "__main__":
     os.makedirs(run_dir, exist_ok=True)
     log = RunLog(os.path.join(run_dir, "train.log"))
     log(f"Training {args.model_name} for {args.max_steps} steps in {run_dir} (eval every {args.eval_every}, "
-        f"save every {args.save_every})" + (" [profiling on]" if args.profile else ""))
+        f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers})"
+        + (" [profiling on]" if args.profile else ""))
 
     def _run():
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
-              args.expect_prior_ce, args.expect_shanten)
+              args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol)
 
     if args.profile:
         pr = cProfile.Profile()

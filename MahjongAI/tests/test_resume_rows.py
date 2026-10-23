@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 
+import pytest
 import torch
 
 from MahjongAI import supervised_learning as SL
@@ -13,13 +14,15 @@ from MahjongAI import supervised_learning as SL
 STEPS, EVAL_EVERY, SAVE_EVERY = 12, 5, 4  # rows 0, 5, 10, 12; checkpoints 4, 8, 12
 
 
-def _run(tmp_path, monkeypatch, root, name):
+def _run(tmp_path, monkeypatch, root, name, arch=(64, 1)):
     monkeypatch.setattr(SL, "DATA_ROOT", root)
     monkeypatch.setattr(SL, "VAL_GAMES", 2)
     monkeypatch.setattr(SL, "PRIOR_GAMES", 2)
     run_dir = tmp_path / name
     log = SL.RunLog(str(tmp_path / f"{name}.log"))
-    SL.train("encoder_conv", STEPS, str(run_dir), log, eval_every=EVAL_EVERY, save_every=SAVE_EVERY)
+    # the 128 x 2 init model sits 0.059 below uniform-legal on the fixture's post head: the T-010 run's --row0-tol 0.1
+    SL.train("encoder_conv", STEPS, str(run_dir), log, eval_every=EVAL_EVERY, save_every=SAVE_EVERY, embd_size=arch[0],
+             n_layers=arch[1], row0_tol=0.1 if arch != (64, 1) else None)
     return run_dir
 
 
@@ -48,11 +51,13 @@ def _assert_equal(a, b, where):
         assert a == b, f"{where}: {a!r} vs {b!r}"
 
 
-def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root):
+@pytest.mark.parametrize("arch", [(64, 1), (128, 2)])
+def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root,
+                                                                             arch):
     threads = torch.get_num_threads()
     try:
-        a = _run(tmp_path, monkeypatch, train_data_root, "a")
-        b = _run(tmp_path, monkeypatch, train_data_root, "b")
+        a = _run(tmp_path, monkeypatch, train_data_root, "a", arch)
+        b = _run(tmp_path, monkeypatch, train_data_root, "b", arch)
         # the disk of a kill -9 after row 10 and before the step-12 save: checkpoints 4 and 8; rows 0, 5, 10
         os.remove(b / "checkpoints" / "step_12.pt")
         header, rows = SL.Metrics(str(b / "metrics.jsonl")).read()
@@ -60,7 +65,7 @@ def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_
         resumed_from = torch.load(b / "checkpoints" / "step_8.pt", weights_only=True)
         assert all(n > 0 for _, n in resumed_from["train_sums"].values())  # steps 6..8 since row 5
         shutil.copy(tmp_path / "b.log", tmp_path / "b_first.log")
-        _run(tmp_path, monkeypatch, train_data_root, "b")
+        _run(tmp_path, monkeypatch, train_data_root, "b", arch)
     finally:
         torch.set_num_threads(threads)
     log_b = open(tmp_path / "b.log").read()
