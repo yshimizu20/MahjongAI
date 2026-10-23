@@ -6,10 +6,10 @@ CPU gradient) and the parameters after one AdamW update (the trainer's lr 1e-3) 
 (ln_f x 1.5) must fail it. The floor is for the attention key bias: softmax ignores a shift of a query's scores, so
 its gradient is zero by math and both devices give rounding noise (~1e-11) whose ratio means nothing.
 Eval: the val rows of an MPS run (computed on the trainer's CPU copy) equal a CPU model's val of the same weights.
-Resume [R6]: an MPS positions-mode run with dropout on, killed after an eval row, resumes to the unbroken MPS run:
-rows, step lines and every checkpoint field (MPS RNG state included). A miss reports the largest weight difference.
-In torch 2.5.1 it misses: nn.Embedding backward on MPS is not deterministic (two identical runs differ by ~1e-8
-after one step), so this test fails until that is fixed; the data path of the resume is checked exactly apart.
+Resume [R6]: an MPS positions-mode run with dropout on, killed after an eval row and resumed. Its data path (read
+and sample hashes, loader and batcher states, RNG states, row counters) equals the unbroken MPS run exactly; its
+weights and val CE are within 10 x the measured run-to-run noise of two unbroken MPS runs (nn.Embedding backward on
+MPS is not deterministic on torch 2.5.1). A resume without the optimizer state or the MPS RNG state must fail that.
 Load [R14]: an MPS checkpoint loads on the CPU in the viewer (infer.load_model) and the self-play player
 (ModelPlayer); their logits equal the CPU model of the same weights."""
 import glob
@@ -25,7 +25,7 @@ from MahjongAI.engine import players
 from MahjongAI.process_xml import process
 from MahjongAI.tests.conftest import build_train_data_root
 from MahjongAI.tests.test_legacy_forward_ref import GAMES, GATE_GAMES
-from MahjongAI.tests.test_positions_train import _run, assert_runs_equal, step_lines
+from MahjongAI.tests.test_positions_train import _run, step_lines
 from MahjongAI.tests.test_resume_rows import _assert_equal
 from MahjongAI.turn import HalfTurn
 from MahjongAI.viewer import infer
@@ -103,40 +103,82 @@ def mps_root(tmp_path_factory):
     return build_train_data_root(tmp_path_factory.mktemp("mps_data") / "data")
 
 
+# MPS backward (nn.Embedding) is not deterministic on torch 2.5.1; user decision 2026-10-22: tolerance vs the
+# measured run-to-run noise. Two unbroken MPS runs differ by ~1e-8 after one step, so a resumed MPS run is held to
+# NOISE_TIMES x the unbroken-vs-unbroken difference at the same step (plus an absolute floor); its data path and RNG
+# states stay exact.
+NOISE_TIMES, WEIGHT_FLOOR, CE_FLOOR = 10, 1e-6, 1e-5
+
+
+def _kill_and_resume(tmp_path, mp, root, name, patch=None):
+    """A run killed after its row-10 write (step_12.pt and row 12 removed), resumed from step_8.pt with
+    `patch` (object, attribute, replacement) in force."""
+    run = _run(tmp_path, mp, root, name, device="mps")
+    os.remove(run / "checkpoints" / "step_12.pt")
+    header, rows = SL.Metrics(str(run / "metrics.jsonl")).read()
+    SL.Metrics(str(run / "metrics.jsonl"))._write([header] + [r for r in rows if r["step"] <= 10])
+    with pytest.MonkeyPatch.context() as patched:
+        if patch:
+            patched.setattr(*patch)
+        _run(tmp_path, mp, root, name, device="mps")
+    assert "resuming at step 8;" in open(tmp_path / f"{name}.log").read()
+
+
+def _without_mps_rng(state, device):
+    torch.set_rng_state(state["torch_rng_state"])  # the MPS generator keeps whatever state it has
+
+
 @pytest.fixture(scope="module")
 def mps_runs(tmp_path_factory, mps_root):
-    """An unbroken MPS positions-mode run "a" (dropout on; a checkpoint every 2 steps) and a run "b" killed after
-    its row-10 write (step_12.pt and row 12 removed), then resumed."""
+    """MPS positions-mode runs, dropout on: "a" and "c" unbroken (a checkpoint every 2 steps; c measures the
+    run-to-run noise), "b" killed after its row-10 write and resumed, and two broken resumes (the negative controls):
+    "no_opt" restores no optimizer state, "no_rng" restores no MPS RNG state."""
     tmp_path = tmp_path_factory.mktemp("mps")
     with pytest.MonkeyPatch.context() as mp:
-        _run(tmp_path, mp, mps_root, "a", save_every=2, device="mps")
-        b = _run(tmp_path, mp, mps_root, "b", device="mps")
-        os.remove(b / "checkpoints" / "step_12.pt")
-        header, rows = SL.Metrics(str(b / "metrics.jsonl")).read()
-        SL.Metrics(str(b / "metrics.jsonl"))._write([header] + [r for r in rows if r["step"] <= 10])
-        _run(tmp_path, mp, mps_root, "b", device="mps")
+        for name in ("a", "c"):
+            _run(tmp_path, mp, mps_root, name, save_every=2, device="mps")
+        _kill_and_resume(tmp_path, mp, mps_root, "b")
+        _kill_and_resume(tmp_path, mp, mps_root, "no_opt",
+                         (torch.optim.AdamW, "load_state_dict", lambda self, state: None))
+        _kill_and_resume(tmp_path, mp, mps_root, "no_rng", (SL, "set_rng_state", _without_mps_rng))
     return tmp_path
 
 
-def _max_weight_diff(a, b):
-    sa = torch.load(a, map_location="cpu", weights_only=True)["model_state_dict"]
-    sb = torch.load(b, map_location="cpu", weights_only=True)["model_state_dict"]
-    return max((sa[k].double() - sb[k].double()).abs().max().item() for k in sa)
+def run_diffs(root, x, y, step=12) -> dict:
+    """Run x vs run y at `step`: max |weight diff| (step_<step>.pt) and per-head |val CE diff| (row <step>)."""
+    sx, sy = (torch.load(root / r / "checkpoints" / f"step_{step}.pt", map_location="cpu",
+                         weights_only=True)["model_state_dict"] for r in (x, y))
+    rx, ry = ({r["step"]: r for r in SL.Metrics(str(root / name / "metrics.jsonl")).read()[1]}[step]
+              for name in (x, y))
+    return {"weight": max((sx[k].double() - sy[k].double()).abs().max().item() for k in sx),
+            "ce": {h: abs(rx["heads"][h]["ce"] - ry["heads"][h]["ce"]) for h in SL.HEADS}}
 
 
-def test_mps_resume_equals_the_unbroken_mps_run(mps_runs):
+def within_noise(diffs: dict, noise: dict) -> bool:
+    """Every diff <= NOISE_TIMES x the run-to-run noise of the same quantity + its absolute floor."""
+    return diffs["weight"] <= NOISE_TIMES * noise["weight"] + WEIGHT_FLOOR and all(
+        diffs["ce"][h] <= NOISE_TIMES * noise["ce"][h] + CE_FLOOR for h in SL.HEADS)
+
+
+def test_mps_resume_is_within_the_run_to_run_noise(mps_runs):
     ckpt = torch.load(mps_runs / "a" / "checkpoints" / "step_12.pt", map_location="cpu", weights_only=True)
     assert ckpt["config"]["device"] == "mps" and "mps_rng_state" in ckpt
-    assert "resuming at step 8;" in open(mps_runs / "b.log").read()
-    diff = _max_weight_diff(mps_runs / "a" / "checkpoints" / "step_12.pt", mps_runs / "b" / "checkpoints" / "step_12.pt")
-    print(f"\nMPS resume vs unbroken MPS run, step_12 max |weight diff|: {diff}")
-    assert_runs_equal(mps_runs, "a", "b", (4, 8, 12))
+    noise, resumed = run_diffs(mps_runs, "a", "c"), run_diffs(mps_runs, "a", "b")
+    print(f"\nMPS step 12, unbroken vs unbroken (noise): {noise}\nMPS step 12, resumed vs unbroken: {resumed}")
+    assert within_noise(resumed, noise), (resumed, noise)
+
+
+@pytest.mark.parametrize("broken", ["no_opt", "no_rng"])
+def test_the_noise_check_fails_a_broken_resume(mps_runs, broken):
+    noise, diffs = run_diffs(mps_runs, "a", "c"), run_diffs(mps_runs, "a", broken)
+    print(f"\nMPS step 12, {broken} resume vs unbroken: {diffs} (noise {noise})")
+    assert not within_noise(diffs, noise), (broken, diffs, noise)
 
 
 def test_mps_resume_repeats_the_data_path_of_the_unbroken_mps_run(mps_runs):
-    """The device-free part of the resume: every step reads the same files and trains on the same rows (read hash,
-    sample digest), the loader and batcher states of every checkpoint are equal, and the batcher counters of every
-    row. This holds even where the MPS weights drift (nn.Embedding backward on MPS is not deterministic)."""
+    """Exact on MPS: every step reads the same files and trains on the same rows (read hash, sample digest); the
+    loader and batcher states and the CPU and MPS RNG states of every checkpoint, and the batcher counters of every
+    row, are equal."""
     tail = re.compile(r" \| read [0-9a-f]{12} \| sample [0-9a-f]{12}$")
     lines_a, lines_b = step_lines(mps_runs / "a.log"), step_lines(mps_runs / "b.log")
     assert sorted(lines_a) == sorted(lines_b) == list(range(1, 13))
@@ -145,7 +187,8 @@ def test_mps_resume_repeats_the_data_path_of_the_unbroken_mps_run(mps_runs):
     for step in (4, 8, 12):
         a, b = (torch.load(mps_runs / r / "checkpoints" / f"step_{step}.pt", map_location="cpu", weights_only=True)
                 for r in ("a", "b"))
-        for key in ("current_step", "loader_state", "batcher_state", "config", "val_ids"):
+        for key in ("current_step", "loader_state", "batcher_state", "config", "val_ids", "torch_rng_state",
+                    "mps_rng_state"):
             _assert_equal(a[key], b[key], f"step_{step}.pt.{key}")
     rows_a, rows_b = (SL.Metrics(str(mps_runs / r / "metrics.jsonl")).read()[1] for r in ("a", "b"))
     _assert_equal([r.get("positions") for r in rows_a], [r.get("positions") for r in rows_b], "rows positions")
