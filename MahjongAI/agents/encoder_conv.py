@@ -188,6 +188,7 @@ class EncoderConvModel(nn.Module):
             tensors_discard,
             tensors_post,
         ) = self.tensor_processor.prepare_batches(all_halfturns_list, all_encoding_tokens_list)
+        device = self.ln_f.weight.device  # the model's own device (T-055), not the module default
 
         results = {}
         for tensors, head in zip(
@@ -271,6 +272,32 @@ class EncoderConvModel(nn.Module):
             loss = F.cross_entropy(logits, y_tensor, reduction="mean")
             results[head] = HeadOutput(logits, loss, y_tensor)
 
+        return results
+
+    def forward_heads(self, batches: dict) -> dict:
+        """{head: HeadOutput} of ready per-head tensors (T-055 positions mode): batches = {head: (tokens (B, 150),
+        (x1, x2, x3), mask (B, A), y (B,), padding (B, 150))}, every row already checked at admission (binary mask,
+        a legal target). The network steps of `forward` (steps 1-6, the same ops), heads in during / discard / post
+        order, so dropout draws in the order of `forward`; no sampling and no device sync. Inputs move to the
+        model's own device."""
+        device = self.ln_f.weight.device
+        results = {}
+        for head in ("during", "discard", "post"):
+            if head not in batches:
+                continue
+            tokens, state, mask, y, padding = batches[head]
+            tokens, padding, mask, y = tokens.to(device), padding.to(device), mask.to(device), y.to(device)
+            state = tuple(t.to(device) for t in state)
+            fused = torch.cat([self.token_embedder(tokens), self.state_net(state).unsqueeze(1)], dim=1)
+            state_mask = torch.ones(padding.size(0), 1, dtype=torch.bool, device=device)
+            attn_mask = torch.cat([padding, state_mask], dim=1).unsqueeze(1)  # (B, 1, 151)
+            x = fused
+            for i, block in enumerate(self.blocks):
+                x = block(x, attn_mask, state_row_only=(i == len(self.blocks) - 1))
+            logits = self.heads[head](self.ln_f(x[:, -1, :]))
+            assert logits.shape == mask.shape, f"{head}: logits {tuple(logits.shape)}, mask {tuple(mask.shape)}"
+            logits = logits.masked_fill(mask == 0, -1e9)
+            results[head] = HeadOutput(logits, F.cross_entropy(logits, y, reduction="mean"), y)
         return results
 
 
