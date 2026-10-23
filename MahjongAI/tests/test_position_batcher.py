@@ -8,7 +8,8 @@ is compared row by row (provenance -> file, and the tensor contents -> the same 
 comparison fails on a dropped, duplicated, reordered or corrupted row.
 Real games: the batcher's tensors equal a FIFO over TransformerTensorProcessor.prepare_batches per game.
 Failure boundaries: a stop inside a fill (before or after a draw, inside an admission, at an epoch change), an
-UnexpectedSkip after admitted games, a dead worker, a failure between peek and commit. After each, a batcher and
+UnexpectedSkip after admitted games, a dead worker, a failure while a game enters the buffers, a failure between peek
+and commit. After each, a batcher and
 cluster restored from their weights_only state (or the same objects, in-process) give the reference's steps and,
 after every commit, the reference's cluster and batcher state."""
 import collections
@@ -29,7 +30,7 @@ from MahjongAI.process_xml import InvalidGameException
 from MahjongAI.utils import dataloader as DL
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip, epoch_order
 from MahjongAI.utils.game_workers import DataWorkerError, GameWorkers
-from MahjongAI.utils.position_batcher import HEADS, SIDE_CAP, PositionBatcher, emit_counts, side_take
+from MahjongAI.utils.position_batcher import HEADS, SIDE_CAP, PositionBatcher, RowBuffer, emit_counts, side_take
 
 DIMS = {"during": 72, "discard": 37, "post": 154}
 EXPECTED = SL.EXPECTED_SKIPS | {"invalid:synthetic"}
@@ -318,7 +319,18 @@ def test_side_buffer_above_the_cap_raises_and_drops_nothing(tmp_path, synthetic)
     assert sum(batcher.rows_in["post"].values()) - sum(batcher.rows_out["post"].values()) == buffered
 
 
-@pytest.mark.parametrize("specs", [["invalid:synthetic"] * 4, [[(2, 0, 3)]] * 4],
+def test_side_buffer_cap_is_checked_after_each_admission(tmp_path, synthetic):
+    """Games of one discard row and 5 post rows: the post buffer passes 8 x 1 at the 2nd admission, long before the
+    40-row discard fill ends. The cap raises there, not after the fill (Codex round 2)."""
+    sizes = {"during": 1, "discard": 40, "post": 1}
+    root = write_corpus(tmp_path / "A", [[(0, 1, 5)]] * 50)
+    batcher = PositionBatcher(make_cluster([root]), sizes, SyntheticProcessor())
+    with pytest.raises(RuntimeError, match=r"exceed 8 x the step size .* on \['post'\]; games admitted 2$"):
+        batcher.peek()
+    assert batcher.buffered() == {"during": 0, "discard": 2, "post": 10}
+
+
+@pytest.mark.parametrize("specs", [["invalid:synthetic"] * 4, [[(1, 0, 1)]] * 4],  # side rows under the cap
                          ids=["every_game_skipped", "no_discard_row"])
 def test_an_epoch_without_a_discard_row_raises(tmp_path, synthetic, specs):
     root = write_corpus(tmp_path / "A", specs)
@@ -525,6 +537,45 @@ def test_a_dead_worker_inside_a_fill_continues_as_the_unbroken_run(tmp_path, syn
     w.close()
     with synthetic_workers() as w2:
         _continue_and_compare(_restored([root], state, w2), reference, ids, done)
+
+
+@pytest.mark.parametrize("resume", ["restored", "in_process"])
+def test_a_failure_while_a_game_enters_the_buffers_undoes_its_draw(tmp_path, synthetic, monkeypatch, resume):
+    """A MemoryError at the discard buffer's append (the 2nd head, after the during rows went in) in step 3's 2nd
+    admission: the batcher and cluster states equal those before that draw (no partial game, the loader not past the
+    file), and the file is drawn again: the run continues as the unbroken run (Codex round 2)."""
+    root = write_corpus(tmp_path / "A", [[(1 + i % 3, 8 + i % 5, 2 + i % 4)] for i in range(20)])
+    reference = _reference_run([root], 10)
+    batcher = PositionBatcher(make_cluster([root]), SIZES, SyntheticProcessor())
+    ids = Ids([root])
+    run(batcher, 2, ids)
+    append, calls, before = RowBuffer.append, [0], []
+
+    def failing_append(self, cols, provenance):
+        if self is batcher.buffers["discard"]:
+            calls[0] += 1
+            if calls[0] == 2:
+                raise MemoryError("forced allocation failure at the discard append")
+        append(self, cols, provenance)
+
+    draw = batcher._draw
+
+    def recording_draw():
+        before.append((roundtrip(batcher.cluster.state_dict()), roundtrip(batcher.state_dict())))
+        draw()
+
+    with monkeypatch.context() as m:
+        m.setattr(RowBuffer, "append", failing_append)
+        m.setattr(batcher, "_draw", recording_draw)
+        with pytest.raises(MemoryError, match="forced allocation failure"):
+            run(batcher, 1, ids)
+    assert calls[0] == 2
+    state = (roundtrip(batcher.cluster.state_dict()), roundtrip(batcher.state_dict()))
+    assert state[0] == before[-1][0], "the cluster is past the file that failed to enter"
+    assert_state_equal(state[1], before[-1][1], "batcher after the failed admission")
+    if resume == "restored":
+        batcher = _restored([root], state)
+    _continue_and_compare(batcher, reference, ids, 2)
 
 
 @pytest.mark.parametrize("resume", ["restored", "in_process"])

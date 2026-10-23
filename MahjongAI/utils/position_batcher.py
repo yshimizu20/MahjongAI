@@ -11,7 +11,9 @@ no RNG.
 Transaction: `peek` fills the buffers (admissions are permanent) and returns the step's rows without removing them;
 `commit`, called after optimizer.step(), removes them. A failure between the two leaves the buffers whole, so a
 stop checkpoint keeps every row an update has not trained on. An UnexpectedSkip or a dead worker in a draw leaves
-every buffer, counter and provenance as it was (the loaders roll back or move past their own draw).
+every buffer, counter and provenance as it was (the loaders roll back or move past their own draw). A game enters the
+three buffers all or nothing; a failure while it enters undoes its draw. The side-buffer cap is checked after each
+admission.
 """
 import hashlib
 import os
@@ -158,7 +160,9 @@ class PositionBatcher:
             return list(game.unpack(self.processor))
         return [self.processor.build_tensors(h, t) for h, t in zip(game, tokens)]
 
-    def _admit(self, game, tokens, file: str, loader: int, epoch: int, index: int):
+    def _check(self, game, tokens, file: str, loader: int, epoch: int, index: int) -> dict:
+        """{head: [(7 tensors, provenance)] per round with rows} of the game, every round built and checked; a build
+        error, a tensor-level skip or a failed row check raises here, before anything is admitted."""
         rounds = self._build(game, tokens)
         if self.processor.skipped:
             raise UnexpectedSkip(f"tensor-level skip {dict(self.processor.skipped)} in the training game "
@@ -173,15 +177,17 @@ class PositionBatcher:
                     prov = torch.tensor([[loader, epoch, index, r, 0]], dtype=torch.int64).repeat(n, 1)
                     prov[:, 4] = torch.arange(n)
                     per_head[h].append((_flatten(t), prov))
-        for h in HEADS:  # every check passed: the game enters all three buffers together
-            parts = per_head[h]
-            if parts:
-                cols = tuple(torch.cat([p[0][i] for p in parts]) for i in range(7))
-                self.buffers[h].append(cols, torch.cat([p[1] for p in parts]))
-                n = sum(len(p[1]) for p in parts)
-                self.rows_in[h][epoch] = self.rows_in[h].get(epoch, 0) + n
+        return per_head
+
+    def _admit(self, per_head: dict, file: str, epoch: int):
+        """A checked game enters all three buffers together: every head's rows are concatenated first, then appended."""
+        staged = {h: (tuple(torch.cat([p[0][i] for p in parts]) for i in range(7)), torch.cat([p[1] for p in parts]))
+                  for h, parts in per_head.items() if parts}
+        for h, (cols, prov) in staged.items():
+            self.buffers[h].append(cols, prov)
+            self.rows_in[h][epoch] = self.rows_in[h].get(epoch, 0) + len(prov)
         self.games_admitted[epoch] = self.games_admitted.get(epoch, 0) + 1
-        self.read_since_update.append(where)
+        self.read_since_update.append(os.path.basename(file))
 
     def _snapshot(self):
         """Everything one draw and its admission change: the cluster's and its loaders' positions, the buffers'
@@ -206,9 +212,10 @@ class PositionBatcher:
 
     def _draw(self):
         """One cluster draw; the game it returns (none when it was skipped) is admitted. An interrupt (not an
-        Exception: KeyboardInterrupt, SystemExit) inside the draw or the admission undoes both, so a stop never
-        loses a drawn game; a rejected game (build error, tensor-level skip, a failed row check) stays drawn: the
-        stop names it and the loader is past it, as in games mode."""
+        Exception: KeyboardInterrupt, SystemExit) inside the draw or the checks undoes both, so a stop never loses a
+        drawn game; a rejected game (build error, tensor-level skip, a failed row check) stays drawn: the stop names it
+        and the loader is past it, as in games mode. A checked game enters all three buffers or none: any failure
+        while it enters (an allocation error, an interrupt) undoes the draw too, so the file is drawn again."""
         snapshot = self._snapshot()
         try:
             games, tokens = next(self.cluster)
@@ -222,24 +229,35 @@ class PositionBatcher:
             loader = self.cluster.dataloaders[self.cluster.idx]
             file, index = self.cluster.last_batch_files[0], loader.current_index - 1
             assert loader.file_list[index] == file, f"{file} is not file {index} of the epoch order"
-            self._admit(games[0], tokens[0], file, self.cluster.idx, loader.epoch, index)
+            per_head = self._check(games[0], tokens[0], file, self.cluster.idx, loader.epoch, index)
         except Exception:
             raise
         except BaseException:
             self._restore(snapshot)
             raise
+        try:
+            self._admit(per_head, file, loader.epoch)
+        except BaseException:
+            self._restore(snapshot)
+            raise
 
     # ---------------------------------------------------------------- the step transaction
-    def peek(self) -> dict:
-        """{head: (tokens, (x1, x2, x3), mask, y, padding)} of the next step, absent heads left out. Draws games
-        until the discard buffer holds a step; removes nothing (commit does)."""
-        while len(self.buffers["discard"]) < self.sizes["discard"]:
-            self._draw()
+    def _check_side_cap(self):
+        """Raises when a post / during buffer holds more than SIDE_CAP x its step size (the rows stay buffered)."""
         buffered = self.buffered()
         over = {h: n for h, n in buffered.items() if h != "discard" and n > SIDE_CAP * self.sizes[h]}
         if over:
             raise RuntimeError(f"position buffers {buffered} exceed {SIDE_CAP} x the step size {self.sizes} on "
                                f"{sorted(over)}; games admitted {sum(self.games_admitted.values())}")
+
+    def peek(self) -> dict:
+        """{head: (tokens, (x1, x2, x3), mask, y, padding)} of the next step, absent heads left out. Draws games
+        until the discard buffer holds a step; removes nothing (commit does)."""
+        self._check_side_cap()
+        while len(self.buffers["discard"]) < self.sizes["discard"]:
+            self._draw()
+            self._check_side_cap()  # after each admission: low-discard games can grow a side buffer within one fill
+        buffered = self.buffered()
         for h in HEADS:
             self.max_buffered[h] = max(self.max_buffered[h], buffered[h])
         counts = emit_counts(buffered, self.sizes)
