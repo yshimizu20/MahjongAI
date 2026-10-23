@@ -3,7 +3,8 @@
 Parity: dropout off, the same weights and tensors (two fixture games, every head): per-head loss within 1e-4, every
 gradient within 1e-4 relative (per parameter: max |diff| / max |CPU grad|, the scale floored at 1e-6 x the largest
 CPU gradient) and the parameters after one AdamW update (the trainer's lr 1e-3) within 1e-4; a perturbed weight
-(ln_f x 1.5) must fail it. The floor is for the attention key bias: softmax ignores a shift of a query's scores, so
+(ln_f x 1.5) and a NaN gradient must fail it (every loss, gradient and updated parameter is checked finite before the
+maxima, which are NaN-aware). The floor is for the attention key bias: softmax ignores a shift of a query's scores, so
 its gradient is zero by math and both devices give rounding noise (~1e-11) whose ratio means nothing.
 Eval: the val rows of an MPS run (computed on the trainer's CPU copy) equal a CPU model's val of the same weights.
 Resume [R6]: an MPS positions-mode run with dropout on, killed after an eval row and resumed. Its data path (read
@@ -13,6 +14,8 @@ MPS is not deterministic on torch 2.5.1). A resume without the optimizer state o
 Load [R14]: an MPS checkpoint loads on the CPU in the viewer (infer.load_model) and the self-play player
 (ModelPlayer); their logits equal the CPU model of the same weights."""
 import glob
+import json
+import math
 import os
 import re
 
@@ -52,6 +55,18 @@ def _without_dropout(model):
     return model.train()
 
 
+def assert_finite(label: str, named) -> None:
+    """Every (name, tensor or float) value finite; else an AssertionError naming them."""
+    bad = [n for n, v in named if not (bool(torch.isfinite(v).all()) if torch.is_tensor(v) else math.isfinite(v))]
+    assert not bad, f"non-finite {label}: {bad[:5]}"
+
+
+def nan_max(values) -> float:
+    """max, NaN when any value is NaN (Python's max skips a NaN that comes after a finite value)."""
+    values = list(values)
+    return math.nan if any(math.isnan(v) for v in values) else max(values)
+
+
 def _step(model, batches):
     """Per-head loss, gradients and the parameters after one AdamW update (lr 1e-3), all on the CPU."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -63,8 +78,9 @@ def _step(model, batches):
     return losses, grads, [p.detach().cpu().clone() for p in model.parameters()]
 
 
-def parity_diffs(games, perturb=False) -> dict:
-    """The largest MPS - CPU differences: per-head loss (abs), gradients (relative), updated parameters (abs)."""
+def parity_diffs(games, perturb=False, nan_grad=False) -> dict:
+    """The largest MPS - CPU differences: per-head loss (abs), gradients (relative), updated parameters (abs).
+    nan_grad: a hook turns the MPS during_head.bias gradient into NaN (the negative control of the finite checks)."""
     torch.manual_seed(0)
     cpu = _without_dropout(EncoderConvModel(verbose=False))
     halfturns, tokens = [g[0] for g in games], [g[1] for g in games]
@@ -75,14 +91,21 @@ def parity_diffs(games, perturb=False) -> dict:
     if perturb:
         with torch.no_grad():
             gpu.ln_f.weight.mul_(1.5)
+    if nan_grad:
+        gpu.during_head.bias.register_hook(lambda g: torch.full_like(g, float("nan")))
     loss_c, grads_c, params_c = _step(cpu, batches)
     loss_g, grads_g, params_g = _step(gpu, batches)
     assert next(gpu.parameters()).device.type == "mps"
-    floor = 1e-6 * max(g.abs().max().item() for g in grads_c)
-    return {"loss": max(abs(loss_c[h] - loss_g[h]) for h in SL.HEADS),
-            "grad_rel": max((a - b).abs().max().item() / max(a.abs().max().item(), floor)
-                            for a, b in zip(grads_c, grads_g)),
-            "param": max((a - b).abs().max().item() for a, b in zip(params_c, params_g))}
+    names = [n for n, _ in cpu.named_parameters()]
+    for device, losses, grads, params in (("CPU", loss_c, grads_c, params_c), ("MPS", loss_g, grads_g, params_g)):
+        assert_finite(f"{device} loss", losses.items())
+        assert_finite(f"{device} gradient", zip(names, grads))
+        assert_finite(f"{device} updated parameter", zip(names, params))
+    floor = 1e-6 * nan_max(g.abs().max().item() for g in grads_c)
+    return {"loss": nan_max(abs(loss_c[h] - loss_g[h]) for h in SL.HEADS),
+            "grad_rel": nan_max((a - b).abs().max().item() / max(a.abs().max().item(), floor)
+                                for a, b in zip(grads_c, grads_g)),
+            "param": nan_max((a - b).abs().max().item() for a, b in zip(params_c, params_g))}
 
 
 def test_dropout_off_parity_of_loss_gradients_and_one_update(games):
@@ -95,6 +118,13 @@ def test_parity_fails_on_a_perturbed_weight(games):
     diffs = parity_diffs(games, perturb=True)
     print(f"\nMPS (ln_f x 1.5) vs CPU: {diffs}")
     assert diffs["loss"] > TOL and diffs["grad_rel"] > TOL, diffs
+
+
+def test_parity_fails_on_a_nan_gradient(games):
+    """A NaN gradient of one parameter (finite losses; Adam then makes that parameter NaN) must fail the gate
+    (Codex round 2: Python's max can skip a NaN after a finite value)."""
+    with pytest.raises(AssertionError, match="non-finite"):
+        print(f"\nMPS (NaN during_head.bias grad) vs CPU: {parity_diffs(games, nan_grad=True)}")
 
 
 # ---------------------------------------------------------------- runs on MPS
@@ -150,7 +180,10 @@ def run_diffs(root, x, y, step=12) -> dict:
                          weights_only=True)["model_state_dict"] for r in (x, y))
     rx, ry = ({r["step"]: r for r in SL.Metrics(str(root / name / "metrics.jsonl")).read()[1]}[step]
               for name in (x, y))
-    return {"weight": max((sx[k].double() - sy[k].double()).abs().max().item() for k in sx),
+    for name, weights, row in ((x, sx, rx), (y, sy, ry)):
+        assert_finite(f"weight in {name}/step_{step}.pt", weights.items())
+        assert_finite(f"val CE in {name} row {step}", ((h, row["heads"][h]["ce"]) for h in SL.HEADS))
+    return {"weight": nan_max((sx[k].double() - sy[k].double()).abs().max().item() for k in sx),
             "ce": {h: abs(rx["heads"][h]["ce"] - ry["heads"][h]["ce"]) for h in SL.HEADS}}
 
 
@@ -158,6 +191,19 @@ def within_noise(diffs: dict, noise: dict) -> bool:
     """Every diff <= NOISE_TIMES x the run-to-run noise of the same quantity + its absolute floor."""
     return diffs["weight"] <= NOISE_TIMES * noise["weight"] + WEIGHT_FLOOR and all(
         diffs["ce"][h] <= NOISE_TIMES * noise["ce"][h] + CE_FLOOR for h in SL.HEADS)
+
+
+def test_run_diffs_fails_on_a_nan_weight(tmp_path):
+    """A NaN in the last weight of a checkpoint (after finite ones, where Python's max skips it) must fail."""
+    row = {"type": "eval", "step": 12, "heads": {h: {"ce": 1.0} for h in SL.HEADS}}
+    for name, last in (("x", 1.0), ("y", math.nan)):
+        (tmp_path / name / "checkpoints").mkdir(parents=True)
+        weights = {"a": torch.tensor([1.0, 2.0]), "b": torch.tensor([last])}
+        torch.save({"model_state_dict": weights}, tmp_path / name / "checkpoints" / "step_12.pt")
+        (tmp_path / name / "metrics.jsonl").write_text(json.dumps({"type": "header"}) + "\n" + json.dumps(row) + "\n")
+    assert run_diffs(tmp_path, "x", "x")["weight"] == 0
+    with pytest.raises(AssertionError, match=r"non-finite weight in y/step_12.pt: \['b'\]"):
+        run_diffs(tmp_path, "x", "y")
 
 
 def test_mps_resume_is_within_the_run_to_run_noise(mps_runs):
