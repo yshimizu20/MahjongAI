@@ -106,14 +106,17 @@ def reference_stream(roots, expected=EXPECTED, seed=0):
         yield file, epoch, rows
 
 
-def reference_steps(stream, sizes, n_steps, peaks=None):
+def reference_steps(stream, sizes, n_steps, peaks=None, tally=None):
     """Per step {head: [row id]}: the emit rule written out in plain Python over FIFO deques. peaks: a dict that
-    gets the largest buffer per head (after a fill, before the take)."""
-    buf, steps = {h: collections.deque() for h in HEADS}, []
+    gets the largest buffer per head (after a fill, before the take). tally: a list that gets, after each step, the
+    games read per source epoch and the rows left in each buffer."""
+    buf, steps, games = {h: collections.deque() for h in HEADS}, [], collections.Counter()
     for _ in range(n_steps):
         while len(buf["discard"]) < sizes["discard"]:
-            for h, rows in next(stream)[2].items():
-                buf[h].extend(rows)
+            _, epoch, rows = next(stream)
+            games[epoch] += 1
+            for h, ids in rows.items():
+                buf[h].extend(ids)
         if peaks is not None:
             peaks.update({h: max(peaks.get(h, 0), len(buf[h])) for h in HEADS})
         step = {}
@@ -122,7 +125,31 @@ def reference_steps(stream, sizes, n_steps, peaks=None):
             k = size if h == "discard" else 2 * size if n >= 2 * size else size if n >= size else 0
             step[h] = [buf[h].popleft() for _ in range(k)]
         steps.append(step)
+        if tally is not None:
+            tally.append({"games": games.copy(), "buffered": {h: list(buf[h]) for h in HEADS}})
     return steps
+
+
+def epoch_counter_problems(report, steps, tally) -> list:
+    """Problems of a batcher report's per-source-epoch counters against the reference after `steps` (its tally entry
+    of that step): games per epoch, and per head rows out (the epochs of the emitted row ids) and rows in (emitted +
+    left in the buffer). Empty: equal."""
+    def by_epoch(counter):
+        return {str(e): n for e, n in sorted(counter.items()) if n}
+
+    problems = []
+    if report["games_by_epoch"] != by_epoch(tally["games"]):
+        problems.append(f"games by epoch {report['games_by_epoch']}, the reference {by_epoch(tally['games'])}")
+    for h in HEADS:
+        out = collections.Counter(row[1] for step in steps for row in step[h])
+        left = collections.Counter(row[1] for row in tally["buffered"][h])
+        if report["rows_out"][h] != by_epoch(out):
+            problems.append(f"{h}: rows out {report['rows_out'][h]}, the reference {by_epoch(out)}")
+        if report["rows_in"][h] != by_epoch(out + left):
+            problems.append(f"{h}: rows in {report['rows_in'][h]}, the reference {by_epoch(out + left)}")
+        if report["buffered"][h] != len(tally["buffered"][h]):
+            problems.append(f"{h}: {report['buffered'][h]} rows buffered, the reference {len(tally['buffered'][h])}")
+    return problems
 
 
 class Ids:
@@ -245,8 +272,8 @@ def test_steps_equal_the_reference(tmp_path, synthetic, pattern):
     specs, sizes, n_steps = PATTERNS[pattern]
     seed = None if pattern == "codex_burst" else 0
     root = write_corpus(tmp_path / "A", specs)
-    peaks = {}
-    expected = reference_steps(reference_stream([root], seed=seed), sizes, n_steps, peaks)
+    peaks, tally = {}, []
+    expected = reference_steps(reference_stream([root], seed=seed), sizes, n_steps, peaks, tally)
     batcher = PositionBatcher(make_cluster([root], seed=seed), sizes, SyntheticProcessor())
     ids = Ids([root], seed)
     max_seen = {h: 0 for h in HEADS}
@@ -254,11 +281,12 @@ def test_steps_equal_the_reference(tmp_path, synthetic, pattern):
         run(batcher, 1, ids, expected, sizes, start=s)
         max_seen = {h: max(max_seen[h], batcher.max_buffered[h]) for h in HEADS}
         assert all(batcher.buffered()[h] <= SIDE_CAP * sizes[h] for h in ("during", "post"))
+        # conservation by source epoch: in = out + buffered, each against the reference's provenance
+        problems = epoch_counter_problems(batcher.report(), expected[:s + 1], tally[s])
+        assert not problems, f"step {s}: {problems}"
     assert max_seen == peaks, (max_seen, peaks)
     report = batcher.report()
-    for h in HEADS:  # conservation: in = out + buffered, by source epoch
-        n_in, n_out = sum(report["rows_in"][h].values()), sum(report["rows_out"][h].values())
-        assert n_in - n_out == report["buffered"][h] and n_out == sum(len(e[h]) for e in expected)
+    for h in HEADS:
         assert sum(report["taken"][h].values()) == n_steps
     if pattern == "random":
         assert len(report["games_by_epoch"]) >= 3 and report["taken"]["during"].get("0", 0) > 0
@@ -270,6 +298,32 @@ def test_steps_equal_the_reference(tmp_path, synthetic, pattern):
         # the buffer holds them) peaks lower, well under the 8 x 320 cap
         assert max_seen["post"] < 1240 and max_seen["post"] <= SIDE_CAP * sizes["post"], max_seen
         assert report["taken"]["during"] == {"0": n_steps}
+
+
+class EpochZero(PositionBatcher):
+    """A mutant that credits every emitted row to source epoch 0 (totals unchanged)."""
+
+    def commit(self):
+        out = super().commit()
+        self.rows_out = {h: {0: sum(self.rows_out[h].values())} if self.rows_out[h] else {} for h in HEADS}
+        return out
+
+
+def test_per_epoch_counters_fail_a_batcher_crediting_every_row_to_epoch_0(tmp_path, synthetic):
+    """The mutant keeps every total (in - out = buffered, rows out = rows emitted): only the per-epoch comparison
+    against the reference provenance catches it, once the run is past epoch 0."""
+    specs, sizes, n_steps = PATTERNS["random"]
+    root = write_corpus(tmp_path / "A", specs)
+    tally = []
+    expected = reference_steps(reference_stream([root]), sizes, n_steps, tally=tally)
+    batcher = EpochZero(make_cluster([root]), sizes, SyntheticProcessor())
+    run(batcher, n_steps, Ids([root]), expected, sizes)
+    report = batcher.report()
+    for h in HEADS:  # the totals hold
+        n_in, n_out = sum(report["rows_in"][h].values()), sum(report["rows_out"][h].values())
+        assert n_in - n_out == report["buffered"][h] and n_out == sum(len(e[h]) for e in expected)
+    problems = epoch_counter_problems(report, expected, tally[-1])
+    assert problems and all("rows out" in p for p in problems), problems
 
 
 def test_negative_controls_fail_the_comparison(tmp_path, synthetic):
@@ -425,11 +479,17 @@ SIZES = {"during": 3, "discard": 30, "post": 8}  # ~2-3 synthetic games per step
 
 
 def _reference_run(roots, n_steps, expected=EXPECTED):
-    """The unbroken run: per step (row ids, read, digest) and the (cluster, batcher) state after its commit."""
+    """The unbroken run: per step (row ids, read, digest) and the (cluster, batcher) state after its commit. Each step
+    and the per-epoch counters after it equal the independent reference (reference_steps)."""
+    tally = []
+    want = reference_steps(reference_stream(roots, expected=expected), SIZES, n_steps, tally=tally)
     batcher = PositionBatcher(make_cluster(roots, expected=expected), SIZES, SyntheticProcessor())
     ids, out = Ids(roots), []
-    for _ in range(n_steps):
-        out.append((run(batcher, 1, ids)[0], roundtrip(batcher.cluster.state_dict()), roundtrip(batcher.state_dict())))
+    for s in range(n_steps):
+        out.append((run(batcher, 1, ids, want, SIZES, start=s)[0], roundtrip(batcher.cluster.state_dict()),
+                    roundtrip(batcher.state_dict())))
+        problems = epoch_counter_problems(batcher.report(), want[:s + 1], tally[s])
+        assert not problems, f"reference run, step {s}: {problems}"
     return out
 
 

@@ -7,6 +7,8 @@ Failure boundaries: a stop inside a fill (an interrupt after a cluster draw) and
 before the commit (a forced clip_grad_norm_ error) each save a checkpoint from which the resume ends equal to the
 unbroken run; the second one's stop checkpoint equals the unbroken run's checkpoint of that step except the fill
 (RNG from before the failed forward; the buffers whole, with the rows the failed step's fill drew).
+Counters: every eval row's per-source-epoch counters (games, rows in / out per head) equal an independent reference
+over the trainer's loader order (prepare_batches per game, the plain-Python emit rule).
 Identity: batch mode, sizes and device are run-identity keys; a config without them reads as games mode on the CPU."""
 import os
 import re
@@ -16,6 +18,8 @@ import pytest
 import torch
 
 from MahjongAI import supervised_learning as SL
+from MahjongAI.agents.encoder_conv import TransformerTensorProcessor
+from MahjongAI.tests.test_position_batcher import epoch_counter_problems, reference_steps
 from MahjongAI.tests.test_resume_rows import _assert_equal
 
 STEPS, EVAL_EVERY, SAVE_EVERY = 12, 5, 4  # rows 0, 5, 10, 12; checkpoints 4, 8, 12
@@ -62,6 +66,25 @@ def assert_runs_equal(tmp_path, a, b, checkpoints, ckpt_b=None):
                       f"step_{step}.pt")
 
 
+def reference_epoch_counts(monkeypatch, root, n_steps):
+    """(steps, tally) of reference_steps over the trainer's loader order (a fresh serial cluster), each game's rows
+    counted per head by TransformerTensorProcessor.prepare_batches: a row id is (file, source epoch, row)."""
+    monkeypatch.setattr(SL, "DATA_ROOT", root)
+    cluster, processor = SL.train_cluster(lambda *_: None, 1), TransformerTensorProcessor()
+
+    def stream():
+        while True:
+            games, tokens = next(cluster)
+            if not games:
+                continue
+            file, epoch = cluster.last_batch_files[0], cluster.dataloaders[cluster.idx].epoch
+            built = processor.prepare_batches(games, tokens)
+            yield file, epoch, {h: [(file, epoch, i) for i in range(len(t[3]))] for h, t in zip(SL.HEADS, built)}
+
+    tally = []
+    return reference_steps(stream(), SIZES, n_steps, tally=tally), tally
+
+
 @pytest.fixture
 def unbroken(tmp_path, monkeypatch, train_data_root):
     """The unbroken positions-mode run "a" (save every 2 steps: a checkpoint for every even step)."""
@@ -69,7 +92,7 @@ def unbroken(tmp_path, monkeypatch, train_data_root):
     return tmp_path / "a"
 
 
-def test_unbroken_run_records_positions(tmp_path, unbroken):
+def test_unbroken_run_records_positions(tmp_path, monkeypatch, train_data_root, unbroken):
     header, rows = SL.Metrics(str(unbroken / "metrics.jsonl")).read()
     config = header["config"]
     assert (config["batch_mode"], config["position_sizes"], config["device"], config["batch_size"]) == (
@@ -78,8 +101,15 @@ def test_unbroken_run_records_positions(tmp_path, unbroken):
     last = rows[-1]["positions"]
     assert last["games_admitted"] > 40 and set(last["games_by_epoch"]) >= {"0", "1"}  # crossed an epoch
     assert last["taken"]["discard"] == {str(SIZES["discard"]): STEPS}
+    # per source epoch, every row's counters equal an independent reference over the same loader order
+    steps, tally = reference_epoch_counts(monkeypatch, train_data_root, STEPS)
+    for row in rows[1:]:
+        s = row["step"]
+        problems = epoch_counter_problems(row["positions"], steps[:s], tally[s - 1])
+        assert not problems, f"row {s}: {problems}"
+    zeroed = {**last, "rows_out": {h: {"0": sum(last["rows_out"][h].values())} for h in SL.HEADS}}
+    assert epoch_counter_problems(zeroed, steps, tally[-1]), "crediting every row to epoch 0 must fail"
     for h in SL.HEADS:
-        assert sum(last["rows_in"][h].values()) - sum(last["rows_out"][h].values()) == last["buffered"][h]
         assert rows[-1]["heads"][h]["train_n"] == sum(int(k) * n for k, n in last["taken"][h].items()) - sum(
             int(k) * n for k, n in rows[-2]["positions"]["taken"][h].items())
     lines = step_lines(tmp_path / "a.log")
