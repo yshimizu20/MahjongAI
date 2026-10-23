@@ -565,6 +565,17 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         assert not mismatch and header["val_ids"] == val.ids, (
             f"{metrics.path} header is from another run" + (f": {_mismatch_text(mismatch)}" if mismatch else ""))
         rows = metrics.truncate_after(current_step)
+        if any(r["step"] == current_step for r in rows):
+            # row current_step is on disk, so its interval is closed: a stop after the row's write and before the
+            # resets (or inside them) saved that interval's train sums and buffer peaks
+            peaks = None if batcher is None else dict(batcher.max_buffered)
+            sums = {h: list(train_sums[h]) for h in HEADS}
+            train_sums = {h: [0.0, 0] for h in HEADS}
+            if batcher is not None:
+                batcher.reset_max_buffered()
+            if any(sums[h][1] for h in HEADS) or (batcher is not None and peaks != batcher.max_buffered):
+                log(f"row {current_step} is on disk: its interval closed (train sums {sums} -> 0"
+                    + ("" if batcher is None else f", buffer peaks {peaks} -> {batcher.max_buffered}") + ")")
         log(f"Loaded checkpoint {latest_checkpoint}: resuming at step {current_step}; prior loaded "
             f"(no refit); data loader at {checkpoint['loader_state']}; metrics rows kept {[r['step'] for r in rows]}")
     else:
@@ -678,7 +689,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     # total_steps counts optimizer UPDATES: a batch without samples does not consume the budget, so the
     # cosine horizon and the number of updates agree. A persistent data failure aborts.
     batches_without_update = 0
-    consistent = True  # False only between optimizer.step() and current_step += 1: no checkpoint from there
+    consistent = True  # False from optimizer.step() until the step count, RNG snapshot and train sums match the update
     step_rng = None  # positions mode: the RNG state before the forward of a step not committed yet
     try:
         if is_eval_step(current_step) and not any(r["step"] == current_step for r in rows):
@@ -720,12 +731,12 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             if batcher is not None:
                 read, sample_digest = batcher.commit()
             current_step += 1
-            consistent = True
             step_rng = None
-
             for h, out in results.items():
                 train_sums[h][0] += out.loss.item() * out.y.numel()
                 train_sums[h][1] += out.y.numel()
+            consistent = True
+
             if batcher is None:
                 trace = f" | files {batch_files_hash(consumed)}"
             else:  # the files admitted since the last update, and the provenance of the rows this update trained on

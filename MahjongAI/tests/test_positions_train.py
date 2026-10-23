@@ -6,13 +6,17 @@ every checkpoint field (batcher buffers and provenance included).
 Failure boundaries: a stop inside a fill (an interrupt after a cluster draw) and a failure after the forward and
 before the commit (a forced clip_grad_norm_ error) each save a checkpoint from which the resume ends equal to the
 unbroken run; the second one's stop checkpoint equals the unbroken run's checkpoint of that step except the fill
-(RNG from before the failed forward; the buffers whole, with the rows the failed step's fill drew).
+(RNG from before the failed forward; the buffers whole, with the rows the failed step's fill drew). An interrupt
+after a commit and before the update's RNG snapshot and train sums are final saves no checkpoint; a failure after an
+eval row is on disk resumes with that row's interval closed. Both resume to the unbroken run.
 Counters: every eval row's per-source-epoch counters (games, rows in / out per head) equal an independent reference
 over the trainer's loader order (prepare_batches per game, the plain-Python emit rule).
 Identity: batch mode, sizes and device are run-identity keys; a config without them reads as games mode on the CPU."""
+import inspect
 import os
 import re
 import shutil
+import sys
 
 import pytest
 import torch
@@ -213,6 +217,96 @@ def test_failure_after_the_forward_before_the_commit_keeps_the_step(tmp_path, mo
             _assert_equal(rb["buffers"][h]["cols"], [c[:n] for c in sb["buffers"][h]["cols"]], f"{h} rows prefix")
     _run(tmp_path, monkeypatch, train_data_root, "b")
     assert_runs_equal(tmp_path, "a", "b", (8, 12))
+
+
+class InterruptAtLine:
+    """A KeyboardInterrupt (a signal's stand-in) raised by a trace function just before the first execution of the
+    source line `at` of SL._train after the line `after` ran n times: a window between two plain statements, which
+    no wrapped call reaches."""
+
+    def __init__(self, after: str, n: int, at: str):
+        lines, start = inspect.getsourcelines(SL._train)
+
+        def line_of(text):
+            found = [start + i for i, ln in enumerate(lines) if ln.strip() == text]
+            assert len(found) == 1, (text, found)
+            return found[0]
+
+        self.after, self.n, self.at, self.seen, self.fired = line_of(after), n, line_of(at), 0, False
+
+    def __enter__(self):
+        sys.settrace(self._call)
+        return self
+
+    def __exit__(self, *exc):
+        sys.settrace(None)
+
+    def _call(self, frame, event, arg):
+        return self._line if frame.f_code is SL._train.__code__ else None
+
+    def _line(self, frame, event, arg):
+        if event == "line" and not self.fired:
+            if frame.f_lineno == self.after:
+                self.seen += 1
+            elif frame.f_lineno == self.at and self.seen == self.n:
+                self.fired = True
+                raise KeyboardInterrupt(f"interrupt before line {self.at}")
+        return self._line
+
+
+@pytest.mark.parametrize("at", ["step_rng = None", "train_sums[h][1] += out.y.numel()"],
+                         ids=["before_the_rng_snapshot_is_cleared", "inside_the_train_sums_update"])
+def test_an_interrupt_after_the_commit_never_saves_a_half_finished_update(tmp_path, monkeypatch, train_data_root,
+                                                                          unbroken, at):
+    """An interrupt after update 7's commit, before the step's RNG snapshot is cleared or inside its train-sums update
+    (Codex round 2): no stop checkpoint holds the previous step's RNG or half-added train sums. The resume (from
+    step_4.pt) ends equal to the unbroken run."""
+    with InterruptAtLine("current_step += 1", 7, at) as trace:
+        with pytest.raises(KeyboardInterrupt, match="interrupt before line"):
+            _run(tmp_path, monkeypatch, train_data_root, "b")
+    assert trace.fired
+    assert "no checkpoint: the stop came inside an optimizer update" in open(tmp_path / "b.log").read()
+    assert sorted(os.listdir(tmp_path / "b" / "checkpoints")) == ["step_4.pt"]
+    _run(tmp_path, monkeypatch, train_data_root, "b")
+    assert "resuming at step 4;" in open(tmp_path / "b.log").read()
+    assert_runs_equal(tmp_path, "a", "b", (8, 12))
+
+
+@pytest.mark.parametrize("where", ["after_the_row_append", "inside_the_peak_reset"])
+def test_a_failure_after_an_eval_row_is_on_disk_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root,
+                                                                            unbroken, where):
+    """Row 10 is on disk, then a RuntimeError: right after Metrics.append returns (before the interval resets), or in
+    the buffer-peak reset (train sums already reset) (Codex round 2). The stop checkpoint step_10.pt holds the closed
+    interval's accounting; the resume keeps row 10, closes that interval (train sums, buffer peaks) and ends equal to
+    the unbroken run."""
+    if where == "after_the_row_append":
+        append = SL.Metrics.append
+
+        def fail_after_row_10(self, row):
+            append(self, row)
+            if row.get("type") == "eval" and row["step"] == 10:
+                raise RuntimeError("failure after the row-10 append")
+
+        patch = (SL.Metrics, "append", fail_after_row_10)
+    else:
+        reset, calls = SL.PositionBatcher.reset_max_buffered, [0]
+
+        def fail_at_row_10(self):
+            calls[0] += 1
+            if calls[0] == 3:  # rows 0, 5, 10
+                raise RuntimeError("failure after the row-10 append")
+            reset(self)
+
+        patch = (SL.PositionBatcher, "reset_max_buffered", fail_at_row_10)
+    with monkeypatch.context() as m:
+        m.setattr(*patch)
+        with pytest.raises(RuntimeError, match="failure after the row-10 append"):
+            _run(tmp_path, monkeypatch, train_data_root, "b")
+    assert [r["step"] for r in SL.Metrics(str(tmp_path / "b" / "metrics.jsonl")).read()[1]] == [0, 5, 10]
+    assert os.path.exists(tmp_path / "b" / "checkpoints" / "step_10.pt")
+    _run(tmp_path, monkeypatch, train_data_root, "b")
+    assert "resuming at step 10;" in open(tmp_path / "b.log").read()
+    assert_runs_equal(tmp_path, "a", "b", (4, 8, 12))
 
 
 # ---------------------------------------------------------------- run identity
