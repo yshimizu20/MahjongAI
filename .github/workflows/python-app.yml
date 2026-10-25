@@ -29,7 +29,8 @@ jobs:
         python -m pip install --upgrade pip
         # the CPU-only torch wheel first (no CUDA wheels to download); requirements.txt's unpinned torch accepts it
         pip install --index-url https://download.pytorch.org/whl/cpu torch
-        pip install flake8 pytest pytest-xdist
+        # xdist pinned: conftest places the self-test parts by 3.8.0 worksteal's first split (worksteal_starts)
+        pip install flake8 pytest pytest-xdist==3.8.0
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
         python -c "import torch; print('torch', torch.__version__)"
     - name: Lint with flake8
