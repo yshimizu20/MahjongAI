@@ -36,7 +36,8 @@ Log lines (through the run log, after its timestamp; seconds):
         admitted games <g> during <n> discard <n> post <n> total <n> | ms per 1k positions <x> | exposed wait <s> s |
         workers <n> busy <s>,... s files <n>,...
         outer: from the completion of update W to the completion of update W+M (MeasureWindow.update_done, called
-        right after the scheduler step of every update: a sync on MPS, then the clock); rows: rows trained in the window
+        right after the scheduler step of every update: a sync on MPS, then the clock; the workers' exposed wait and
+        busy counters are read right after it); rows: rows trained in the window
         per head (the batcher's rows_out counters, read after each endpoint update's commit, checked against the steps'
         own row counts); admitted: games and rows admitted in the window; busy / files: per data worker, the seconds it
         spent on parse + build + serialize and the files it finished in the window (in parallel with the trainer: never
@@ -169,6 +170,7 @@ class MeasureWindow:
         self.clock = clock
         self.batcher, self.step_rows, self.workers = batcher, step_rows, workers
         self.times = {}  # {endpoint update: perf_counter time of its completion}
+        self.counters = {}  # {endpoint update: (the workers' exposed wait, busy seconds), read right after the clock}
         self.mem = {}  # {endpoint update: its memory sample}
         self.start = None
 
@@ -176,19 +178,33 @@ class MeasureWindow:
     def last(self) -> int:
         return self.warmup + self.measure
 
+    def _worker_counters(self) -> tuple:
+        w = self.workers
+        return (0.0 if w is None else w.exposed_wait_s, [] if w is None else w.busy_seconds())
+
     def update_done(self, step: int):
-        """Right after the scheduler step of update `step`: at an endpoint, sync, the time, then the memory sample."""
-        if step in (self.warmup, self.last):
+        """Right after the scheduler step of update `step`, in this exact order (plan T-061 "Window endpoint samples"):
+        start (update W): the memory sample -> sync -> clock -> worker counters, so the sample's cost lands before the
+        window's clock; end (update W+M): sync -> clock -> worker counters -> the memory sample, so no sample is inside
+        the window or in the busy deltas."""
+        if step == self.warmup:
+            self.mem[step] = self.memory()
             self.sync()
             self.times[step] = self.clock()
+            self.counters[step] = self._worker_counters()
+        elif step == self.last:
+            self.sync()
+            self.times[step] = self.clock()
+            self.counters[step] = self._worker_counters()
             self.mem[step] = self.memory()
 
     def _reading(self, step: int) -> Reading:
         assert step in self.times, f"measure window: no completion time of update {step} (update_done not called)"
-        b, w = self.batcher, self.workers
+        b = self.batcher
+        wait, busy = self.counters[step]
         return Reading(self.times[step], {h: counts(b.rows_out[h]) for h in HEADS},
                        {h: counts(b.rows_in[h]) for h in HEADS}, counts(b.games_admitted), dict(self.step_rows()),
-                       0.0 if w is None else w.exposed_wait_s, [] if w is None else w.busy_seconds())
+                       wait, busy)
 
     def _memory_line(self, edge: str, step: int) -> str:
         return (f"measure-window memory {edge} step {step} | "

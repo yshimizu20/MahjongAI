@@ -435,10 +435,13 @@ def set_rng_state(state: dict, device: torch.device):
         torch.mps.set_rng_state(state["mps_rng_state"])
 
 
-def make_workers(timing: bool = False):
-    """The run's data workers (started on first use), or None for DATA_WORKERS = 0. timing: their T-057 clocks (exposed
-    wait, busy time), for --phase-timing / --measure-window only."""
-    return GameWorkers(DATA_WORKERS, build_game, window=DATA_PREFETCH, timing=timing) if DATA_WORKERS else None
+def make_workers(timing: bool = False, n: int = None, prefetch: int = None):
+    """The run's data workers (started on first use), or None for 0 workers. timing: their T-057 clocks (exposed
+    wait, busy time), for --phase-timing / --measure-window only. n / prefetch (T-061 --data-workers / --data-prefetch):
+    None = DATA_WORKERS / DATA_PREFETCH."""
+    n = DATA_WORKERS if n is None else n
+    prefetch = DATA_PREFETCH if prefetch is None else prefetch
+    return GameWorkers(n, build_game, window=prefetch, timing=timing) if n else None
 
 
 def train_cluster(log, batch_size: int, workers=None) -> DataLoaderCluster:
@@ -464,7 +467,8 @@ def find_latest_checkpoint(checkpoint_dir: str):
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, embd_size: int = EMBD_SIZE,
           n_layers: int = N_LAYERS, row0_tol: float = None, batch_mode: str = "games", position_sizes: dict = None,
-          device: str = "cpu", stop_after_step: int = None, phase_timing: bool = False, measure_window: tuple = None):
+          device: str = "cpu", stop_after_step: int = None, phase_timing: bool = False, measure_window: tuple = None,
+          data_workers: int = None, data_prefetch: int = None, torch_threads: int = None):
     """position_sizes: {head: step size N} of positions mode (default DEFAULT_SIZES): a step takes N discard rows and
     0, N or 2 N during / post rows (position_batcher.side_take); games mode takes none.
     stop_after_step: stop once this many updates are done (after that step's eval / save), with a checkpoint of that
@@ -476,7 +480,11 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     W + M (right after each scheduler step), the rows trained and admitted in between, the workers' busy time, a
     memory sample at each end, and the one eval and save at step W + M timed apart (T-057). Either T-057 flag turns
     the data workers' clocks on (exposed wait, busy time); with both off they read none. A fresh run only; it needs
-    stop_after_step = W + M and eval / save steps at W + M and none inside the window."""
+    stop_after_step = W + M and eval / save steps at W + M and none inside the window.
+    data_workers / data_prefetch / torch_threads (T-061): None = DATA_WORKERS / DATA_PREFETCH / TORCH_THREADS; each
+    >= 1. The workers' count and prefetch window change no batch (the loaders own the order) and are no run-identity
+    key; torch_threads is one (the config records the value used; it changes the float reduction order). The startup
+    pools (prior, validation) keep PRIOR_WORKERS / PRIOR_PREFETCH; the data workers keep one torch thread each."""
     row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
     assert batch_mode in BATCH_MODES and device in DEVICES, (batch_mode, device)
     if batch_mode == "positions":
@@ -486,11 +494,15 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     assert stop_after_step is None or stop_after_step > 0, f"stop_after_step {stop_after_step}: must be > 0"
     assert batch_mode == "positions" or not phase_timing, "phase timing is a positions-mode setting"
     assert batch_mode == "positions" or measure_window is None, "the measure window is a positions-mode setting"
-    workers = make_workers(timing=phase_timing or measure_window is not None)
+    for name, value in (("data_workers", data_workers), ("data_prefetch", data_prefetch),
+                        ("torch_threads", torch_threads)):
+        assert value is None or (isinstance(value, int) and value >= 1), f"{name} {value!r}: must be an integer >= 1"
+    torch_threads = TORCH_THREADS if torch_threads is None else torch_threads
+    workers = make_workers(timing=phase_timing or measure_window is not None, n=data_workers, prefetch=data_prefetch)
     try:
         _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
                embd_size, n_layers, row0_tol, batch_mode, position_sizes, torch.device(device),
-               stop_after_step, phase_timing, measure_window)
+               stop_after_step, phase_timing, measure_window, torch_threads)
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
@@ -499,11 +511,12 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
 def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int, save_every: int,
            expect_prior_ce, expect_shanten, workers, embd_size: int, n_layers: int,
            row0_tol: float, batch_mode: str, position_sizes, device: torch.device,
-           stop_after_step, phase_timing: bool = False, measure_window: tuple = None):
+           stop_after_step, phase_timing: bool = False, measure_window: tuple = None,
+           torch_threads: int = TORCH_THREADS):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
-    torch.set_num_threads(TORCH_THREADS)
+    torch.set_num_threads(torch_threads)
 
     if model_name == "encoder_conv":
         torch.manual_seed(MODEL_SEED)
@@ -547,7 +560,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         "train_files": sum(len(dl.file_list) for dl in dataloaders), "train_files_sha256": train_files_sha256(cluster),
         "val_year": VAL_YEAR, "val_days": list(VAL_DAYS), "val_games": VAL_GAMES, "val_seed": VAL_SEED,
         "prior_games": PRIOR_GAMES, "prior_seed": PRIOR_SEED, "prior_l2": PRIOR_L2,
-        "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": TORCH_THREADS,
+        "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": torch_threads,
         "embd_size": embd_size, "n_layers": n_layers, "n_params": n_params,
         "batch_mode": batch_mode, "position_sizes": position_sizes, "device": device.type,
     }
@@ -920,6 +933,29 @@ def parse_measure_window(text: str) -> tuple:
     return tuple(values)
 
 
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{value}: must be >= 1")
+    return value
+
+
+def run_header(args) -> str:
+    """The CLI's first log line. The T-061 settings (--data-workers / --data-prefetch / --torch-threads) are appended,
+    resolved, only when one of them is given: a run without them logs today's line."""
+    tuned = (args.data_workers, args.data_prefetch, args.torch_threads) != (None, None, None)
+    return (f"Training {args.model_name} for {args.max_steps} steps in {args.run_dir} (eval every {args.eval_every}, "
+            f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers}, batch mode "
+            f"{args.batch_mode}, device {args.device})"
+            + (f", stop after step {args.stop_after_step}" if args.stop_after_step is not None else "")
+            + (", phase timing" if args.phase_timing else "")
+            + (f", measure window {args.measure_window[0]},{args.measure_window[1]}" if args.measure_window else "")
+            + (f", data workers {DATA_WORKERS if args.data_workers is None else args.data_workers}, data prefetch "
+               f"{DATA_PREFETCH if args.data_prefetch is None else args.data_prefetch}, torch threads "
+               f"{TORCH_THREADS if args.torch_threads is None else args.torch_threads}" if tuned else "")
+            + (" [profiling on]" if args.profile else ""))
+
+
 def parse_expect_prior_ce(text: str):
     values = [float(v) for v in text.split(",")]
     if len(values) != len(HEADS):
@@ -969,6 +1005,13 @@ if __name__ == "__main__":
                         help="positions mode, a fresh run: time updates W+1..W+M (outer timer, rows, worker busy time), "
                              "then the one eval and save at W+M apart; needs --stop-after-step, --eval-every and "
                              "--save-every W+M (T-057)")
+    parser.add_argument("--data-workers", type=positive_int, default=None, metavar="N",
+                        help=f"training data worker processes (default {DATA_WORKERS}; T-061); no batch changes")
+    parser.add_argument("--data-prefetch", type=positive_int, default=None, metavar="P",
+                        help=f"files a training loader keeps submitted ahead (default {DATA_PREFETCH}; T-061)")
+    parser.add_argument("--torch-threads", type=positive_int, default=None, metavar="T",
+                        help=f"the trainer's torch threads, training and CPU eval (default {TORCH_THREADS}; T-061); a "
+                             "run-identity key: a resume needs the same T")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -993,22 +1036,17 @@ if __name__ == "__main__":
         last = sum(args.measure_window)
         parser.error(f"--measure-window W,M needs --stop-after-step {last} --eval-every {last} --save-every {last}")
 
-    run_dir = args.run_dir or os.path.join("runs", f"{args.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    run_dir = args.run_dir = (args.run_dir or os.path.join(
+        "runs", f"{args.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
     os.makedirs(run_dir, exist_ok=True)
     log = RunLog(os.path.join(run_dir, "train.log"))
-    log(f"Training {args.model_name} for {args.max_steps} steps in {run_dir} (eval every {args.eval_every}, "
-        f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers}, batch mode "
-        f"{args.batch_mode}, device {args.device})"
-        + (f", stop after step {args.stop_after_step}" if args.stop_after_step is not None else "")
-        + (", phase timing" if args.phase_timing else "")
-        + (f", measure window {args.measure_window[0]},{args.measure_window[1]}" if args.measure_window else "")
-        + (" [profiling on]" if args.profile else ""))
+    log(run_header(args))
 
     def _run():
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
               args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol,
               args.batch_mode, args.position_sizes, args.device, args.stop_after_step, args.phase_timing,
-              args.measure_window)
+              args.measure_window, args.data_workers, args.data_prefetch, args.torch_threads)
 
     if args.profile:
         pr = cProfile.Profile()
