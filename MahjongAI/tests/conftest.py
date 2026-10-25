@@ -21,15 +21,18 @@ def link_games(files, root: pathlib.Path, day_map=None) -> pathlib.Path:
     return root
 
 
-@pytest.fixture
-def train_data_root(tmp_path) -> pathlib.Path:
+def build_train_data_root(root: pathlib.Path) -> pathlib.Path:
     """A DATA_ROOT for supervised_learning.train: 2021 = every 2021 fixture game but day VAL_FROM's, and
     2022/20220101 = VAL_FROM's games."""
-    root = tmp_path / "data"
     games = sorted(GATE_GAMES.glob("2021/*/*/*.log"))
     link_games([f for f in games if f.parent.parent.name != VAL_FROM], root / "2021")
     link_games([f for f in games if f.parent.parent.name == VAL_FROM], root / "2022", {VAL_FROM: "20220101"})
     return root
+
+
+@pytest.fixture
+def train_data_root(tmp_path) -> pathlib.Path:
+    return build_train_data_root(tmp_path / "data")
 
 
 @pytest.fixture

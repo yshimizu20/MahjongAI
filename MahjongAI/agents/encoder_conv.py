@@ -43,6 +43,32 @@ EMBD_SIZE = 64  # the default width; a model's own width is EncoderConvModel(emb
 N_HEADS = 8
 N_LAYERS = 1
 DROPOUT_RATIO = 0.2
+# T-056: off the CPU, the token embedder pads its unique (token, position) count U up to a multiple of this. With the
+# raw, data-dependent U (a new value most steps), MPS driver memory of a 64 x 1 positions-mode run grew 5-6 MiB per
+# step (OOM at step 4,736) and was not released by empty_cache; padded, it stays flat and a step is ~3x faster.
+UNIQUE_BUCKET = 1024
+
+
+def pads_unique_codes(device: torch.device) -> bool:
+    """True: the token embedder pads U on this device (T-056; every device but the CPU). A test patches it to run the
+    padded path on the CPU, where the padded and the raw path must agree bit for bit."""
+    return device.type != "cpu"
+
+
+# T-058: off the CPU, a block that computes every row (every block but the last) runs on chunks of exactly this many
+# rows, the last chunk padded. Its rows per call were the head's batch size (96 / 192 / 320 / 640 / 1,024 rows, a mix
+# every step): MPS driver memory of a 128 x 2 positions-mode run grew 4-6 MiB per step (a 64 x 2 run too; 128 x 1, whose
+# one block is state-row only, stayed flat). Discard-only steps (one size) stayed flat; the same rows cycled through
+# the five sizes grew.
+ROW_CHUNK = 128
+
+
+def chunks_full_rows(device: torch.device) -> bool:
+    """True: full-row blocks run on ROW_CHUNK-row chunks on this device (T-058; every device but the CPU). A test
+    patches it to run the chunked path on the CPU."""
+    return device.type != "cpu"
+
+
 # The architecture keys of a run config (T-010). A config written before T-010 has neither key: a 64 x 1 model.
 LEGACY_ARCH = {"embd_size": 64, "n_layers": 1}
 
@@ -176,6 +202,24 @@ class EncoderConvModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, std=0.02)
 
+    def encode(self, x, attn_mask):
+        """The encoder blocks on fused (B, 151, EMBD_SIZE): the last block computes the state row alone (T-011), so
+        the result is (B, 1, EMBD_SIZE). Off the CPU every other block runs on ROW_CHUNK-row chunks (T-058): rows do not
+        interact inside a block, so a chunk's rows equal the full call's; the padding rows (zeros, every key kept) are
+        computed and dropped, their gradient is zero. The dropout draws differ from the full call's (one draw per
+        chunk), not their distribution."""
+        for i, block in enumerate(self.blocks):
+            if i == len(self.blocks) - 1:
+                return block(x, attn_mask, state_row_only=True)
+            if not chunks_full_rows(x.device):
+                x = block(x, attn_mask)
+                continue
+            B = x.size(0)
+            pad = -B % ROW_CHUNK
+            xp = torch.cat([x, x.new_zeros(pad, *x.shape[1:])])
+            mp = torch.cat([attn_mask, attn_mask.new_ones(pad, *attn_mask.shape[1:])])
+            x = torch.cat([block(xp[j:j + ROW_CHUNK], mp[j:j + ROW_CHUNK]) for j in range(0, B + pad, ROW_CHUNK)])[:B]
+
     def forward(
         self,
         all_halfturns_list: List[list[HalfTurn]],
@@ -188,6 +232,7 @@ class EncoderConvModel(nn.Module):
             tensors_discard,
             tensors_post,
         ) = self.tensor_processor.prepare_batches(all_halfturns_list, all_encoding_tokens_list)
+        device = self.ln_f.weight.device  # the model's own device (T-055), not the module default
 
         results = {}
         for tensors, head in zip(
@@ -247,9 +292,7 @@ class EncoderConvModel(nn.Module):
             # Step 5: Bidirectional self-attention (no causal mask). Only the state token reaches the heads, so the
             # last block computes its row alone (keys / values still come from every position): exact, T-011
             attn_mask = fused_mask.unsqueeze(1)  # (B, 1, 151)
-            x = fused
-            for i, block in enumerate(self.blocks):
-                x = block(x, attn_mask, state_row_only=(i == len(self.blocks) - 1))  # last: (B, 1, EMBD_SIZE)
+            x = self.encode(fused, attn_mask)  # (B, 1, EMBD_SIZE)
 
             # Step 6: Extract state token (last position), output head, loss
             final_state = x[:, -1, :]  # (B, EMBD_SIZE)
@@ -271,6 +314,30 @@ class EncoderConvModel(nn.Module):
             loss = F.cross_entropy(logits, y_tensor, reduction="mean")
             results[head] = HeadOutput(logits, loss, y_tensor)
 
+        return results
+
+    def forward_heads(self, batches: dict) -> dict:
+        """{head: HeadOutput} of ready per-head tensors (T-055 positions mode): batches = {head: (tokens (B, 150),
+        (x1, x2, x3), mask (B, A), y (B,), padding (B, 150))}, every row already checked at admission (binary mask,
+        a legal target). The network steps of `forward` (steps 1-6, the same ops), heads in during / discard / post
+        order, so dropout draws in the order of `forward`; no sampling and no device sync. Inputs move to the
+        model's own device."""
+        device = self.ln_f.weight.device
+        results = {}
+        for head in ("during", "discard", "post"):
+            if head not in batches:
+                continue
+            tokens, state, mask, y, padding = batches[head]
+            tokens, padding, mask, y = tokens.to(device), padding.to(device), mask.to(device), y.to(device)
+            state = tuple(t.to(device) for t in state)
+            fused = torch.cat([self.token_embedder(tokens), self.state_net(state).unsqueeze(1)], dim=1)
+            state_mask = torch.ones(padding.size(0), 1, dtype=torch.bool, device=device)
+            attn_mask = torch.cat([padding, state_mask], dim=1).unsqueeze(1)  # (B, 1, 151)
+            x = self.encode(fused, attn_mask)
+            logits = self.heads[head](self.ln_f(x[:, -1, :]))
+            assert logits.shape == mask.shape, f"{head}: logits {tuple(logits.shape)}, mask {tuple(mask.shape)}"
+            logits = logits.masked_fill(mask == 0, -1e9)
+            results[head] = HeadOutput(logits, F.cross_entropy(logits, y, reduction="mean"), y)
         return results
 
 
@@ -328,6 +395,11 @@ class TokenEmbedder(nn.Module):
         and their order are the full-size computation's, so the output is bitwise equal to it; the backward reaches
         the tables through one gather over the unique rows.
 
+        Off the CPU the unique codes are padded with code 0 (a valid token at position 0) up to a multiple of
+        UNIQUE_BUCKET (T-056): the padded rows are computed but never gathered, so the output is the same and their
+        gradient is zero; every op after torch.unique sees one of a few sizes instead of a new U each batch. The CPU
+        path is unchanged.
+
         Args:
             encoding_tokens_batch: (B, 150) tensor of encoding tokens
 
@@ -339,6 +411,9 @@ class TokenEmbedder(nn.Module):
         positions = torch.arange(T, device=encoding_tokens_batch.device)
         codes = encoding_tokens_batch * MAX_ACTION_LEN + positions  # (B, T): one code per (token, position)
         unique_codes, inverse = torch.unique(codes, return_inverse=True)  # (U,), (B, T)
+        if pads_unique_codes(unique_codes.device):
+            pad = -unique_codes.numel() % UNIQUE_BUCKET
+            unique_codes = torch.cat([unique_codes, unique_codes.new_zeros(pad)])  # (U + pad,): never gathered
         tokens = torch.div(unique_codes, MAX_ACTION_LEN, rounding_mode="floor")
         rows = self._embed_codes(tokens, self.position_coding_table[unique_codes - tokens * MAX_ACTION_LEN])
         return F.embedding(inverse, rows)  # (B, T, EMBD_SIZE)
