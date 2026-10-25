@@ -132,7 +132,7 @@ def test_a_resume_with_other_workers_and_prefetch_continues_the_same_stream(tmp_
     _run(tmp_path, monkeypatch, train_data_root, "b", stop_after_step=5, data_workers=3, data_prefetch=20)
     _run(tmp_path, monkeypatch, train_data_root, "b", data_workers=6, data_prefetch=8)
     assert "resuming at step 5" in open(tmp_path / "b.log").read()
-    assert_runs_equal(tmp_path, "a", "b", [8, 12])
+    assert_runs_equal(tmp_path / "a", tmp_path / "b", [8, 12])
 
 
 def _thread_parse(filename):
@@ -184,10 +184,10 @@ def serial_stream(tmp_path_factory):
 
 
 @pytest.mark.parametrize("n,p", [(n, p) for n in (3, 4, 6, 8, 10) for p in (8, 20)])
-def test_workers_and_prefetch_give_the_serial_positions_stream(serial_stream, n, p):
+def test_workers_and_prefetch_give_the_serial_positions_stream(serial_stream, big_pool_slot, n, p):
     root, (ref_steps, ref_cluster, ref_batcher, ref_files) = serial_stream
     assert len(ref_files) >= 30 and ref_cluster["loaders"][0]["epoch"] >= 1  # P = 20 fills; an epoch is crossed
-    with GameWorkers(n, build_game, window=p) as w:
+    with big_pool_slot(n), GameWorkers(n, build_game, window=p) as w:
         steps, cluster, batcher, files = _positions_stream(root, w)
         assert len(w.pids()) == n and w.window == p
     assert files == ref_files
@@ -198,11 +198,12 @@ def test_workers_and_prefetch_give_the_serial_positions_stream(serial_stream, n,
 
 
 @pytest.mark.parametrize("n", [4, 8, 10])
-def test_games_path_with_prefetch_20_gives_the_same_batches(small_roots, monkeypatch, n):
+def test_games_path_with_prefetch_20_gives_the_same_batches(small_roots, monkeypatch, big_pool_slot, n):
     """test_worker_count.py at P = 20: n workers / P20 against 2 workers / P8."""
     base = WC._run(small_roots, 2)
     monkeypatch.setattr(SL, "DATA_PREFETCH", 20)
-    other = WC._run(small_roots, n)
+    with big_pool_slot(n):
+        other = WC._run(small_roots, n)
     _assert_equal(base, other, f"{n} workers / P20")
 
 
