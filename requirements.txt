@@ -4,3 +4,4 @@ mahjong==2.0.0  # exact pin: a new release may reassign yaku ids / names (utils/
 requests
 matplotlib  # run_report figure (plan T-005)
 pytest>=7  # pytest.ini uses the pythonpath key (7.0+)
+psutil  # CPU RSS in the --measure-window memory sample (utils/phase_timing.py, T-057)

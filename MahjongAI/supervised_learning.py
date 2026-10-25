@@ -43,6 +43,8 @@ from MahjongAI.agents.encoder_conv import (EMBD_SIZE, LEGACY_ARCH, N_LAYERS, Enc
 from MahjongAI.utils.baselines import fit_bias_prior, greedy_hits, score_bias, shanten_best, uniform_legal
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
 from MahjongAI.utils.game_workers import GameWorkers, _transportable
+from MahjongAI.utils.phase_probe import PhaseProbe, sync_for, sync_reader_for
+from MahjongAI.utils.phase_timing import MeasureWindow, PhaseTimer, memory_for
 from MahjongAI.utils.position_batcher import DEFAULT_SIZES, PositionBatcher
 
 # Root of the MahjongAI package: data paths resolve the same from any working directory.
@@ -433,9 +435,13 @@ def set_rng_state(state: dict, device: torch.device):
         torch.mps.set_rng_state(state["mps_rng_state"])
 
 
-def make_workers():
-    """The run's data workers (started on first use), or None for DATA_WORKERS = 0."""
-    return GameWorkers(DATA_WORKERS, build_game, window=DATA_PREFETCH) if DATA_WORKERS else None
+def make_workers(timing: bool = False, n: int = None, prefetch: int = None):
+    """The run's data workers (started on first use), or None for 0 workers. timing: their T-057 clocks (exposed
+    wait, busy time), for --phase-timing / --measure-window only. n / prefetch (T-061 --data-workers / --data-prefetch):
+    None = DATA_WORKERS / DATA_PREFETCH."""
+    n = DATA_WORKERS if n is None else n
+    prefetch = DATA_PREFETCH if prefetch is None else prefetch
+    return GameWorkers(n, build_game, window=prefetch, timing=timing) if n else None
 
 
 def train_cluster(log, batch_size: int, workers=None) -> DataLoaderCluster:
@@ -461,11 +467,24 @@ def find_latest_checkpoint(checkpoint_dir: str):
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, embd_size: int = EMBD_SIZE,
           n_layers: int = N_LAYERS, row0_tol: float = None, batch_mode: str = "games", position_sizes: dict = None,
-          device: str = "cpu", stop_after_step: int = None):
+          device: str = "cpu", stop_after_step: int = None, phase_timing: bool = False, measure_window: tuple = None,
+          data_workers: int = None, data_prefetch: int = None, torch_threads: int = None):
     """position_sizes: {head: step size N} of positions mode (default DEFAULT_SIZES): a step takes N discard rows and
     0, N or 2 N during / post rows (position_batcher.side_take); games mode takes none.
     stop_after_step: stop once this many updates are done (after that step's eval / save), with a checkpoint of that
-    step; total_steps stays the LR horizon, so a resume continues the same schedule (T-056). None: run to total_steps."""
+    step; total_steps stays the LR horizon, so a resume continues the same schedule (T-056). None: run to total_steps.
+    phase_timing: positions mode only, a PhaseProbe (utils/phase_probe.py) marks each operation of the step, eval and
+    save, and the marks give each step's phase times, one `phase-time` line per step (utils/phase_timing.py, T-057); a
+    mark syncs the device (MPS). No run-identity key: the training math is unchanged.
+    measure_window: positions mode only, (W, M): an outer timer from the completion of update W to that of update
+    W + M (right after each scheduler step), the rows trained and admitted in between, the workers' busy time, a
+    memory sample at each end, and the one eval and save at step W + M timed apart (T-057). Either T-057 flag turns
+    the data workers' clocks on (exposed wait, busy time); with both off they read none. A fresh run only; it needs
+    stop_after_step = W + M and eval / save steps at W + M and none inside the window.
+    data_workers / data_prefetch / torch_threads (T-061): None = DATA_WORKERS / DATA_PREFETCH / TORCH_THREADS; each
+    >= 1. The workers' count and prefetch window change no batch (the loaders own the order) and are no run-identity
+    key; torch_threads is one (the config records the value used; it changes the float reduction order). The startup
+    pools (prior, validation) keep PRIOR_WORKERS / PRIOR_PREFETCH; the data workers keep one torch thread each."""
     row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
     assert batch_mode in BATCH_MODES and device in DEVICES, (batch_mode, device)
     if batch_mode == "positions":
@@ -473,11 +492,17 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     assert batch_mode == "positions" or position_sizes is None, "position sizes are a positions-mode setting"
     assert device != "mps" or torch.backends.mps.is_available(), "--device mps: this machine has no MPS backend"
     assert stop_after_step is None or stop_after_step > 0, f"stop_after_step {stop_after_step}: must be > 0"
-    workers = make_workers()
+    assert batch_mode == "positions" or not phase_timing, "phase timing is a positions-mode setting"
+    assert batch_mode == "positions" or measure_window is None, "the measure window is a positions-mode setting"
+    for name, value in (("data_workers", data_workers), ("data_prefetch", data_prefetch),
+                        ("torch_threads", torch_threads)):
+        assert value is None or (isinstance(value, int) and value >= 1), f"{name} {value!r}: must be an integer >= 1"
+    torch_threads = TORCH_THREADS if torch_threads is None else torch_threads
+    workers = make_workers(timing=phase_timing or measure_window is not None, n=data_workers, prefetch=data_prefetch)
     try:
         _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
                embd_size, n_layers, row0_tol, batch_mode, position_sizes, torch.device(device),
-               stop_after_step)
+               stop_after_step, phase_timing, measure_window, torch_threads)
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
@@ -486,11 +511,12 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
 def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int, save_every: int,
            expect_prior_ce, expect_shanten, workers, embd_size: int, n_layers: int,
            row0_tol: float, batch_mode: str, position_sizes, device: torch.device,
-           stop_after_step):
+           stop_after_step, phase_timing: bool = False, measure_window: tuple = None,
+           torch_threads: int = TORCH_THREADS):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
-    torch.set_num_threads(TORCH_THREADS)
+    torch.set_num_threads(torch_threads)
 
     if model_name == "encoder_conv":
         torch.manual_seed(MODEL_SEED)
@@ -534,7 +560,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         "train_files": sum(len(dl.file_list) for dl in dataloaders), "train_files_sha256": train_files_sha256(cluster),
         "val_year": VAL_YEAR, "val_days": list(VAL_DAYS), "val_games": VAL_GAMES, "val_seed": VAL_SEED,
         "prior_games": PRIOR_GAMES, "prior_seed": PRIOR_SEED, "prior_l2": PRIOR_L2,
-        "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": TORCH_THREADS,
+        "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": torch_threads,
         "embd_size": embd_size, "n_layers": n_layers, "n_params": n_params,
         "batch_mode": batch_mode, "position_sizes": position_sizes, "device": device.type,
     }
@@ -632,6 +658,33 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     def is_save_step(s: int) -> bool:
         return s % save_every == 0 or s == total_steps
 
+    # --phase-timing (T-057): one probe mark after each operation, in the order of the T-059 mark list; the timer reads
+    # each mark's time and times the spans from timer.begin(<mark>), called right before each operation. Every probe
+    # call and its arguments sit under `if probe is not None` (every timer call under `if timer is not None`), so a run
+    # without the flag makes no probe or timer call (no timing work, no device sync of the probe).
+    probe = timer = None
+    if phase_timing:
+        timer = PhaseTimer(log, None if workers is None else (lambda: workers.exposed_wait_s), sync_for(device))
+        probe = PhaseProbe(log, sync_reader_for(device), is_eval_step, is_save_step, timer=timer)
+    # --measure-window (T-057): every call sits under `if window is not None` (or `window is None`): none without it
+    window = None
+    if measure_window is not None:
+        warmup, measure = measure_window
+        last = warmup + measure
+        inside = [s for s in range(1, last) if is_eval_step(s) or is_save_step(s)]
+        assert not latest_checkpoint, "--measure-window needs a fresh run dir (a resume shifts the window)"
+        assert stop_after_step == last, f"--measure-window {warmup},{measure} needs --stop-after-step {last}"
+        assert not inside and is_eval_step(last) and is_save_step(last), (
+            f"--measure-window {warmup},{measure}: eval / save steps {inside[:5]} inside the window, or none at step "
+            f"{last} (use --eval-every {last} --save-every {last})")
+        window = MeasureWindow(log, warmup, measure, sync_for(device), batcher,
+                               lambda: {h: train_sums[h][1] for h in HEADS}, workers, memory_for(device))
+
+    def phase_stop():
+        """The last phase mark (--phase-timing)."""
+        if probe is not None:
+            probe.mark("stop", step=current_step)
+
     def log_mps_memory(when: str = ""):
         """One MPS memory sample. when: "" for the every-MPS_MEMORY_EVERY-steps line (before that step's eval / save),
         " (post-eval/save)" right after an eval or a save, " (final)" after the last save of the run (T-056)."""
@@ -639,11 +692,19 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             log(f"mps memory at step {current_step}{when}: driver {torch.mps.driver_allocated_memory() / 2**20:.0f} "
                 f"MB, current {torch.mps.current_allocated_memory() / 2**20:.0f} MB")
 
+    def after_eval_save():
+        """The memory line after an eval / save, then (--phase-timing) the boundary mark."""
+        log_mps_memory(" (post-eval/save)")
+        if probe is not None:
+            probe.mark("boundary")
+
     def evaluate():
         """Row `current_step`: val per head and game, mean train CE since the last row. Row 0 is written only if
         it passes the uniform-legal check, so a restart after that stop checks it again."""
         if eval_model is not model:
             eval_model.load_state_dict(model.state_dict())
+        if probe is not None:
+            probe.mark("eval_weights")
         per_game = val.evaluate(eval_model)
         heads = {}
         for h in HEADS:
@@ -677,6 +738,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             train_sums[h] = [0.0, 0]
         if batcher is not None:
             batcher.reset_max_buffered()
+        if probe is not None:
+            probe.mark("eval")
 
     def save_checkpoint():
         """Everything a resume needs, written atomically (*.tmp, then os.replace). A stop between a positions-mode
@@ -702,20 +765,26 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         processor = model.tensor_processor if batcher is None else batcher.processor
         log(f"Checkpoint saved at {path}; skipped games: {dict(cluster.skipped())}; "
             f"skipped samples: {dict(processor.skipped)}")
+        if probe is not None:
+            probe.mark("save")
 
     # total_steps counts optimizer UPDATES: a batch without samples does not consume the budget, so the
     # cosine horizon and the number of updates agree. A persistent data failure aborts.
     batches_without_update = 0
     consistent = True  # False from optimizer.step() until the step count, RNG snapshot and train sums match the update
     step_rng = None  # positions mode: the RNG state before the forward of a step not committed yet
+    if probe is not None:
+        probe.mark("init", step=current_step)
     try:
         if is_eval_step(current_step) and not any(r["step"] == current_step for r in rows):
             evaluate()  # row 0 of a fresh run, or the row a stop / kill lost after its checkpoint
-            log_mps_memory(" (post-eval/save)")
+            after_eval_save()
         consumed = []  # the files of the batches drawn since the last update, in order (a no-sample batch included)
         while current_step < total_steps:
             if stop_after_step is not None and current_step >= stop_after_step:
                 break  # at the top of the loop: the last update, its eval row and its save are done
+            if probe is not None:
+                probe.mark("top", step=current_step + 1)
             if batcher is None:
                 games, tokens = next(cluster)
                 consumed += cluster.last_batch_files
@@ -732,31 +801,81 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
                     continue
                 batches_without_update = 0
             else:  # positions mode: the step's rows stay buffered until commit, after optimizer.step()
+                if timer is not None:
+                    timer.begin("peek")
                 batches = batcher.peek()
+                if probe is not None:
+                    probe.mark("peek", heads=tuple(batches))
+                if timer is not None:
+                    timer.begin("rng")
                 step_rng = rng_state(device)
-                results = model.forward_heads(batches)
+                if probe is not None:
+                    probe.mark("rng")
+                results = model.forward_heads(batches, mark=None if probe is None else probe.mark)
+                if probe is not None:
+                    probe.mark("results")  # the previous step's outputs are released by this assignment
 
+            if timer is not None:
+                timer.begin("loss")
             total_loss = sum(out.loss for out in results.values())
+            if probe is not None:
+                probe.mark("loss")
+            if timer is not None:
+                timer.begin("finite")
             if not torch.isfinite(total_loss):  # before backward: the weights a stop saves are clean
                 per_head = {h: f"{out.loss.item():.4f}" for h, out in results.items()}
                 raise RuntimeError(f"NaN or Inf in total_loss at update {current_step + 1} (per-head: {per_head})")
+            if probe is not None:
+                probe.mark("finite")
 
+            if timer is not None:
+                timer.begin("zero_grad")
             optimizer.zero_grad()
+            if probe is not None:
+                probe.mark("zero_grad")
+            if timer is not None:
+                timer.begin("backward")
             total_loss.backward()
+            if probe is not None:
+                probe.mark("backward")
             # a finite loss can still give non-finite gradients: raise before optimizer.step, the weights stay clean
+            if timer is not None:
+                timer.begin("clip")
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, error_if_nonfinite=True)
+            if probe is not None:
+                probe.mark("clip")
             consistent = False
+            if timer is not None:
+                timer.begin("opt_step")
             optimizer.step()
+            if probe is not None:
+                probe.mark("opt_step")
+            if timer is not None:
+                timer.begin("sched_step")
             scheduler.step()
+            if probe is not None:
+                probe.mark("sched_step")
+            if window is not None:  # the update's completion: the window's endpoint time (a sync on MPS)
+                window.update_done(current_step + 1)
             if batcher is not None:
+                if timer is not None:
+                    timer.begin("commit")
                 read, sample_digest = batcher.commit()
+                if probe is not None:
+                    probe.mark("commit")
             current_step += 1
             step_rng = None
+            if timer is not None:
+                timer.begin("sums")
             for h, out in results.items():
                 train_sums[h][0] += out.loss.item() * out.y.numel()
                 train_sums[h][1] += out.y.numel()
             consistent = True
+            if probe is not None:
+                probe.mark("sums")
 
+            if timer is not None:
+                timer.begin("log")
             if batcher is None:
                 trace = f" | files {batch_files_hash(consumed)}"
             else:  # the files admitted since the last update, and the provenance of the rows this update trained on
@@ -766,17 +885,22 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             consumed = []
             if current_step % MPS_MEMORY_EVERY == 0:
                 log_mps_memory()
+            if probe is not None:
+                probe.mark("log")
+            if window is not None:
+                window.step_end(current_step)
 
             if is_eval_step(current_step):
-                evaluate()
+                evaluate() if window is None else window.timed("eval", current_step, evaluate)
             if is_save_step(current_step):
-                save_checkpoint()
+                save_checkpoint() if window is None else window.timed("save", current_step, save_checkpoint)
             if is_eval_step(current_step) or is_save_step(current_step):
-                log_mps_memory(" (post-eval/save)")
+                after_eval_save()
         if current_step < total_steps:  # --stop-after-step: a checkpoint of the stop step (none if it is on disk)
             if current_step != latest_step and not is_save_step(current_step):
                 save_checkpoint()
             log_mps_memory(" (final)")
+            phase_stop()
             log(f"stopped after update {current_step} (--stop-after-step {stop_after_step}, total_steps "
                 f"{total_steps}): a start on this run dir resumes here")
             return
@@ -791,6 +915,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             log("no checkpoint: the stop came inside an optimizer update")
         raise
     log_mps_memory(" (final)")
+    phase_stop()
     log("Training completed.")
 
 
@@ -799,6 +924,36 @@ def parse_position_sizes(text: str) -> dict:
     if len(values) != len(HEADS) or min(values) <= 0:
         raise argparse.ArgumentTypeError(f"--position-sizes needs {len(HEADS)} positive counts ({','.join(HEADS)})")
     return dict(zip(HEADS, values))
+
+
+def parse_measure_window(text: str) -> tuple:
+    values = [int(v) for v in text.split(",")]
+    if len(values) != 2 or min(values) < 1:
+        raise argparse.ArgumentTypeError("--measure-window needs W,M: warm-up and measured updates, both >= 1")
+    return tuple(values)
+
+
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{value}: must be >= 1")
+    return value
+
+
+def run_header(args) -> str:
+    """The CLI's first log line. The T-061 settings (--data-workers / --data-prefetch / --torch-threads) are appended,
+    resolved, only when one of them is given: a run without them logs today's line."""
+    tuned = (args.data_workers, args.data_prefetch, args.torch_threads) != (None, None, None)
+    return (f"Training {args.model_name} for {args.max_steps} steps in {args.run_dir} (eval every {args.eval_every}, "
+            f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers}, batch mode "
+            f"{args.batch_mode}, device {args.device})"
+            + (f", stop after step {args.stop_after_step}" if args.stop_after_step is not None else "")
+            + (", phase timing" if args.phase_timing else "")
+            + (f", measure window {args.measure_window[0]},{args.measure_window[1]}" if args.measure_window else "")
+            + (f", data workers {DATA_WORKERS if args.data_workers is None else args.data_workers}, data prefetch "
+               f"{DATA_PREFETCH if args.data_prefetch is None else args.data_prefetch}, torch threads "
+               f"{TORCH_THREADS if args.torch_threads is None else args.torch_threads}" if tuned else "")
+            + (" [profiling on]" if args.profile else ""))
 
 
 def parse_expect_prior_ce(text: str):
@@ -842,6 +997,21 @@ if __name__ == "__main__":
     parser.add_argument("--device", choices=DEVICES, default="cpu", help="training device (validation: the CPU)")
     parser.add_argument("--stop-after-step", type=int, default=None, metavar="K",
                         help="stop after update K with a checkpoint; max_steps stays the LR horizon (T-056)")
+    parser.add_argument("--phase-timing", action="store_true",
+                        help="positions mode: one line per step with the time of each phase (wait, admit, transfer, "
+                             "forward, backward, update, overhead), from the phase probe's marks (a device sync each; "
+                             "T-057)")
+    parser.add_argument("--measure-window", type=parse_measure_window, default=None, metavar="W,M",
+                        help="positions mode, a fresh run: time updates W+1..W+M (outer timer, rows, worker busy time), "
+                             "then the one eval and save at W+M apart; needs --stop-after-step, --eval-every and "
+                             "--save-every W+M (T-057)")
+    parser.add_argument("--data-workers", type=positive_int, default=None, metavar="N",
+                        help=f"training data worker processes (default {DATA_WORKERS}; T-061); no batch changes")
+    parser.add_argument("--data-prefetch", type=positive_int, default=None, metavar="P",
+                        help=f"files a training loader keeps submitted ahead (default {DATA_PREFETCH}; T-061)")
+    parser.add_argument("--torch-threads", type=positive_int, default=None, metavar="T",
+                        help=f"the trainer's torch threads, training and CPU eval (default {TORCH_THREADS}; T-061); a "
+                             "run-identity key: a resume needs the same T")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -859,20 +1029,24 @@ if __name__ == "__main__":
         parser.error("--stop-after-step needs K > 0")
     if args.position_sizes is not None and args.batch_mode != "positions":
         parser.error("--position-sizes needs --batch-mode positions")
+    if (args.phase_timing or args.measure_window) and args.batch_mode != "positions":
+        parser.error("--phase-timing and --measure-window need --batch-mode positions")
+    if args.measure_window and not (args.stop_after_step == args.eval_every == args.save_every
+                                    == sum(args.measure_window)):
+        last = sum(args.measure_window)
+        parser.error(f"--measure-window W,M needs --stop-after-step {last} --eval-every {last} --save-every {last}")
 
-    run_dir = args.run_dir or os.path.join("runs", f"{args.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    run_dir = args.run_dir = (args.run_dir or os.path.join(
+        "runs", f"{args.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
     os.makedirs(run_dir, exist_ok=True)
     log = RunLog(os.path.join(run_dir, "train.log"))
-    log(f"Training {args.model_name} for {args.max_steps} steps in {run_dir} (eval every {args.eval_every}, "
-        f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers}, batch mode "
-        f"{args.batch_mode}, device {args.device})"
-        + (f", stop after step {args.stop_after_step}" if args.stop_after_step is not None else "")
-        + (" [profiling on]" if args.profile else ""))
+    log(run_header(args))
 
     def _run():
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
               args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol,
-              args.batch_mode, args.position_sizes, args.device, args.stop_after_step)
+              args.batch_mode, args.position_sizes, args.device, args.stop_after_step, args.phase_timing,
+              args.measure_window, args.data_workers, args.data_prefetch, args.torch_threads)
 
     if args.profile:
         pr = cProfile.Profile()

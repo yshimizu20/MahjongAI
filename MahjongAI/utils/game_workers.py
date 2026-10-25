@@ -83,7 +83,9 @@ def _send_frame(fd: int, body: bytes):
         view = view[os.write(fd, view):]
 
 
-def _worker_main(tasks, results, build, parent_pid: int, send=_send_frame, parse=None):
+def _worker_main(tasks, results, build, parent_pid: int, send=_send_frame, parse=None, busy=None):
+    """busy: a shared [seconds, files] array (T-057, timing on) or None (no timing clock read): each file adds its parse
+    + build + serialize seconds and 1."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     import torch
     torch.set_num_threads(1)  # the trainer's threads keep their cores
@@ -94,6 +96,7 @@ def _worker_main(tasks, results, build, parent_pid: int, send=_send_frame, parse
         filename = tasks.get()
         if filename is None:
             return
+        t0 = None if busy is None else time.perf_counter()
         try:
             halfturns, tokens = parse(filename)
         except Exception as e:
@@ -107,7 +110,12 @@ def _worker_main(tasks, results, build, parent_pid: int, send=_send_frame, parse
             data = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as e:
             data = pickle.dumps(("broken", f"{type(e).__name__}: {e}"))
-        send(results.fileno(), pickle.dumps((filename, data), protocol=pickle.HIGHEST_PROTOCOL))
+        body = pickle.dumps((filename, data), protocol=pickle.HIGHEST_PROTOCOL)
+        if busy is not None:
+            busy[0] += time.perf_counter() - t0
+            busy[1] += 1
+        send(results.fileno(), body)
+        del body  # a frame is 3-4 MB: not kept while the worker waits for its next file
 
 
 class Fetched:
@@ -126,13 +134,15 @@ class Fetched:
 class GameWorkers:
     """`n` spawn worker processes shared by the loaders of one run. window: files a loader keeps submitted ahead.
     send, parse: test hooks, module-level functions: the worker's frame writer of (fd, body), and its parser of a
-    file (default process_xml.process)."""
+    file (default process_xml.process). timing (T-057, the trainer's --phase-timing / --measure-window): the workers
+    time their files (busy_seconds) and fetch times its waits for a result (exposed_wait_s); off (the default): no
+    shared counters and no timing clock reads (fetch still reads its timeout clock)."""
 
     def __init__(self, n: int, build, window: int = 8, timeout_s: float = WORKER_TIMEOUT_S, send=_send_frame,
-                 parse=None):
+                 parse=None, timing: bool = False):
         assert n >= 1 and window >= 1
         self.n, self.build, self.window, self.timeout_s = n, build, window, timeout_s
-        self.send, self.parse = send, parse
+        self.send, self.parse, self.timing = send, parse, timing
         self.procs = []
         self.readers = []  # per worker: the read end of its result pipe (non-blocking)
         self.buffers = []  # per worker: bytes read and not yet a whole frame
@@ -144,6 +154,10 @@ class GameWorkers:
         self._stop = threading.Event()
         self._drainer = None
         self._error = None  # the first broken pipe or frame the thread saw, raised by the next fetch
+        # T-057 timing (timing=True only), read by the trainer's --phase-timing / --measure-window (never part of any
+        # decision here):
+        self.exposed_wait_s = 0.0  # cumulative seconds `fetch` blocked on the condition, waiting for a result
+        self.busy = []  # per worker: a shared [seconds, files] of its parse + build + serialize work
 
     def _start(self):
         if self.procs:
@@ -154,7 +168,10 @@ class GameWorkers:
         self.tasks = ctx.Queue()
         for _ in range(self.n):
             reader, writer = ctx.Pipe(duplex=False)
-            args = (self.tasks, writer, self.build, os.getpid(), self.send, self.parse)
+            if self.timing:
+                self.busy.append(ctx.RawArray("d", 2))
+            args = (self.tasks, writer, self.build, os.getpid(), self.send, self.parse,
+                    self.busy[-1] if self.timing else None)
             p = ctx.Process(target=_worker_main, args=args, daemon=True)
             # registered before start: an interrupt during or after p.start() leaves no process close() cannot see
             self.procs.append(p)
@@ -270,7 +287,12 @@ class GameWorkers:
                     failure = (f"no result for {filename} from the data workers within {self.timeout_s:.0f} s"
                                + self._unfinished())
                     break
-                self._cond.wait(min(POLL_S, left))
+                if self.timing:  # the exposed wait: only the blocked wait itself, no check around it
+                    t0 = time.perf_counter()
+                    self._cond.wait(min(POLL_S, left))
+                    self.exposed_wait_s += time.perf_counter() - t0
+                else:
+                    self._cond.wait(min(POLL_S, left))
         if failure is not None:
             self._fail(failure)  # outside _cond: close() joins the drain thread
         try:
@@ -313,6 +335,11 @@ class GameWorkers:
         self.in_flight.clear()
         self.done.clear()
         self._error = None
+
+    def busy_seconds(self) -> list:
+        """[(seconds, files)] per worker: the parse + build + serialize time and the files each finished so far ([]
+        without timing)."""
+        return [(a[0], int(a[1])) for a in self.busy]
 
     def pids(self) -> list:
         return [p.pid for p in self.procs]
