@@ -464,9 +464,23 @@ def embedder_run(tokens, device, bucket: int, monkeypatch) -> tuple:
 
 
 def relative_grad_diffs(grads: dict, ref: dict) -> dict:
-    """{table: max |grads - ref| / max |ref|}."""
+    """{table: max |grads - ref| / max |ref|}. Every gradient must be finite: a NaN diff compares False against any
+    limit, so a NaN gradient would pass the noise check."""
     assert grads.keys() == ref.keys(), (grads.keys(), ref.keys())
+    bad = sorted(n for n in ref if not (torch.isfinite(grads[n]).all() and torch.isfinite(ref[n]).all()))
+    assert not bad, f"non-finite gradients: {bad}"
     return {n: (grads[n] - g).abs().max().item() / max(g.abs().max().item(), 1e-12) for n, g in ref.items()}
+
+
+def test_relative_grad_diffs_rejects_a_non_finite_gradient():
+    """The negative control of the finite check (Codex T-062 round 2): a NaN or inf in either side raises."""
+    good = {"w": torch.ones(3), "b": torch.ones(2)}
+    assert relative_grad_diffs(good, good) == {"w": 0.0, "b": 0.0}
+    for value in (float("nan"), float("inf")):
+        bad = {**good, "w": torch.tensor([1.0, value, 1.0])}
+        for a, b in ((bad, good), (good, bad)):
+            with pytest.raises(AssertionError, match=r"non-finite gradients: \['w'\]"):
+                relative_grad_diffs(a, b)
 
 
 def all_tokens(games):

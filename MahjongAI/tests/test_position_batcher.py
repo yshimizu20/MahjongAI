@@ -665,3 +665,64 @@ def test_state_without_a_peek_and_commit_without_peek(tmp_path, synthetic):
     assert empty["buffers"]["discard"]["cols"] is None and empty["read_since_update"] == []
     with pytest.raises(AssertionError, match="checkpoint position sizes"):
         PositionBatcher(make_cluster([root]), dict(SIZES, post=9), SyntheticProcessor()).load_state_dict(empty)
+
+
+REJECTIONS = {  # how the armed build fails: the error and its message
+    "build_error": (ValueError, "forced build error"),
+    "tensor_skip": (UnexpectedSkip, "tensor-level skip"),
+    "mask_not_binary": (AssertionError, "discard mask is not binary"),
+    "row_without_action": (AssertionError, "a discard row has no allowed action"),
+    "target_masked": (AssertionError, "a discard target is masked out"),
+}
+
+
+@pytest.mark.parametrize("rejection", sorted(REJECTIONS))
+def test_a_rejected_game_admits_nothing_and_stays_drawn(tmp_path, synthetic, monkeypatch, rejection):
+    """After two valid steps, the next drawn game fails at its build (an error, a tensor-level skip) or at its row
+    checks (a mask that is not binary, a row with no allowed action, a masked target; Codex T-062 round 2). It raises
+    before anything is admitted: the buffers, the admission counters and the files read equal those right after its
+    draw. It stays drawn (the _draw policy): the cluster and its loader stay past the file, which is in no buffer."""
+    root = write_corpus(tmp_path / "A", [[(1 + i % 3, 8 + i % 5, 2 + i % 4)] for i in range(20)])
+    batcher = PositionBatcher(make_cluster([root]), SIZES, SyntheticProcessor())
+    run(batcher, 2)
+    processor, build, seen = batcher.processor, batcher.processor.build_tensors, []
+
+    def armed(turns, tokens):
+        out = build(turns, tokens)
+        if seen:
+            return out
+        c = batcher.cluster
+        seen.append((c.draws, c.dataloaders[0].current_index, batcher.buffered(), dict(batcher.games_admitted),
+                     {h: dict(batcher.rows_in[h]) for h in HEADS}, list(batcher.read_since_update),
+                     os.path.basename(c.last_batch_files[0]), turns[0]))
+        if rejection == "build_error":
+            raise ValueError("forced build error")
+        if rejection == "tensor_skip":
+            processor.skipped["forced_skip"] += 1
+            return out
+        tokens_, x, mask, y, padding = out[1]  # the discard head
+        mask = mask.clone()
+        if rejection == "mask_not_binary":
+            mask[0, 0] = 0.5
+        elif rejection == "row_without_action":
+            mask[0] = 0
+        else:
+            mask[0, y[0]] = 0
+        return out[0], (tokens_, x, mask, y, padding), out[2]
+
+    monkeypatch.setattr(processor, "build_tensors", armed)
+    error, message = REJECTIONS[rejection]
+    with pytest.raises(error, match=message):
+        for _ in range(10):
+            run(batcher, 1)
+    assert len(seen) == 1
+    draws, index, buffered, games, rows_in, read, file, game_id = seen[0]
+    c = batcher.cluster
+    assert (c.draws, c.dataloaders[0].current_index) == (draws, index)  # not undone: the loader is past the file
+    assert batcher.buffered() == buffered and batcher.games_admitted == games
+    assert {h: dict(batcher.rows_in[h]) for h in HEADS} == rows_in and batcher.read_since_update == read
+    assert file not in read
+    for h in HEADS:  # no row of the rejected game in any buffer
+        if len(batcher.buffers[h]):
+            cols, _ = batcher.buffers[h].first(len(batcher.buffers[h]))
+            assert not (cols[0][:, 0] == game_id).any(), h

@@ -15,6 +15,8 @@ from MahjongAI import supervised_learning as SL
 from MahjongAI.agents.encoder_conv import EncoderConvModel
 from MahjongAI.process_xml import process
 
+pytestmark = pytest.mark.mac_floats  # digests of this Mac's CPU floats: Linux CI deselects them (pytest.ini)
+
 GATE_GAMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "gate_games")
 GAMES = ("2021010101gm-00a9-0000-6422c07e.log", "2021010521gm-00a9-0000-e76b4550.log")
 SAMPLE_SIZE = 40

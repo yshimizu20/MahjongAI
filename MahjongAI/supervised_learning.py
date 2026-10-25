@@ -3,13 +3,16 @@
 Run from the repo root as a module: python -m MahjongAI.supervised_learning encoder_conv 12000 --run-dir runs/T-005
 
 Batch modes (T-055): `games` (the default) feeds the model 2-game batches, each head capped at 2,250 sampled rows;
-`positions` (--batch-mode positions) feeds it fixed-size per-head steps from utils/position_batcher.py (one game per
-draw, rows carried over). --device mps trains on the Apple GPU; validation always runs on the CPU (a CPU copy of
+`positions` (--batch-mode positions) feeds it per-head steps from utils/position_batcher.py (one game per draw, rows
+carried over): a step takes N_d discard rows and 0, N or 2 N rows of the during / post heads, by their buffers
+(position_batcher.side_take). --device mps trains on the Apple GPU; validation always runs on the CPU (a CPU copy of
 the model, float64 CE), so val numbers do not depend on the device. A resume must use the same mode, sizes and
 device. The header records the git commit; the inputs and the feature code are assumed fixed within a run.
 
 Step semantics: row s of metrics.jsonl = the model after s optimizer updates; row 0 = before any update. A step that
-is both an eval and a save step evals (row written) first, then saves. The final step is always both.
+is both an eval and a save step evals (row written) first, then saves. The final step (total_steps) is always both;
+a --stop-after-step stop at an earlier step keeps the schedule and adds a checkpoint of that step (no extra eval
+row).
 
 Run dir: train.log, metrics.jsonl (a header row, then one row per eval), checkpoints/step_<s>.pt. Starting again on
 the same run dir resumes from its latest checkpoint: the run config and the val ids must match (total_steps may
@@ -459,7 +462,8 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, embd_size: int = EMBD_SIZE,
           n_layers: int = N_LAYERS, row0_tol: float = None, batch_mode: str = "games", position_sizes: dict = None,
           device: str = "cpu", stop_after_step: int = None):
-    """position_sizes: {head: rows per step} of positions mode (default DEFAULT_SIZES); games mode takes none.
+    """position_sizes: {head: step size N} of positions mode (default DEFAULT_SIZES): a step takes N discard rows and
+    0, N or 2 N during / post rows (position_batcher.side_take); games mode takes none.
     stop_after_step: stop once this many updates are done (after that step's eval / save), with a checkpoint of that
     step; total_steps stays the LR horizon, so a resume continues the same schedule (T-056). None: run to total_steps."""
     row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
@@ -829,10 +833,11 @@ if __name__ == "__main__":
                         help=f"row-0 |val CE - uniform-legal CE| limit per head (default {UNIFORM_ROW0_TOL}); a wider "
                              "init model starts further from uniform (T-010 128x2: post -0.069)")
     parser.add_argument("--batch-mode", choices=BATCH_MODES, default="games",
-                        help="games: 2-game batches, sampled per head (default); positions: fixed rows per head and "
-                             "step, carried over (T-055)")
+                        help="games: 2-game batches, sampled per head (default); positions: per-head steps of the "
+                             "position sizes (discard N rows; during / post 0, N or 2 N), rows carried over (T-055)")
     parser.add_argument("--position-sizes", type=parse_position_sizes, default=None, metavar="U,D,P",
-                        help="positions mode: rows per step of the during, discard, post heads (default "
+                        help="positions mode: step sizes N of the during, discard, post heads; a step takes N "
+                             "discard rows and 0, N or 2 N during / post rows (default "
                              f"{','.join(str(DEFAULT_SIZES[h]) for h in HEADS)})")
     parser.add_argument("--device", choices=DEVICES, default="cpu", help="training device (validation: the CPU)")
     parser.add_argument("--stop-after-step", type=int, default=None, metavar="K",
