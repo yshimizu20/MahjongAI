@@ -129,22 +129,26 @@ def test_phase_sum_matches_the_outer_timer(runs):
     print(f"C1 ratio {ratio:.4f}, unattributed {totals['unattributed']:.6f} s of wall {totals['wall']:.6f} s")
 
 
+GAP_S = 1.0  # the injected unattributed seconds per step of test_c1_detects_unattributed_time
+
+
 @pytest.mark.parametrize("where", ["between_spans", "no_begin"])
 def test_c1_detects_unattributed_time(tmp_path, monkeypatch, train_data_root, where):
-    """between_spans: a 0.2 s sleep in the trainer's code after the backward span and before the clip span starts.
-    no_begin: a 0.2 s clip whose span begin is missing (forgotten instrumentation). Either way the time is in the outer
-    timer and in no phase: C1 fails."""
+    """between_spans: a GAP_S sleep in the trainer's code after the backward span and before the clip span starts.
+    no_begin: a GAP_S clip whose span begin is missing (forgotten instrumentation). Either way the time is in the outer
+    timer and in no phase: C1 fails. GAP_S is 1.0 s (was 0.2 s, T-063): a 64 x 1 step is well under 1 s, so the
+    missing share stays far above the 5 % limit when parallel tests slow the steps several times."""
     begin = PT.PhaseTimer.begin
     if where == "between_spans":
         def spy(self, name):
             if name == "clip":
-                time.sleep(0.2)  # runs before begin's sync and clock: outside every span
+                time.sleep(GAP_S)  # runs before begin's sync and clock: outside every span
             return begin(self, name)
     else:
         clip = torch.nn.utils.clip_grad_norm_
 
         def slow_clip(*a, **k):
-            time.sleep(0.2)
+            time.sleep(GAP_S)
             return clip(*a, **k)
         monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", slow_clip)
 
@@ -156,7 +160,8 @@ def test_c1_detects_unattributed_time(tmp_path, monkeypatch, train_data_root, wh
     totals = PT.phase_totals(u)
     with pytest.raises(PT.CheckError, match="C1"):
         PT.check_c1(totals["sum"], u["end"]["outer"])
-    assert totals["unattributed"] >= 0.2 * WINDOW[1] and totals["update"] < 0.2 * WINDOW[1]
+    # the gap is unattributed, not booked into update (which a gap there would push to >= GAP_S * M)
+    assert totals["unattributed"] >= GAP_S * WINDOW[1] and totals["update"] < 0.5 * WINDOW[1]
 
 
 def test_window_endpoints_are_the_update_completions(runs):

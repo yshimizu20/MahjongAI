@@ -18,16 +18,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Set up Python 3.10
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v5
       with:
         python-version: "3.10"
+        cache: pip  # keyed on requirements.txt (v5: v3's cache toolkit is retired)
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install flake8 pytest
+        # the CPU-only torch wheel first (no CUDA wheels to download); requirements.txt's unpinned torch accepts it
+        pip install --index-url https://download.pytorch.org/whl/cpu torch
+        pip install flake8 pytest pytest-xdist
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        python -c "import torch; print('torch', torch.__version__)"
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
@@ -37,5 +41,15 @@ jobs:
     - name: Test with pytest
       run: |
         # MPS tests and frozen Mac float digests need this Mac: Linux CI deselects them (they run locally, see
-        # pytest.ini)
-        cd MahjongAI/tests/; pytest -m "not mps and not mac_floats"
+        # pytest.ini). 4 xdist workers (explicit: -n auto counts physical cores), worksteal balances the long tests.
+        # A background sampler keeps the peak of free's "Mem: used" (MiB) while pytest runs.
+        echo "0 0" > "$RUNNER_TEMP/mem_peak"
+        ( peak=0; k=0; while true; do u=$(free -m | awk '/^Mem:/ {print $3}'); k=$((k + 1))
+          [ "$u" -gt "$peak" ] && peak=$u; echo "$peak $k" > "$RUNNER_TEMP/mem_peak"; sleep 5; done ) &
+        sampler=$!
+        rc=0
+        cd MahjongAI/tests/; pytest -n 4 --dist worksteal --durations=25 -m "not mps and not mac_floats" || rc=$?
+        kill $sampler
+        read peak k < "$RUNNER_TEMP/mem_peak"
+        echo "peak used memory $peak MiB (samples $k)"
+        exit $rc

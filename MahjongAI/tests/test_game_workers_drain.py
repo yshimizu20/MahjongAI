@@ -37,13 +37,20 @@ def _send_and_mark(fd, body):
     (marker_dir / f"sent-{time.monotonic_ns()}").touch()
 
 
+def _mark_partial():
+    """A marker file once the partial write returned: the parent may start its deadline only after it (T-063)."""
+    (pathlib.Path(os.environ["T047_MARKER_DIR"]) / f"partial-{os.getpid()}").touch()
+
+
 def _send_part_of_header(fd, body):
     os.write(fd, struct.pack("!Q", len(body))[:3])
+    _mark_partial()
     time.sleep(120)
 
 
 def _send_part_of_body(fd, body):
     os.write(fd, struct.pack("!Q", len(body)) + body[:len(body) // 2])
+    _mark_partial()
     time.sleep(120)
 
 
@@ -98,13 +105,20 @@ def test_worker_finishes_two_large_frames_while_the_trainer_does_not_fetch(tmp_p
 
 
 @pytest.mark.parametrize("send", [_send_part_of_header, _send_part_of_body], ids=["header", "body"])
-def test_live_worker_with_an_unfinished_frame_is_a_bounded_fatal_error(send):
+def test_live_worker_with_an_unfinished_frame_is_a_bounded_fatal_error(send, tmp_path, monkeypatch):
     """A worker writes part of a frame (header or body) and stays alive: the fetch raises DataWorkerError within the
-    deadline, naming the worker's pid and the unfinished frame; every worker and the drain thread are stopped."""
+    deadline, naming the worker's pid and the unfinished frame; every worker and the drain thread are stopped.
+    The 4 s deadline starts only after the worker's partial write returned (its marker file), so a slow worker start
+    under load cannot use it up before the fault exists (T-063)."""
+    monkeypatch.setenv("T047_MARKER_DIR", str(tmp_path))
     w = GameWorkers(1, _build_big, window=4, timeout_s=4, send=send, parse=_parse_name)
-    w.prefetch([])
+    w.prefetch(["game-a.log"])
     pids = w.pids()
     assert len(pids) == 1 and len(_drain_threads()) == 1
+    marker, wait_until = tmp_path / f"partial-{pids[0]}", time.monotonic() + 60
+    while not marker.exists() and time.monotonic() < wait_until:
+        time.sleep(0.05)
+    assert marker.exists(), "the worker did not write its partial frame within 60 s of the prefetch"
     t = time.monotonic()
     with pytest.raises(DataWorkerError) as error:
         w.fetch("game-a.log")
