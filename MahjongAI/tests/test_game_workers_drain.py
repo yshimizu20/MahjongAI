@@ -14,6 +14,7 @@ import pytest
 from MahjongAI.utils.game_workers import DataWorkerError, GameWorkers, _send_frame
 
 FRAME_BYTES = 4 << 20  # a frame of >= 4 MB: 64 pipe-fulls of a macOS pipe
+READY_S = 60  # the bound on a worker reaching its fault before a short deadline starts (T-063)
 
 
 def _payload(filename: str) -> bytes:
@@ -112,22 +113,25 @@ def test_live_worker_with_an_unfinished_frame_is_a_bounded_fatal_error(send, tmp
     under load cannot use it up before the fault exists (T-063)."""
     monkeypatch.setenv("T047_MARKER_DIR", str(tmp_path))
     w = GameWorkers(1, _build_big, window=4, timeout_s=4, send=send, parse=_parse_name)
-    w.prefetch(["game-a.log"])
-    pids = w.pids()
-    assert len(pids) == 1 and len(_drain_threads()) == 1
-    marker, wait_until = tmp_path / f"partial-{pids[0]}", time.monotonic() + 60
-    while not marker.exists() and time.monotonic() < wait_until:
-        time.sleep(0.05)
-    assert marker.exists(), "the worker did not write its partial frame within 60 s of the prefetch"
-    t = time.monotonic()
-    with pytest.raises(DataWorkerError) as error:
-        w.fetch("game-a.log")
-    seconds = time.monotonic() - t
-    message = str(error.value)
-    assert "no result for game-a.log from the data workers within 4 s" in message
-    assert f"data worker pid {pids[0]} holds " in message and "byte(s) of an unfinished frame" in message, message
-    assert seconds < 20 and w.pids() == [] and w.closed and w._drainer is None
-    assert _gone(pids) and not multiprocessing.active_children() and not _drain_threads()
+    try:
+        w.prefetch(["game-a.log"])
+        pids = w.pids()
+        assert len(pids) == 1 and len(_drain_threads()) == 1
+        marker, wait_until = tmp_path / f"partial-{pids[0]}", time.monotonic() + READY_S
+        while not marker.exists() and time.monotonic() < wait_until:
+            time.sleep(0.05)
+        assert marker.exists(), f"the worker did not write its partial frame within {READY_S} s of the prefetch"
+        t = time.monotonic()
+        with pytest.raises(DataWorkerError) as error:
+            w.fetch("game-a.log")
+        seconds = time.monotonic() - t
+        message = str(error.value)
+        assert "no result for game-a.log from the data workers within 4 s" in message
+        assert f"data worker pid {pids[0]} holds " in message and "byte(s) of an unfinished frame" in message, message
+        assert seconds < 20 and w.pids() == [] and w.closed and w._drainer is None
+        assert _gone(pids) and not multiprocessing.active_children() and not _drain_threads()
+    finally:
+        w.close()  # a failed wait or assertion leaves no worker to the next test of this process (idempotent)
 
 
 def test_drain_thread_start_failure_still_stops_every_worker(monkeypatch):

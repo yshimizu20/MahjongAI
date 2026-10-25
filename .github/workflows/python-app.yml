@@ -42,14 +42,18 @@ jobs:
       run: |
         # MPS tests and frozen Mac float digests need this Mac: Linux CI deselects them (they run locally, see
         # pytest.ini). 4 xdist workers (explicit: -n auto counts physical cores), worksteal balances the long tests.
-        # A background sampler keeps the peak of free's "Mem: used" (MiB) while pytest runs.
-        echo "0 0" > "$RUNNER_TEMP/mem_peak"
+        # A background sampler keeps the peak of free's "Mem: used" (MiB) while pytest runs. Each sample replaces the
+        # file by a rename (never half written); a missing or unreadable peak never changes the step's exit status.
+        peak_file="$RUNNER_TEMP/mem_peak"
+        echo "0 0" > "$peak_file"
         ( peak=0; k=0; while true; do u=$(free -m | awk '/^Mem:/ {print $3}'); k=$((k + 1))
-          [ "$u" -gt "$peak" ] && peak=$u; echo "$peak $k" > "$RUNNER_TEMP/mem_peak"; sleep 5; done ) &
+          [ "$u" -gt "$peak" ] && peak=$u; echo "$peak $k" > "$peak_file.new" && mv -f "$peak_file.new" "$peak_file"
+          sleep 5; done ) &
         sampler=$!
         rc=0
         cd MahjongAI/tests/; pytest -n 4 --dist worksteal --durations=25 -m "not mps and not mac_floats" || rc=$?
-        kill $sampler
-        read peak k < "$RUNNER_TEMP/mem_peak"
-        echo "peak used memory $peak MiB (samples $k)"
+        kill $sampler; wait $sampler 2>/dev/null || true
+        peak=unknown; k=0
+        read -r peak k < "$peak_file" || true
+        echo "peak used memory ${peak:-unknown} MiB (samples ${k:-0})"
         exit $rc

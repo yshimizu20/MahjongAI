@@ -72,6 +72,9 @@ class UnpicklableFailingProcessor(FailingProcessor):
     error, extra = Unpicklable, (7,)
 
 
+READY_S = 60  # the bound on the workers reaching their hang before the 3 s deadline starts (T-063)
+
+
 class StallingProcessor(TransformerTensorProcessor):
     def build_tensors(self, turns, tokens):
         """Hang: a marker file in $T063_STALL_DIR (when set) on entry, then 30 s of sleep."""
@@ -350,18 +353,21 @@ def test_hung_worker_times_out_and_leaves_no_process(small_roots, tmp_path, monk
     submitted first, 8 of its 9 parse), so the timeout is the hang, not a slow worker start under load (T-063)."""
     monkeypatch.setenv("T063_STALL_DIR", str(tmp_path))
     w = _workers(processor_cls=StallingProcessor, timeout_s=3)
-    fast = _cluster(small_roots, 2, SL.EXPECTED_SKIPS, w)
-    w.prefetch([str(f) for f in sorted(small_roots[0].rglob("*.log"))])
-    wait_until = time.monotonic() + 60
-    while len(list(tmp_path.glob("stall-*"))) < 2 and time.monotonic() < wait_until:
-        time.sleep(0.05)
-    stalled = sorted(p.name for p in tmp_path.glob("stall-*"))
-    assert stalled == sorted(f"stall-{pid}" for pid in w.pids()), f"workers stalled within 60 s: {stalled}"
-    t = time.monotonic()
-    with pytest.raises(DataWorkerError, match=r"no result for .*\.log from the data workers within 3 s"):
-        next(fast)
-    pids_seen = w.pids()
-    assert time.monotonic() - t < 30 and pids_seen == [] and not multiprocessing.active_children()
+    try:
+        fast = _cluster(small_roots, 2, SL.EXPECTED_SKIPS, w)
+        w.prefetch([str(f) for f in sorted(small_roots[0].rglob("*.log"))])
+        wait_until = time.monotonic() + READY_S
+        while len(list(tmp_path.glob("stall-*"))) < 2 and time.monotonic() < wait_until:
+            time.sleep(0.05)
+        stalled = sorted(p.name for p in tmp_path.glob("stall-*"))
+        assert stalled == sorted(f"stall-{pid}" for pid in w.pids()), f"workers stalled within {READY_S} s: {stalled}"
+        t = time.monotonic()
+        with pytest.raises(DataWorkerError, match=r"no result for .*\.log from the data workers within 3 s"):
+            next(fast)
+        pids_seen = w.pids()
+        assert time.monotonic() - t < 30 and pids_seen == [] and not multiprocessing.active_children()
+    finally:
+        w.close()  # a failed wait or assertion leaves no worker to the next test of this process (idempotent)
 
 
 # ---------------------------------------------------------------- lazy start, shutdown on every stop path
