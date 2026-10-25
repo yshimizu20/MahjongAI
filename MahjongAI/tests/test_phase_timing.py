@@ -10,6 +10,9 @@ per head equal the batcher counters at step 5 (metrics row) minus those at step 
 timer's spans, chains and wait split, the window's endpoint times and memory samples, the window line's own row check
 and its round trip through the parser, the data workers' exposed wait (only the blocked waits) and busy time, and the
 gate arithmetic (C1, C2, D1 with its repeat band, the epoch projection, the window hashes)."""
+import math
+import os
+import sys
 import time
 
 import pytest
@@ -19,9 +22,12 @@ from MahjongAI import supervised_learning as SL
 from MahjongAI.tests.conftest import build_train_data_root
 from MahjongAI.tests.test_positions_train import _run, step_lines
 from MahjongAI.tests.test_resume_rows import _assert_equal
+from MahjongAI.utils import game_workers as GW
 from MahjongAI.utils import phase_probe as PP
 from MahjongAI.utils import phase_timing as PT
 from MahjongAI.utils.game_workers import GameWorkers
+
+NAN, INF = math.nan, math.inf
 
 STEPS, LAST, WINDOW = 12, 5, (2, 3)  # eval every 5 (_run); save every 5: one eval + save at the window's last step
 
@@ -319,6 +325,40 @@ def _build_small(halfturns, tokens):
     return halfturns
 
 
+def test_the_worker_loop_keeps_no_sent_frame(monkeypatch):
+    """With timing off (the default path), the worker releases each frame after its send (Codex T-062 round 2): while
+    it waits for the next file, the only references to the sent bytes are the test's list and getrefcount's argument.
+    Run in this process (no spawn): the parent watcher and the SIGINT setting are stubbed, the thread count restored."""
+    sent, refs = [], []
+
+    class Tasks:
+        def __init__(self):
+            self.items = ["a.log", "b.log", None]
+
+        def get(self):
+            if sent:
+                refs.append(sys.getrefcount(sent[-1]))
+            return self.items.pop(0)
+
+    class Results:
+        def fileno(self):
+            return -1
+
+    monkeypatch.setattr(GW, "_watch_parent", lambda pid: None)
+    monkeypatch.setattr(GW.signal, "signal", lambda *a: None)
+    threads = torch.get_num_threads()
+    try:
+        GW._worker_main(Tasks(), Results(), _build_small, os.getpid(), send=lambda fd, body: sent.append(body),
+                        parse=_parse_fast)
+    finally:
+        torch.set_num_threads(threads)
+    assert len(sent) == 2 and refs == [2, 2], refs
+
+
+def _parse_fast(filename):
+    return filename, None
+
+
 def test_workers_report_exposed_wait_and_busy_time():
     with GameWorkers(2, _build_small, window=2, timeout_s=60, parse=_parse_slow, timing=True) as w:
         assert w.exposed_wait_s == 0.0
@@ -353,6 +393,9 @@ def test_c1_accounting():
             PT.check_c1(bad, 100.0)
     with pytest.raises(PT.CheckError):
         PT.check_c1(1.0, 0.0)
+    for phase_sum, outer in ((NAN, 100.0), (100.0, NAN), (INF, 100.0), (100.0, INF)):  # Codex T-062 round 2
+        with pytest.raises(PT.CheckError, match="finite"):
+            PT.check_c1(phase_sum, outer)
 
 
 def test_c2_labels_both_directions():
@@ -360,6 +403,9 @@ def test_c2_labels_both_directions():
     assert PT.c2_label(151.0, 100.0)[1] == "distorted by sync"
     assert PT.c2_label(89.0, 100.0)[1] == "distorted by sync"
     assert PT.c2_label(150.0, 100.0)[1] == PT.c2_label(90.0, 100.0)[1] == "ok"
+    for b, a in ((INF, INF), (NAN, 100.0), (100.0, NAN), (INF, 100.0)):  # Codex T-062 round 2
+        with pytest.raises(PT.CheckError, match="finite"):
+            PT.c2_label(b, a)
 
 
 def test_d1_with_its_repeat_band():
@@ -373,6 +419,9 @@ def test_d1_with_its_repeat_band():
     assert PT.d1_verdict({"x1": "fail", "x2": "repeat"}) == "repeat"
     assert PT.d1_verdict({"x1": "fail", "x2": "repeat pending"}) == "repeat"
     assert PT.d1_verdict({"x1": "fail", "x2": "fail"}) == "fail"
+    for cpu, mps in (([INF], [1.0]), ([100.0], [NAN]), ([100.0, NAN], [80.0, 80.0])):  # Codex T-062 round 2
+        with pytest.raises(PT.CheckError, match="finite"):
+            PT.d1_size(cpu, mps)
     with pytest.raises(PT.CheckError):
         PT.d1_size([], [1.0])
     with pytest.raises(PT.CheckError):

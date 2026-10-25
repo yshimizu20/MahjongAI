@@ -661,7 +661,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     # --phase-timing (T-057): one probe mark after each operation, in the order of the T-059 mark list; the timer reads
     # each mark's time and times the spans from timer.begin(<mark>), called right before each operation. Every probe
     # call and its arguments sit under `if probe is not None` (every timer call under `if timer is not None`), so a run
-    # without the flag does no extra work (no call, no allocation).
+    # without the flag makes no probe or timer call (no timing work, no device sync of the probe).
     probe = timer = None
     if phase_timing:
         timer = PhaseTimer(log, None if workers is None else (lambda: workers.exposed_wait_s), sync_for(device))

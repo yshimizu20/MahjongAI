@@ -84,8 +84,8 @@ def _send_frame(fd: int, body: bytes):
 
 
 def _worker_main(tasks, results, build, parent_pid: int, send=_send_frame, parse=None, busy=None):
-    """busy: a shared [seconds, files] array (T-057, timing on) or None (no clock read): each file adds its parse +
-    build + serialize seconds and 1."""
+    """busy: a shared [seconds, files] array (T-057, timing on) or None (no timing clock read): each file adds its parse
+    + build + serialize seconds and 1."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     import torch
     torch.set_num_threads(1)  # the trainer's threads keep their cores
@@ -115,6 +115,7 @@ def _worker_main(tasks, results, build, parent_pid: int, send=_send_frame, parse
             busy[0] += time.perf_counter() - t0
             busy[1] += 1
         send(results.fileno(), body)
+        del body  # a frame is 3-4 MB: not kept while the worker waits for its next file
 
 
 class Fetched:
@@ -135,7 +136,7 @@ class GameWorkers:
     send, parse: test hooks, module-level functions: the worker's frame writer of (fd, body), and its parser of a
     file (default process_xml.process). timing (T-057, the trainer's --phase-timing / --measure-window): the workers
     time their files (busy_seconds) and fetch times its waits for a result (exposed_wait_s); off (the default): no
-    shared counters, no clock reads."""
+    shared counters and no timing clock reads (fetch still reads its timeout clock)."""
 
     def __init__(self, n: int, build, window: int = 8, timeout_s: float = WORKER_TIMEOUT_S, send=_send_frame,
                  parse=None, timing: bool = False):

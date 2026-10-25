@@ -320,7 +320,8 @@ class EncoderConvModel(nn.Module):
         """{head: HeadOutput} of ready per-head tensors (T-055 positions mode): batches = {head: (tokens (B, 150),
         (x1, x2, x3), mask (B, A), y (B,), padding (B, 150))}, every row already checked at admission (binary mask,
         a legal target). The network steps of `forward` (steps 1-6, the same ops), heads in during / discard / post
-        order, so dropout draws in the order of `forward`; no sampling and no device sync. Inputs move to the
+        order, so dropout draws in the order of `forward`; no sampling and no device sync of its own (a --phase-timing
+        mark syncs MPS). Inputs move to the
         model's own device. mark: the trainer's --phase-timing probe (T-057), called with "<head>:transfer" after a
         head's inputs moved and "<head>:forward" after its loss; None (the default): no call."""
         device = self.ln_f.weight.device

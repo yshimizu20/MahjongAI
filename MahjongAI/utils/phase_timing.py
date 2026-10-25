@@ -354,8 +354,8 @@ def phase_totals(parsed: dict) -> dict:
 def check_c1(phase_sum: float, outer: float, tol: float = C1_TOL) -> float:
     """C1 accounting: the B run's phase sum over the window within tol of its independent outer time. Returns the
     ratio; raises with the numbers."""
-    if not outer > 0:
-        raise CheckError(f"C1: outer time {outer} is not positive")
+    if not (math.isfinite(outer) and outer > 0 and math.isfinite(phase_sum)):
+        raise CheckError(f"C1: outer time {outer} must be finite and positive, phase sum {phase_sum} finite")
     ratio = phase_sum / outer
     if abs(ratio - 1) > tol:
         raise CheckError(f"C1: phase sum {phase_sum:.6f} s vs outer {outer:.6f} s, ratio {ratio:.4f} outside "
@@ -365,8 +365,8 @@ def check_c1(phase_sum: float, outer: float, tol: float = C1_TOL) -> float:
 
 def c2_label(b_outer: float, a_outer: float) -> tuple:
     """C2 sync cost: (B / A, label); the label is "distorted by sync" outside C2_RANGE, else "ok"."""
-    if not (a_outer > 0 and b_outer > 0):
-        raise CheckError(f"C2: outer times A {a_outer}, B {b_outer} must be positive")
+    if not all(math.isfinite(t) and t > 0 for t in (a_outer, b_outer)):
+        raise CheckError(f"C2: outer times A {a_outer}, B {b_outer} must be finite and positive")
     ratio = b_outer / a_outer
     return ratio, ("distorted by sync" if ratio > C2_RANGE[1] or ratio < C2_RANGE[0] else "ok")
 
@@ -376,8 +376,9 @@ def d1_size(cpu_ms: list, mps_ms: list) -> tuple:
     status). The original ratio (A runs) inside D1_REPEAT_BAND needs both repeats: "repeat" (none yet), "repeat
     pending" (one device's only), then the ratio of the means decides. Outside the band the original ratio decides.
     status: "pass" (ratio <= D1_RATIO) or "fail"."""
-    if not cpu_ms or not mps_ms or min(cpu_ms + mps_ms) <= 0 or max(len(cpu_ms), len(mps_ms)) > 2:
-        raise CheckError(f"D1: needs one or two positive A times per device (cpu {cpu_ms}, mps {mps_ms})")
+    if (not cpu_ms or not mps_ms or not all(math.isfinite(t) and t > 0 for t in cpu_ms + mps_ms)
+            or max(len(cpu_ms), len(mps_ms)) > 2):
+        raise CheckError(f"D1: needs one or two finite positive A times per device (cpu {cpu_ms}, mps {mps_ms})")
     ratio = mps_ms[0] / cpu_ms[0]
     if D1_REPEAT_BAND[0] <= ratio <= D1_REPEAT_BAND[1]:
         repeats = (len(cpu_ms) == 2) + (len(mps_ms) == 2)
