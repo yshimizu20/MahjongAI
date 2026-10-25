@@ -6,6 +6,7 @@ import glob
 import hashlib
 import math
 import os
+import sys
 
 import pytest
 import torch
@@ -74,9 +75,12 @@ def test_count_parameters_draws_no_random_number():
 
 
 # Frozen from the pre-T-010 code (f23862a, fixed width 64): sha256 over the seed-0 state_dict (name, shape, bytes in
-# state_dict order) and the next three torch.rand draws after the build (the RNG state the build leaves behind)
+# state_dict order) and the next three torch.rand draws after the build (the RNG state the build leaves behind). The
+# digest holds on macOS only (torch 2.5.1 and 2.13 agree there); Linux CPU init writes other float bits from the same
+# RNG stream, so the RNG-state check is the one that runs everywhere
 PRE_T010_INIT_SHA256 = "464d068574eb18ed46252e960d41c231cc68a562b550ba8c439f05deaddcc44e"
 PRE_T010_NEXT_RAND = [0.935202419757843, 0.6767680644989014, 0.6052327156066895]
+OFF_DIGEST_PLATFORM = sys.platform != "darwin"
 
 
 def _init_fingerprint(**kwargs):
@@ -90,10 +94,17 @@ def _init_fingerprint(**kwargs):
     return h.hexdigest(), torch.rand(3).tolist()
 
 
+def test_default_model_leaves_the_rng_state_as_before():
+    """The default and an explicit 64 x 1 build draw as many random numbers as the pre-T-010 build: same RNG after."""
+    assert _init_fingerprint()[1] == PRE_T010_NEXT_RAND
+    assert _init_fingerprint(n_layers=1, embd_size=64)[1] == PRE_T010_NEXT_RAND
+
+
+@pytest.mark.skipif(OFF_DIGEST_PLATFORM, reason="frozen digest of macOS CPU init floats (torch 2.5.1, 2.13)")
 def test_default_model_is_initialised_as_before():
-    """The default and an explicit 64 x 1 model draw the pre-T-010 initial weights and leave the same RNG state."""
-    assert _init_fingerprint() == (PRE_T010_INIT_SHA256, PRE_T010_NEXT_RAND)
-    assert _init_fingerprint(n_layers=1, embd_size=64) == (PRE_T010_INIT_SHA256, PRE_T010_NEXT_RAND)
+    """The default and an explicit 64 x 1 model draw the pre-T-010 initial weights, byte for byte."""
+    assert _init_fingerprint()[0] == PRE_T010_INIT_SHA256
+    assert _init_fingerprint(n_layers=1, embd_size=64)[0] == PRE_T010_INIT_SHA256
 
 
 def test_two_widths_coexist_in_one_process(game):
