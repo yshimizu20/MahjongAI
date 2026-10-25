@@ -36,4 +36,5 @@ jobs:
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
       run: |
-        cd MahjongAI/tests/; pytest
+        # MPS tests need Apple silicon: Linux CI deselects them (they run locally, see pytest.ini)
+        cd MahjongAI/tests/; pytest -m "not mps"

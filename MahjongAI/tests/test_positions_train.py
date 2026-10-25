@@ -365,10 +365,18 @@ def test_a_legacy_games_run_resumes_and_other_settings_are_rejected(tmp_path, mo
     with pytest.raises(AssertionError, match=r"step_1.pt is from another run config: batch_mode 'games' -> "
                                              r"'positions', batch_size 2 -> 1, position_sizes None -> "):
         _run(tmp_path, monkeypatch, train_data_root, "g", steps=2)
-    with pytest.raises(AssertionError, match=r"step_1.pt is from another run config: device 'cpu' -> 'mps'"):
-        _run(tmp_path, monkeypatch, train_data_root, "g", steps=2, batch_mode="games", device="mps")
     _run(tmp_path, monkeypatch, train_data_root, "g", steps=2, batch_mode="games")
     assert "resuming at step 1;" in open(tmp_path / "g.log").read()
+
+
+@pytest.mark.mps
+def test_a_legacy_games_run_rejects_the_mps_device(tmp_path, monkeypatch, train_data_root):
+    """The device case of the legacy resume: it needs MPS (the trainer moves the model there before the config
+    check), so it carries the mps marker and Linux CI leaves it out."""
+    run = _run(tmp_path, monkeypatch, train_data_root, "g", steps=1, batch_mode="games")
+    _strip_t055(run, 1)  # a run dir written before T-055
+    with pytest.raises(AssertionError, match=r"step_1.pt is from another run config: device 'cpu' -> 'mps'"):
+        _run(tmp_path, monkeypatch, train_data_root, "g", steps=2, batch_mode="games", device="mps")
 
 
 def test_a_positions_run_rejects_other_sizes(tmp_path, monkeypatch, train_data_root):

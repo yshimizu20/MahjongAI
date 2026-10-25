@@ -48,6 +48,8 @@ from MahjongAI.tests.test_resume_rows import _assert_equal
 from MahjongAI.turn import HalfTurn
 from MahjongAI.viewer import infer
 
+pytestmark = pytest.mark.mps  # Linux CI runs `pytest -m "not mps"`; locally `pytest` runs these and needs MPS
+
 TOL = 1e-4
 MPS = torch.device("mps")
 
