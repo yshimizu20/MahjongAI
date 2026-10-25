@@ -9,10 +9,13 @@ unbroken run; the second one's stop checkpoint equals the unbroken run's checkpo
 (RNG from before the failed forward; the buffers whole, with the rows the failed step's fill drew). An interrupt
 after a commit and before the update's RNG snapshot and train sums are final saves no checkpoint; a failure after an
 eval row is on disk resumes with that row's interval closed. Both resume to the unbroken run.
+Stop bound (T-056): --stop-after-step stops after update K with a checkpoint of step K equal to the unbroken run's,
+on the same LR horizon, and no worker left; the resume ends equal to the unbroken run.
 Counters: every eval row's per-source-epoch counters (games, rows in / out per head) equal an independent reference
 over the trainer's loader order (prepare_batches per game, the plain-Python emit rule).
 Identity: batch mode, sizes and device are run-identity keys; a config without them reads as games mode on the CPU."""
 import inspect
+import multiprocessing
 import os
 import re
 import shutil
@@ -31,7 +34,8 @@ SIZES = {"during": 60, "discard": 1600, "post": 400}  # ~3-4 fixture games a ste
 
 
 def _run(tmp_path, monkeypatch, root, name, steps=STEPS, save_every=SAVE_EVERY, sizes=SIZES, device="cpu",
-         batch_mode="positions"):
+         batch_mode="positions", stop_after_step=None, **arch):
+    """arch: embd_size / n_layers / row0_tol of SL.train (the defaults when absent)."""
     monkeypatch.setattr(SL, "DATA_ROOT", root)
     monkeypatch.setattr(SL, "VAL_GAMES", 2)
     monkeypatch.setattr(SL, "PRIOR_GAMES", 2)
@@ -39,7 +43,8 @@ def _run(tmp_path, monkeypatch, root, name, steps=STEPS, save_every=SAVE_EVERY, 
     try:
         SL.train("encoder_conv", steps, str(tmp_path / name), SL.RunLog(str(tmp_path / f"{name}.log")),
                  eval_every=EVAL_EVERY, save_every=save_every, batch_mode=batch_mode,
-                 position_sizes=sizes if batch_mode == "positions" else None, device=device)
+                 position_sizes=sizes if batch_mode == "positions" else None, device=device,
+                 stop_after_step=stop_after_step, **arch)
     finally:
         torch.set_num_threads(threads)
     return tmp_path / name
@@ -217,6 +222,30 @@ def test_failure_after_the_forward_before_the_commit_keeps_the_step(tmp_path, mo
             _assert_equal(rb["buffers"][h]["cols"], [c[:n] for c in sb["buffers"][h]["cols"]], f"{h} rows prefix")
     _run(tmp_path, monkeypatch, train_data_root, "b")
     assert_runs_equal(tmp_path, "a", "b", (8, 12))
+
+
+def test_stop_after_step_saves_step_k_and_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root,
+                                                                       unbroken):
+    """--stop-after-step 6 (not an eval or save step of run b): train returns normally, step_6.pt equals the
+    unbroken run's step_6.pt in every field (scheduler and LR on the 12-step horizon, train sums of the open
+    interval, batcher state, RNG), no worker process is left; a start without the bound resumes at step 6 and ends
+    equal to the unbroken run. A second start with the same bound stops at once and saves nothing new."""
+    b = _run(tmp_path, monkeypatch, train_data_root, "b", stop_after_step=6)
+    assert not multiprocessing.active_children(), multiprocessing.active_children()
+    log = open(tmp_path / "b.log").read()
+    assert "stopped after update 6 (--stop-after-step 6, total_steps 12)" in log and "Training completed." not in log
+    assert sorted(os.listdir(b / "checkpoints")) == ["step_4.pt", "step_6.pt"]
+    assert [r["step"] for r in SL.Metrics(str(b / "metrics.jsonl")).read()[1]] == [0, 5]
+    _assert_equal(torch.load(unbroken / "checkpoints" / "step_6.pt", weights_only=True),
+                  torch.load(b / "checkpoints" / "step_6.pt", weights_only=True), "stop checkpoint step_6.pt")
+    mtime = os.path.getmtime(b / "checkpoints" / "step_6.pt")
+    _run(tmp_path, monkeypatch, train_data_root, "b", stop_after_step=6)
+    assert os.path.getmtime(b / "checkpoints" / "step_6.pt") == mtime
+    assert len(step_lines(tmp_path / "b.log")) == 6  # no update after the bound
+    _run(tmp_path, monkeypatch, train_data_root, "b")
+    assert "resuming at step 6;" in open(tmp_path / "b.log").read()
+    assert "Training completed." in open(tmp_path / "b.log").read()
+    assert_runs_equal(tmp_path, "a", "b", (4, 8, 12))
 
 
 class InterruptAtLine:

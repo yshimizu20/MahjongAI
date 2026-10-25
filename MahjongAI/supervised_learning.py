@@ -93,6 +93,7 @@ BATCH_MODES = ("games", "positions")
 DEVICES = ("cpu", "mps")
 # T-055: the run-identity keys of a config written before T-055 (2-game batches on the CPU)
 LEGACY_RUN = {"batch_mode": "games", "position_sizes": None, "device": "cpu"}
+MPS_MEMORY_EVERY = 100  # steps between the MPS memory log lines (T-055)
 
 
 class RunLog:
@@ -457,18 +458,22 @@ def find_latest_checkpoint(checkpoint_dir: str):
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, embd_size: int = EMBD_SIZE,
           n_layers: int = N_LAYERS, row0_tol: float = None, batch_mode: str = "games", position_sizes: dict = None,
-          device: str = "cpu"):
-    """position_sizes: {head: rows per step} of positions mode (default DEFAULT_SIZES); games mode takes none."""
+          device: str = "cpu", stop_after_step: int = None):
+    """position_sizes: {head: rows per step} of positions mode (default DEFAULT_SIZES); games mode takes none.
+    stop_after_step: stop once this many updates are done (after that step's eval / save), with a checkpoint of that
+    step; total_steps stays the LR horizon, so a resume continues the same schedule (T-056). None: run to total_steps."""
     row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
     assert batch_mode in BATCH_MODES and device in DEVICES, (batch_mode, device)
     if batch_mode == "positions":
         position_sizes = {h: (position_sizes or DEFAULT_SIZES)[h] for h in HEADS}
     assert batch_mode == "positions" or position_sizes is None, "position sizes are a positions-mode setting"
     assert device != "mps" or torch.backends.mps.is_available(), "--device mps: this machine has no MPS backend"
+    assert stop_after_step is None or stop_after_step > 0, f"stop_after_step {stop_after_step}: must be > 0"
     workers = make_workers()
     try:
         _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
-               embd_size, n_layers, row0_tol, batch_mode, position_sizes, torch.device(device))
+               embd_size, n_layers, row0_tol, batch_mode, position_sizes, torch.device(device),
+               stop_after_step)
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
@@ -476,7 +481,8 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
 
 def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int, save_every: int,
            expect_prior_ce, expect_shanten, workers, embd_size: int, n_layers: int,
-           row0_tol: float, batch_mode: str, position_sizes, device: torch.device):
+           row0_tol: float, batch_mode: str, position_sizes, device: torch.device,
+           stop_after_step):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
@@ -622,6 +628,13 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     def is_save_step(s: int) -> bool:
         return s % save_every == 0 or s == total_steps
 
+    def log_mps_memory(when: str = ""):
+        """One MPS memory sample. when: "" for the every-MPS_MEMORY_EVERY-steps line (before that step's eval / save),
+        " (post-eval/save)" right after an eval or a save, " (final)" after the last save of the run (T-056)."""
+        if device.type == "mps":
+            log(f"mps memory at step {current_step}{when}: driver {torch.mps.driver_allocated_memory() / 2**20:.0f} "
+                f"MB, current {torch.mps.current_allocated_memory() / 2**20:.0f} MB")
+
     def evaluate():
         """Row `current_step`: val per head and game, mean train CE since the last row. Row 0 is written only if
         it passes the uniform-legal check, so a restart after that stop checks it again."""
@@ -694,8 +707,11 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     try:
         if is_eval_step(current_step) and not any(r["step"] == current_step for r in rows):
             evaluate()  # row 0 of a fresh run, or the row a stop / kill lost after its checkpoint
+            log_mps_memory(" (post-eval/save)")
         consumed = []  # the files of the batches drawn since the last update, in order (a no-sample batch included)
         while current_step < total_steps:
+            if stop_after_step is not None and current_step >= stop_after_step:
+                break  # at the top of the loop: the last update, its eval row and its save are done
             if batcher is None:
                 games, tokens = next(cluster)
                 consumed += cluster.last_batch_files
@@ -744,11 +760,22 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results)
                 + trace)
             consumed = []
+            if current_step % MPS_MEMORY_EVERY == 0:
+                log_mps_memory()
 
             if is_eval_step(current_step):
                 evaluate()
             if is_save_step(current_step):
                 save_checkpoint()
+            if is_eval_step(current_step) or is_save_step(current_step):
+                log_mps_memory(" (post-eval/save)")
+        if current_step < total_steps:  # --stop-after-step: a checkpoint of the stop step (none if it is on disk)
+            if current_step != latest_step and not is_save_step(current_step):
+                save_checkpoint()
+            log_mps_memory(" (final)")
+            log(f"stopped after update {current_step} (--stop-after-step {stop_after_step}, total_steps "
+                f"{total_steps}): a start on this run dir resumes here")
+            return
     except BaseException as e:
         log(f"STOP at step {current_step}: {type(e).__name__}: {str(e)[:500]}")
         if consistent:
@@ -759,6 +786,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         else:
             log("no checkpoint: the stop came inside an optimizer update")
         raise
+    log_mps_memory(" (final)")
     log("Training completed.")
 
 
@@ -807,6 +835,8 @@ if __name__ == "__main__":
                         help="positions mode: rows per step of the during, discard, post heads (default "
                              f"{','.join(str(DEFAULT_SIZES[h]) for h in HEADS)})")
     parser.add_argument("--device", choices=DEVICES, default="cpu", help="training device (validation: the CPU)")
+    parser.add_argument("--stop-after-step", type=int, default=None, metavar="K",
+                        help="stop after update K with a checkpoint; max_steps stays the LR horizon (T-056)")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -820,6 +850,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     assert args.eval_every > 0 and args.save_every > 0
+    if args.stop_after_step is not None and args.stop_after_step <= 0:
+        parser.error("--stop-after-step needs K > 0")
     if args.position_sizes is not None and args.batch_mode != "positions":
         parser.error("--position-sizes needs --batch-mode positions")
 
@@ -829,12 +861,13 @@ if __name__ == "__main__":
     log(f"Training {args.model_name} for {args.max_steps} steps in {run_dir} (eval every {args.eval_every}, "
         f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers}, batch mode "
         f"{args.batch_mode}, device {args.device})"
+        + (f", stop after step {args.stop_after_step}" if args.stop_after_step is not None else "")
         + (" [profiling on]" if args.profile else ""))
 
     def _run():
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
               args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol,
-              args.batch_mode, args.position_sizes, args.device)
+              args.batch_mode, args.position_sizes, args.device, args.stop_after_step)
 
     if args.profile:
         pr = cProfile.Profile()
