@@ -82,9 +82,7 @@ def predict(model: EncoderConvModel, sample: Sample) -> torch.Tensor:
 @functools.lru_cache(maxsize=None)
 def load_model(ckpt_path: str) -> EncoderConvModel:
     """Memoised per process: every seat gets its own ModelPlayer (own sampling stream) over one set of weights."""
-    model = EncoderConvModel(verbose=False)
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)["model_state_dict"]
-    model.load_state_dict(state)
+    model = EncoderConvModel.from_checkpoint(torch.load(ckpt_path, map_location="cpu", weights_only=True))
     model.eval()
     return model
 

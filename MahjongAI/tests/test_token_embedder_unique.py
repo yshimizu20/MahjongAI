@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from MahjongAI.agents.encoder_conv import (DURING_TURN_ACTION_DIM, MAX_ACTION_LEN, POST_TURN_ACTION_DIM,
+from MahjongAI.agents.encoder_conv import (DURING_TURN_ACTION_DIM, EMBD_SIZE, MAX_ACTION_LEN, POST_TURN_ACTION_DIM,
                                            EncoderConvModel, TokenEmbedder, TransformerTensorProcessor)
 from MahjongAI.process_xml import process
 from MahjongAI.utils.constants import EventStateTypes
@@ -138,9 +138,10 @@ def _all_batches(head_tokens):
     return {**head_tokens, **_constructed_batches(head_tokens)}
 
 
-def test_forward_bitwise_equal(head_tokens):
+@pytest.mark.parametrize("embd_size", [EMBD_SIZE, 128])
+def test_forward_bitwise_equal(head_tokens, embd_size):
     torch.manual_seed(0)
-    module = TokenEmbedder()
+    module = TokenEmbedder(embd_size)
     for m in module.modules():  # nonzero tables everywhere (default init) so every term counts
         if isinstance(m, torch.nn.Embedding):
             torch.nn.init.normal_(m.weight)
@@ -149,7 +150,7 @@ def test_forward_bitwise_equal(head_tokens):
         for train in (False, True):
             module.train(train), ref.train(train)
             out, expected = _embed(module, tokens), ref(tokens)
-            assert out.shape == expected.shape == (*tokens.shape, module.type_embedding.embedding_dim), name
+            assert out.shape == expected.shape == (*tokens.shape, embd_size), name
             assert out.dtype == expected.dtype and torch.equal(out, expected), f"{name} train={train}"
     real = head_tokens["discard"]
     unique = torch.unique(real * MAX_ACTION_LEN + torch.arange(real.size(1))).numel()
@@ -157,9 +158,10 @@ def test_forward_bitwise_equal(head_tokens):
     assert unique < real.numel() // 4  # the fast path has rows to save on real data
 
 
-def test_gradients_equal_in_float64(head_tokens):
+@pytest.mark.parametrize("embd_size", [EMBD_SIZE, 128])
+def test_gradients_equal_in_float64(head_tokens, embd_size):
     torch.manual_seed(0)
-    module = TokenEmbedder().double()
+    module = TokenEmbedder(embd_size).double()
     ref = _reference_of(module)
     g = torch.Generator().manual_seed(1)
     for name, tokens in _all_batches(head_tokens).items():
@@ -189,11 +191,12 @@ def _cast_double(processor):
     processor.prepare_batches = lambda *a, **k: tuple(cast(h) for h in prepare(*a, **k))
 
 
-def test_model_logits_bitwise_and_gradients_equal(games):
+@pytest.mark.parametrize("embd_size,n_layers", [(EMBD_SIZE, 1), (128, 2)])
+def test_model_logits_bitwise_and_gradients_equal(games, embd_size, n_layers):
     """Eval: every head's logits and loss bitwise equal. Train with dropout off, float64: every parameter gradient
     equal."""
     torch.manual_seed(0)
-    model = EncoderConvModel(verbose=False).eval()
+    model = EncoderConvModel(n_layers=n_layers, embd_size=embd_size, verbose=False).eval()
     ref = _reference_of(model)
     with torch.no_grad():
         out, expected = model(*games), ref(*games)

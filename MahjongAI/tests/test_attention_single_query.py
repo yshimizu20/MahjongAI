@@ -83,10 +83,10 @@ def _assert_grads(a, b):
 
 
 # ---------------------------------------------------------------- the attention module on constructed inputs
-def _inputs(B=7, T=151, seed=0, empty_rows=()):
+def _inputs(B=7, T=151, seed=0, empty_rows=(), embd_size=EMBD_SIZE):
     g = torch.Generator().manual_seed(seed)
-    kv = torch.randn(B, T, EMBD_SIZE, generator=g, dtype=torch.float64)
-    q = torch.randn(B, 1, EMBD_SIZE, generator=g, dtype=torch.float64)
+    kv = torch.randn(B, T, embd_size, generator=g, dtype=torch.float64)
+    q = torch.randn(B, 1, embd_size, generator=g, dtype=torch.float64)
     valid = torch.randint(1, T, (B,), generator=g)
     mask = torch.arange(T).unsqueeze(0) < valid.unsqueeze(1)
     mask[:, -1] = True
@@ -106,16 +106,17 @@ def _attention_run(module, kv, q, mask, seed):
     return out.detach(), grads, torch.get_rng_state()
 
 
+@pytest.mark.parametrize("embd_size", [EMBD_SIZE, 128])
 @pytest.mark.parametrize("mode", ["eval", "train_p0", "train_dropout"])
 @pytest.mark.parametrize("empty_rows", [(), (2, 5)], ids=["masked", "fully_masked_rows"])
-def test_attention_module_equals_sdpa_reference(mode, empty_rows):
+def test_attention_module_equals_sdpa_reference(mode, empty_rows, embd_size):
     torch.manual_seed(0)
-    module = MultiHeadAttention(N_HEADS, EMBD_SIZE // N_HEADS).double()
+    module = MultiHeadAttention(N_HEADS, embd_size // N_HEADS, embd_size).double()
     module.train(mode != "eval")
     if mode == "train_p0":
         _set_dropout(module, 0.0)
     ref = _reference_of(module)
-    kv, q, mask = _inputs(empty_rows=empty_rows)
+    kv, q, mask = _inputs(empty_rows=empty_rows, embd_size=embd_size)
     with _count_fast_path() as calls:
         out, grads, rng = _attention_run(module, kv, q, mask, seed=3)
     assert len(calls) == 1, "the one-query path did not run"
@@ -174,14 +175,15 @@ def _model_run(model, games, seed, sample_size):
             {n: p.grad for n, p in model.named_parameters()}, torch.get_rng_state())
 
 
+@pytest.mark.parametrize("embd_size", [EMBD_SIZE, 128])
 @pytest.mark.parametrize("n_layers", [1, 2])
 @pytest.mark.parametrize("mode", ["eval", "train_p0", "train_dropout"])
-def test_model_equals_sdpa_reference(games, n_layers, mode):
+def test_model_equals_sdpa_reference(games, n_layers, mode, embd_size):
     """Real games, a forced small sample cap (every head above it): selected targets equal; logits, losses and every
     parameter gradient equal; final RNG state equal. With 2 layers the first block keeps SDPA (Q = T) and only the
     last block takes the one-query path."""
     torch.manual_seed(0)
-    model = EncoderConvModel(n_layers=n_layers, verbose=False).double()
+    model = EncoderConvModel(n_layers=n_layers, embd_size=embd_size, verbose=False).double()
     model.train(mode != "eval")
     if mode == "train_p0":
         _set_dropout(model, 0.0)

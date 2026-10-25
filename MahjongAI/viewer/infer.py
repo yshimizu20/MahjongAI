@@ -181,10 +181,10 @@ def predict(model: EncoderConvModel, sample: Sample) -> tuple:
 
 
 def load_model(ckpt_path: str) -> EncoderConvModel:
-    """The checkpoint's model in eval mode (supervised_learning.py's load: weights_only, model_state_dict)."""
+    """The checkpoint's model in eval mode (supervised_learning.py's load: weights_only; the architecture from its
+    config, EncoderConvModel.from_checkpoint)."""
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model = EncoderConvModel(verbose=False).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = EncoderConvModel.from_checkpoint(checkpoint).to(device)
     model.eval()
     return model
 
