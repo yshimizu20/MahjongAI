@@ -316,12 +316,13 @@ class EncoderConvModel(nn.Module):
 
         return results
 
-    def forward_heads(self, batches: dict) -> dict:
+    def forward_heads(self, batches: dict, mark=None) -> dict:
         """{head: HeadOutput} of ready per-head tensors (T-055 positions mode): batches = {head: (tokens (B, 150),
         (x1, x2, x3), mask (B, A), y (B,), padding (B, 150))}, every row already checked at admission (binary mask,
         a legal target). The network steps of `forward` (steps 1-6, the same ops), heads in during / discard / post
         order, so dropout draws in the order of `forward`; no sampling and no device sync. Inputs move to the
-        model's own device."""
+        model's own device. mark: the trainer's --phase-timing probe (T-057), called with "<head>:transfer" after a
+        head's inputs moved and "<head>:forward" after its loss; None (the default): no call."""
         device = self.ln_f.weight.device
         results = {}
         for head in ("during", "discard", "post"):
@@ -330,6 +331,8 @@ class EncoderConvModel(nn.Module):
             tokens, state, mask, y, padding = batches[head]
             tokens, padding, mask, y = tokens.to(device), padding.to(device), mask.to(device), y.to(device)
             state = tuple(t.to(device) for t in state)
+            if mark is not None:
+                mark(f"{head}:transfer")
             fused = torch.cat([self.token_embedder(tokens), self.state_net(state).unsqueeze(1)], dim=1)
             state_mask = torch.ones(padding.size(0), 1, dtype=torch.bool, device=device)
             attn_mask = torch.cat([padding, state_mask], dim=1).unsqueeze(1)  # (B, 1, 151)
@@ -338,6 +341,8 @@ class EncoderConvModel(nn.Module):
             assert logits.shape == mask.shape, f"{head}: logits {tuple(logits.shape)}, mask {tuple(mask.shape)}"
             logits = logits.masked_fill(mask == 0, -1e9)
             results[head] = HeadOutput(logits, F.cross_entropy(logits, y, reduction="mean"), y)
+            if mark is not None:
+                mark(f"{head}:forward")
         return results
 
 
