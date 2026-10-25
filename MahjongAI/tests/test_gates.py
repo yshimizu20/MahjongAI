@@ -6,6 +6,7 @@ sorted picks are unchanged. When self_test() starts reading a new game, re-trace
 wrap builtins.open, run gates.self_test() with the default DATA_ROOT, and copy every opened processed/ file here."""
 import ast
 import collections
+import json
 import os
 import random
 from unittest import mock
@@ -13,62 +14,41 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from mahjong.agari import Agari
 from mahjong.hand_calculating import yaku_config
-from mahjong.shanten import Shanten
 
 from MahjongAI import process_xml
 from MahjongAI.draw import Naki
 from MahjongAI.process_xml import process
 from MahjongAI.utils import agari, gates, legal_oracles, win_oracles
 from MahjongAI.utils.legal_oracles import Meld
+from MahjongAI.tests.conftest import shared_tmp
 
 GATE_GAMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "gate_games")
 
 
-class LibraryMemo:
-    """Dict memo over the two pure mahjong-library hand checks the self-test calls ~1 M and ~46 M times (T-063).
-
-    Shanten.calculate_shanten and Agari.is_agari map a count array (+ flags / open sets) to an int / bool, keep no
-    state and copy their input before any edit, so a memoized call returns exactly what the library returns. The
-    self-test counts the same few fixture games ~150 times, so most calls are repeats. A self-test corruption that
-    patches one of them (mock.patch.object) replaces this wrapper for its duration and calls it as its `orig`: the
-    fault is injected on top of the true value, as without the memo."""
-
-    def __init__(self):
-        self.shanten, self.agari = Shanten.calculate_shanten, Agari.is_agari  # the library's own functions
-        self.cache, self.hits, self.misses = {}, 0, 0
-
-    def _get(self, key, call):
-        if key in self.cache:
-            self.hits += 1
-            return self.cache[key]
-        self.misses += 1
-        out = self.cache[key] = call()
-        return out
-
-    def calculate_shanten(self, tiles_34, use_chiitoitsu=True, use_kokushi=True):
-        key = ("shanten", tuple(int(x) for x in tiles_34), bool(use_chiitoitsu), bool(use_kokushi))
-        return self._get(key, lambda: self.shanten(tiles_34, use_chiitoitsu, use_kokushi))
-
-    def is_agari(self, tiles_34, open_sets_34=None):
-        sets = None if open_sets_34 is None else tuple(tuple(int(x) for x in m) for m in open_sets_34)
-        key = ("agari", tuple(int(x) for x in tiles_34), sets)
-        return self._get(key, lambda: self.agari(tiles_34, open_sets_34))
-
-    def install(self, setattr_):
-        """Patch both library functions with `setattr_` (monkeypatch.setattr or mock.patch.object's setattr)."""
-        setattr_(Shanten, "calculate_shanten", staticmethod(self.calculate_shanten))
-        setattr_(Agari, "is_agari", staticmethod(self.is_agari))
+SELF_TEST_PARTS = 4  # the self-test's cases, round robin over 4 tests: one per CI xdist worker (T-063)
 
 
-def test_gates_self_test(monkeypatch):
-    """Each named corruption of gates.self_test() fails its named gate, on the committed fixture games. The two pure
-    library hand checks are memoized (LibraryMemo) to save time; R2 of T-063 showed the self-test output is
-    byte-identical with and without the memo."""
+@pytest.mark.parametrize("part", range(SELF_TEST_PARTS))
+def test_gates_self_test(monkeypatch, tmp_path_factory, request, part):
+    """Each named corruption of gates.self_test() fails its named gate, on the committed fixture games: part `part` of
+    SELF_TEST_PARTS (the cases round robin, conftest starts each part on its own xdist worker). Each part files its
+    report in the run's shared temp folder; a part that then finds every part's report merges them
+    (gates.merge_self_test_parts: every case ran in exactly one part, then the T-041 gate-coverage meta-check) and
+    checks that the merge fails with one of its cases dropped. A run that leaves out a part does no merge."""
     monkeypatch.setattr(gates, "DATA_ROOT", GATE_GAMES)
-    LibraryMemo().install(monkeypatch.setattr)
-    gates.self_test()
+    report = gates.self_test(part, SELF_TEST_PARTS)
+    folder = shared_tmp(tmp_path_factory, request.config) / "gates_self_test_parts"
+    folder.mkdir(exist_ok=True)
+    staged = folder / f".part_{part}.json"
+    staged.write_text(json.dumps(report))
+    staged.replace(folder / f"part_{part}.json")  # whole or absent for a reader
+    reports = [json.loads(f.read_text()) for f in sorted(folder.glob("part_*.json"))]
+    if len(reports) == SELF_TEST_PARTS:
+        gates.merge_self_test_parts(reports)
+        dropped = [dict(r, ran=r["ran"][:-1]) if r["part"] == part else r for r in reports]
+        with pytest.raises(SystemExit, match="case coverage of the parts: missing"):
+            gates.merge_self_test_parts(dropped)
 
 
 # ---- T-040: the oracles share no code with the parser

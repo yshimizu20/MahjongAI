@@ -2,16 +2,16 @@
 loader's os.walk does not enter linked directories.
 
 Under pytest-xdist (CI: -n 4, T-063) each worker process sets its torch default to 1 thread (tests that need a count
-set it and restore it; SL.train sets its own), runs the gates self-test first (the longest test: it starts at t=0),
-and a pool of >= 8 data workers waits for big_pool_slot (one such pool at a time across workers). A serial run keeps
-its order and thread default."""
+set it and restore it; SL.train sets its own), each part of the gates self-test (the longest test) starts a worker's
+first chunk at t=0, and a pool of >= 8 data workers waits for big_pool_slot (one such pool at a time across workers).
+A serial run keeps its order and thread default."""
 import contextlib
 import hashlib
 import pathlib
 
 import pytest
 
-SELF_TEST = "test_gates.py::test_gates_self_test"
+SELF_TEST = "test_gates.py::test_gates_self_test"  # its parts: SELF_TEST[0], SELF_TEST[1], ...
 BIG_POOL = 8  # a pool of this many data workers or more takes big_pool_slot
 
 
@@ -25,10 +25,36 @@ def pytest_configure(config):
         torch.set_num_threads(1)  # 4 workers x the default (cores) threads would oversubscribe the runner
 
 
+def shared_tmp(tmp_path_factory, config) -> pathlib.Path:
+    """A folder of this pytest run that every xdist worker sees (the parent of the workers' basetemps); a serial run's
+    own basetemp. Both are new for each run."""
+    base = tmp_path_factory.getbasetemp()
+    return base.parent if _xdist_worker(config) else base
+
+
+def worksteal_starts(n_items: int, n_workers: int) -> list:
+    """The index of each worker's first item in xdist worksteal's first distribution: idle workers get the pending
+    items in contiguous chunks of len(pending) // workers_left (xdist 3.x WorkStealingScheduling.check_schedule)."""
+    starts, start, left = [], 0, n_items
+    for i in range(n_workers):
+        starts.append(start)
+        take = left // (n_workers - i)
+        start, left = start + take, left - take
+    return starts
+
+
 def pytest_collection_modifyitems(config, items):
-    """Under xdist, the self-test first (every worker applies the same order, as xdist requires)."""
-    if _xdist_worker(config):
-        items.sort(key=lambda item: not item.nodeid.endswith(SELF_TEST))  # stable: the rest keep their order
+    """Under xdist, part k of the self-test is the first item of worker k % workers' first chunk (after the earlier
+    parts of that chunk), the rest keep their order (every worker applies the same order, as xdist requires)."""
+    if not _xdist_worker(config):
+        return
+    parts = [item for item in items if item.nodeid.split("[")[0].endswith(SELF_TEST)]
+    rest = [item for item in items if not item.nodeid.split("[")[0].endswith(SELF_TEST)]
+    n = config.workerinput["workercount"]
+    starts = worksteal_starts(len(items), n)
+    at = {starts[k % n] + k // n: item for k, item in enumerate(parts)}
+    fill = iter(rest)
+    items[:] = [at[i] if i in at else next(fill) for i in range(len(items))]
 
 
 @pytest.fixture(scope="session")
@@ -37,12 +63,12 @@ def big_pool_slot(tmp_path_factory, request):
     their basetemps), so at most one pool of >= 8 torch-importing children runs at a time; a serial run locks a file
     of its own basetemp (never waits). filelock is a torch dependency."""
     from filelock import FileLock
-    base = tmp_path_factory.getbasetemp()
-    lock = FileLock(str((base.parent if _xdist_worker(request.config) else base) / "big_pool.lock"))
+    lock = FileLock(str(shared_tmp(tmp_path_factory, request.config) / "big_pool.lock"))
 
     def slot(n):
         return lock if n >= BIG_POOL else contextlib.nullcontext()
     return slot
+
 
 GATE_GAMES = pathlib.Path(__file__).resolve().parent / "data" / "gate_games"
 VAL_FROM = "20210103"  # the 2021 fixture day served as validation day 2022-01-01 (every 2022 fixture game is a skip)
