@@ -1,5 +1,5 @@
 numpy
-torch
+torch==2.13.0  # exact pin: 2.5.1 grows MPS driver memory under swap pressure, 2.13.0 does not (T-060 Part 2 / 3)
 mahjong==2.0.0  # exact pin: a new release may reassign yaku ids / names (utils/mahjong_version.py, T-036)
 requests
 matplotlib  # run_report figure (plan T-005)
