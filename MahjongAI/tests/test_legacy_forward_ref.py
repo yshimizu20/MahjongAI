@@ -3,10 +3,13 @@ computed from the 9eb24c0 code before T-055 changed the model module: two fixtur
 every head (per-head randperm), dropout on, then backward. The sha256 of the selected labels, the logits, the losses,
 every gradient and the final CPU RNG state must equal the frozen values. A change of the per-head RNG order (randperm,
 then that head's forward and dropout, in during / discard / post order) or of any float op changes a digest.
-The digests are of this machine's float results (CPU, TORCH_THREADS threads)."""
+The digests are of this machine's float results (CPU, TORCH_THREADS threads) under one torch: one set per torch
+major.minor (T-064), each computed from the 9eb24c0 code under that torch, so on every version the test still
+says "main equals the 9eb24c0 code, bit for bit". A torch with no set fails, never skips."""
 import glob
 import hashlib
 import os
+import re
 
 import pytest
 import torch
@@ -21,8 +24,10 @@ GATE_GAMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "g
 GAMES = ("2021010101gm-00a9-0000-6422c07e.log", "2021010521gm-00a9-0000-e76b4550.log")
 SAMPLE_SIZE = 40
 
-# computed on 9eb24c0 (T-010 tip, before T-055), CPU, 4 threads
-FROZEN = {
+# Keyed by torch major.minor (T-064). "2.5": computed on 9eb24c0 (T-010 tip, before T-055) under torch 2.5.1, CPU,
+# 4 threads. A new key needs the T-064 D1 procedure first (op trace: the change is platform floats, not ours),
+# then the digests of the 9eb24c0 code under that torch, never main's.
+FROZEN_BY_TORCH = {"2.5": {
     "heads": ["during", "discard", "post"],
     "during.y": "f182bbfab4f00732",
     "during.logits": "326c33807a8758f1",
@@ -77,7 +82,15 @@ FROZEN = {
     "grad.post_head.weight": "96868679218473c7",
     "grad.post_head.bias": "7e7b1384cf415cd9",
     "rng": "92964edc20a11bd4",
-}
+}}
+
+
+def frozen_for(version: str) -> dict:
+    """The frozen 9eb24c0 digests of this torch version (its major.minor); an AssertionError when there are none."""
+    key = ".".join(version.split("+")[0].split(".")[:2])
+    assert key in FROZEN_BY_TORCH, (f"no frozen digests for torch {version}: run the T-064 D1 procedure, then add "
+                                    f"the 9eb24c0 digests under this torch as FROZEN_BY_TORCH[{key!r}]")
+    return FROZEN_BY_TORCH[key]
 
 
 def _digest(t: torch.Tensor) -> str:
@@ -113,13 +126,23 @@ def legacy_digests(sample_size=SAMPLE_SIZE, model_seed=0) -> dict:
 
 def test_games_mode_forward_equals_the_frozen_9eb24c0_reference():
     got = legacy_digests()
-    assert FROZEN, f"no frozen reference: {got}"
-    diff = {k: (FROZEN.get(k), got.get(k)) for k in FROZEN.keys() | got.keys() if FROZEN.get(k) != got.get(k)}
+    frozen = frozen_for(torch.__version__)
+    assert frozen, f"no frozen reference: {got}"
+    diff = {k: (frozen.get(k), got.get(k)) for k in frozen.keys() | got.keys() if frozen.get(k) != got.get(k)}
     assert not diff, diff
+
+
+def test_frozen_for_picks_the_set_of_the_torch_major_minor():
+    """Negative controls of the lookup: another minor ("2.50" is not "2.5") or an unknown version fails."""
+    assert frozen_for("2.5.1") is frozen_for("2.5.0+cpu") is FROZEN_BY_TORCH["2.5"]
+    for version in ("2.50.1", "2.99.0", "3.5.1"):
+        with pytest.raises(AssertionError, match=rf"no frozen digests for torch {re.escape(version)}: run the T-064"):
+            frozen_for(version)
 
 
 @pytest.mark.parametrize("change", [{"sample_size": SAMPLE_SIZE - 1}, {"model_seed": 1}])
 def test_the_frozen_reference_detects_a_change(change):
     """Negative control: another cap or other weights move the digests."""
+    frozen = frozen_for(torch.__version__)
     got = legacy_digests(**change)
-    assert any(FROZEN.get(k) != v for k, v in got.items())
+    assert any(frozen.get(k) != v for k, v in got.items())
