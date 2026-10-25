@@ -43,9 +43,10 @@ def worksteal_starts(n_items: int, n_workers: int) -> list:
     return starts
 
 
+@pytest.hookimpl(trylast=True)  # after the -m / -k deselection: the positions index the items xdist will schedule
 def pytest_collection_modifyitems(config, items):
-    """Under xdist, part k of the self-test is the first item of worker k % workers' first chunk (after the earlier
-    parts of that chunk), the rest keep their order (every worker applies the same order, as xdist requires)."""
+    """Under xdist, part k of the self-test is the first item of first chunk k % workers (after the earlier parts of
+    that chunk), the rest keep their order (every worker applies the same order, as xdist requires)."""
     if not _xdist_worker(config):
         return
     parts = [item for item in items if item.nodeid.split("[")[0].endswith(SELF_TEST)]
