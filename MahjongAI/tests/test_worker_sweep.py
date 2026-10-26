@@ -44,7 +44,7 @@ def _log_lines(path, name):
     return [re.sub(r"^\[[^]]+\] ", "", line).replace(f"/{name}/", "/<run>/") for line in open(path)]
 
 
-def test_absent_flags_equal_the_explicit_defaults(tmp_path, monkeypatch, train_data_root):
+def test_absent_flags_equal_the_explicit_defaults(tmp_path, monkeypatch, train_data_root, production_pools):
     _run(tmp_path, monkeypatch, train_data_root, "absent", steps=6, save_every=3)
     _run(tmp_path, monkeypatch, train_data_root, "explicit", steps=6, save_every=3, data_workers=4, data_prefetch=8,
          torch_threads=4)
@@ -66,7 +66,7 @@ def test_absent_flags_equal_the_explicit_defaults(tmp_path, monkeypatch, train_d
 
 
 @pytest.mark.parametrize("batch_mode", ["positions", "games"])
-def test_given_flags_are_used(tmp_path, monkeypatch, train_data_root, batch_mode):
+def test_given_flags_are_used(tmp_path, monkeypatch, train_data_root, batch_mode, production_pools):
     pools, threads = _Pools(), []
     set_threads = torch.set_num_threads
     monkeypatch.setattr(SL, "GameWorkers", pools)
@@ -80,7 +80,7 @@ def test_given_flags_are_used(tmp_path, monkeypatch, train_data_root, batch_mode
     assert header["config"]["torch_threads"] == 2
 
 
-def test_the_default_run_builds_the_default_pools(tmp_path, monkeypatch, train_data_root):
+def test_the_default_run_builds_the_default_pools(tmp_path, monkeypatch, train_data_root, production_pools):
     pools = _Pools()
     monkeypatch.setattr(SL, "GameWorkers", pools)
     _run(tmp_path, monkeypatch, train_data_root, "plain", steps=1, save_every=1)
@@ -126,8 +126,12 @@ def test_a_resume_with_other_torch_threads_is_rejected(tmp_path, monkeypatch, tr
 
 
 def test_a_resume_with_other_workers_and_prefetch_continues_the_same_stream(tmp_path, monkeypatch, train_data_root):
-    """b: 5 updates with 3 workers / P20, resumed to 12 with 6 workers / P8; a: unbroken, the defaults. Same rows (the
-    batcher counters in them), step lines (read hash, sample digest) and checkpoints 8 and 12."""
+    """b: 5 updates with 3 workers / P20, resumed to 12 with 6 workers / P8; a: unbroken, the default prefetch and the
+    test session's default worker count (conftest.session_pool_sizes). Same rows (the batcher counters in them), step
+    lines (read hash, sample digest) and checkpoints 8 and 12. The validation set and prior are built in the trainer
+    (PRIOR_WORKERS 0, T-065): the claim is about the data workers, and test_startup_pool proves the startup pool's
+    result equal to that path's."""
+    monkeypatch.setattr(SL, "PRIOR_WORKERS", 0)
     _run(tmp_path, monkeypatch, train_data_root, "a")
     _run(tmp_path, monkeypatch, train_data_root, "b", stop_after_step=5, data_workers=3, data_prefetch=20)
     _run(tmp_path, monkeypatch, train_data_root, "b", data_workers=6, data_prefetch=8)
