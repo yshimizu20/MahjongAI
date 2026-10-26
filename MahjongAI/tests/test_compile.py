@@ -65,6 +65,11 @@ def compile_globals(monkeypatch):
     import torch._inductor.ir as ir
     monkeypatch.setattr(inductor_config, "fallback_random", inductor_config.fallback_random)
     monkeypatch.setattr(ir.FallbackKernel, "create", ir.FallbackKernel.__dict__["create"])
+    # every graph is lowered in this process (no Inductor / AOT autograd cache hit), so the fallback spy sees all of
+    # them: a cached graph would bypass it (Codex stage-5 review)
+    import torch._functorch.config as functorch_config
+    monkeypatch.setattr(inductor_config, "fx_graph_cache", False)
+    monkeypatch.setattr(functorch_config, "enable_autograd_cache", False)
 
 
 class CountingCompiler:
@@ -239,7 +244,7 @@ def test_a_compiled_run_resumes_eager_to_the_eager_run(tmp_path, monkeypatch, tr
     log = (tmp_path / "c.log").read_text()
     assert log.count(CH.COMPILE_ON_LINE) == 1
     summary = re.findall(r"compile summary \| graphs (\d+) \| signatures (\d+) \| graph breaks (\d+) \| "
-                         r"fallbacks \[(.*)\]", log)
+                         r"fallbacks \[(.*)\] \| cache hits fx (\d+) aot (\d+)$", log, flags=re.M)
     assert len(summary) == 1 and int(summary[0][1]) >= 1, summary
     assert log.index("compile summary") < log.index("stopped after update 8")
     _run(tmp_path, monkeypatch, train_data_root, "c")
@@ -559,11 +564,12 @@ def test_a_compiled_mps_run_resumes_eager(tmp_path, monkeypatch, train_data_root
     compiled_calls = len(calls)
     log = (tmp_path / "m.log").read_text()
     summary = re.findall(r"compile summary \| graphs (\d+) \| signatures (\d+) \| graph breaks (\d+) \| "
-                         r"fallbacks \[(.*)\]", log)
+                         r"fallbacks \[(.*)\] \| cache hits fx (\d+) aot (\d+)$", log, flags=re.M)
     print(f"\n{summary}; core calls {compiled_calls}; evaluations {during_eval}")
     assert log.count(CH.COMPILE_ON_LINE) == 1 and len(summary) == 1, summary
-    graphs, signatures, breaks, _ = summary[0]
+    graphs, signatures, breaks, _, fx_hits, aot_hits = summary[0]
     assert int(graphs) == int(signatures) >= 1 and breaks == "0" and not bad_fallbacks(), summary
+    assert fx_hits == aot_hits == "0", f"a cached graph bypassed the fallback spy: {summary}"
     assert compiled_calls >= 3
     keys = list(EncoderConvModel(**ARCH, verbose=False).state_dict())
     ckpt = torch.load(tmp_path / "m" / "checkpoints" / "step_3.pt", weights_only=True)

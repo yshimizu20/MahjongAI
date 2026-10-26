@@ -71,7 +71,11 @@ class CompiledHeads:
 
     def summary(self) -> str:
         """The run's one end line (the G3 judge parses it): dynamo graphs of this process, distinct (head, B)
-        signatures called, graph breaks, the fallback ops recorded by the spy."""
+        signatures called, graph breaks, the fallback ops recorded by the spy, and the Inductor / AOT autograd cache
+        hits. The spy sees only graphs lowered in this process: the fallback list is complete only when both hit
+        counts are 0 (a cold cache); a judge gates fallbacks on such a run."""
         from torch._dynamo.utils import counters
         return (f"compile summary | graphs {counters['stats']['unique_graphs']} | signatures {len(self.signatures)} | "
-                f"graph breaks {sum(counters['graph_break'].values())} | fallbacks [{', '.join(fallback_ops())}]")
+                f"graph breaks {sum(counters['graph_break'].values())} | fallbacks [{', '.join(fallback_ops())}] | "
+                f"cache hits fx {counters['inductor']['fxgraph_cache_hit']} "
+                f"aot {counters['aot_autograd']['autograd_cache_hit']}")

@@ -179,6 +179,6 @@ def test_an_unknown_mark_fails():
 
 def test_a_trainer_whose_forward_drops_its_marks_stops(tmp_path, monkeypatch, train_data_root):
     real = SL.EncoderConvModel.forward_heads
-    monkeypatch.setattr(SL.EncoderConvModel, "forward_heads", lambda self, batches, mark=None: real(self, batches))
+    monkeypatch.setattr(SL.EncoderConvModel, "forward_heads", lambda self, batches, mark=None, cores=None: real(self, batches, cores=cores))
     with pytest.raises(PP.SequenceError, match="during:transfer|discard:transfer"):
         run(tmp_path, monkeypatch, train_data_root, "on")
