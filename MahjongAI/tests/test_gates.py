@@ -6,6 +6,7 @@ sorted picks are unchanged. When self_test() starts reading a new game, re-trace
 wrap builtins.open, run gates.self_test() with the default DATA_ROOT, and copy every opened processed/ file here."""
 import ast
 import collections
+import json
 import os
 import random
 from unittest import mock
@@ -20,13 +21,34 @@ from MahjongAI.draw import Naki
 from MahjongAI.process_xml import process
 from MahjongAI.utils import agari, gates, legal_oracles, win_oracles
 from MahjongAI.utils.legal_oracles import Meld
+from MahjongAI.tests.conftest import shared_tmp
 
 GATE_GAMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "gate_games")
 
 
-def test_gates_self_test(monkeypatch):
+SELF_TEST_PARTS = 4  # the self-test's cases, round robin over 4 tests: one per CI xdist worker (T-063)
+
+
+@pytest.mark.parametrize("part", range(SELF_TEST_PARTS))
+def test_gates_self_test(monkeypatch, tmp_path_factory, request, part):
+    """Each named corruption of gates.self_test() fails its named gate, on the committed fixture games: part `part` of
+    SELF_TEST_PARTS (the cases round robin, conftest starts each part on its own xdist worker). Each part files its
+    report in the run's shared temp folder; a part that then finds every part's report merges them
+    (gates.merge_self_test_parts: every case ran in exactly one part, then the T-041 gate-coverage meta-check) and
+    checks that the merge fails with one of its cases dropped. A run that leaves out a part does no merge."""
     monkeypatch.setattr(gates, "DATA_ROOT", GATE_GAMES)
-    gates.self_test()
+    report = gates.self_test(part, SELF_TEST_PARTS)
+    folder = shared_tmp(tmp_path_factory, request.config) / "gates_self_test_parts"
+    folder.mkdir(exist_ok=True)
+    staged = folder / f".part_{part}.json"
+    staged.write_text(json.dumps(report))
+    staged.replace(folder / f"part_{part}.json")  # whole or absent for a reader
+    reports = [json.loads(f.read_text()) for f in sorted(folder.glob("part_*.json"))]
+    if len(reports) == SELF_TEST_PARTS:
+        gates.merge_self_test_parts(reports)
+        dropped = [dict(r, ran=r["ran"][:-1]) if r["part"] == part else r for r in reports]
+        with pytest.raises(SystemExit, match="case coverage of the parts: missing"):
+            gates.merge_self_test_parts(dropped)
 
 
 # ---- T-040: the oracles share no code with the parser

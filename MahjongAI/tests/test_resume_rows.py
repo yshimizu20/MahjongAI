@@ -1,7 +1,9 @@
 """A kill after an eval row and before the next save (T-047 final runs): the run resumes from the earlier checkpoint
 (a non-eval step, train_sums nonzero), drops the stale rows written after it, recomputes them, and ends equal to an
 unbroken run: metrics rows, per-step log lines (losses, consumed-file hashes) and every checkpoint field.
-Also a stop inside an eval row's write: the resume starts at that eval step's checkpoint and recomputes its row."""
+Also a stop inside an eval row's write: the resume starts at that eval step's checkpoint and recomputes its row.
+
+The 64 x 1 unbroken run "a" is built once per module and only read (T-063, conftest.read_only_run)."""
 import os
 import re
 import shutil
@@ -10,6 +12,7 @@ import pytest
 import torch
 
 from MahjongAI import supervised_learning as SL
+from MahjongAI.tests.conftest import read_only_run, run_log
 
 STEPS, EVAL_EVERY, SAVE_EVERY = 12, 5, 4  # rows 0, 5, 10, 12; checkpoints 4, 8, 12
 
@@ -51,13 +54,37 @@ def _assert_equal(a, b, where):
         assert a == b, f"{where}: {a!r} vs {b!r}"
 
 
-@pytest.mark.parametrize("arch", [(64, 1), (128, 2)])
-def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root,
-                                                                             arch):
+@pytest.fixture(scope="module")
+def unbroken_64(module_data_root):
+    """The unbroken 64 x 1 run "a", built once per module on module_data_root; tests only read it."""
     threads = torch.get_num_threads()
     try:
-        a = _run(tmp_path, monkeypatch, train_data_root, "a", arch)
-        b = _run(tmp_path, monkeypatch, train_data_root, "b", arch)
+        with pytest.MonkeyPatch.context() as m:
+            a = _run(module_data_root.parent, m, module_data_root, "a")
+    finally:
+        torch.set_num_threads(threads)
+    with read_only_run(a) as a:
+        yield a
+
+
+@pytest.mark.parametrize("arch", [(64, 1), (128, 2)])
+def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_path, monkeypatch, request, arch):
+    """64 x 1: "a" is the module's unbroken run, and b's disk before the kill is a copy of it (run dir and log): b's
+    first run is the same command on the same root, so the copy is the disk that run leaves (T-063). What the copy no
+    longer shows here, that two fresh 64 x 1 runs agree over steps 1-8, the next test shows (a fresh b up to row 10),
+    as do test_positions_train and test_worker_sweep. 128 x 2 keeps two fresh runs: the only fresh-run comparison at
+    that architecture."""
+    threads = torch.get_num_threads()
+    try:
+        if arch == (64, 1):
+            root, a = request.getfixturevalue("module_data_root"), request.getfixturevalue("unbroken_64")
+            b = tmp_path / "b"
+            shutil.copytree(a, b)
+            shutil.copy(run_log(a), tmp_path / "b.log")
+        else:
+            root = request.getfixturevalue("train_data_root")
+            a = _run(tmp_path, monkeypatch, root, "a", arch)
+            b = _run(tmp_path, monkeypatch, root, "b", arch)
         # the disk of a kill -9 after row 10 and before the step-12 save: checkpoints 4 and 8; rows 0, 5, 10
         os.remove(b / "checkpoints" / "step_12.pt")
         header, rows = SL.Metrics(str(b / "metrics.jsonl")).read()
@@ -65,7 +92,7 @@ def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_
         resumed_from = torch.load(b / "checkpoints" / "step_8.pt", weights_only=True)
         assert all(n > 0 for _, n in resumed_from["train_sums"].values())  # steps 6..8 since row 5
         shutil.copy(tmp_path / "b.log", tmp_path / "b_first.log")
-        _run(tmp_path, monkeypatch, train_data_root, "b", arch)
+        _run(tmp_path, monkeypatch, root, "b", arch)
     finally:
         torch.set_num_threads(threads)
     log_b = open(tmp_path / "b.log").read()
@@ -76,7 +103,7 @@ def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_
     _assert_equal({k: v for k, v in ha.items() if k != "started"}, {k: v for k, v in hb.items() if k != "started"},
                   "header")
     _assert_equal(rows_a, rows_b, "rows")
-    lines_a, lines_b = _step_lines(tmp_path / "a.log"), _step_lines(tmp_path / "b.log")
+    lines_a, lines_b = _step_lines(run_log(a)), _step_lines(tmp_path / "b.log")
     assert sorted(lines_a) == list(range(1, STEPS + 1)) and lines_a == lines_b
     for step in (4, 8, 12):
         _assert_equal(torch.load(a / "checkpoints" / f"step_{step}.pt", weights_only=True),
@@ -84,7 +111,7 @@ def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_
 
 
 def test_stop_inside_an_eval_row_write_resumes_from_that_steps_checkpoint_and_recomputes_its_row(
-        tmp_path, monkeypatch, train_data_root):
+        tmp_path, monkeypatch, module_data_root, unbroken_64):
     """A stop while row 10 is written (an eval step): the stop path saves checkpoint 10 (train_sums of steps 6..10,
     not reset), whose own row is absent. The resume starts at step 10, recomputes row 10 before any update, and ends
     equal to an unbroken run: rows, step lines and checkpoints 4, 8, 12."""
@@ -97,11 +124,11 @@ def test_stop_inside_an_eval_row_write_resumes_from_that_steps_checkpoint_and_re
 
     threads = torch.get_num_threads()
     try:
-        a = _run(tmp_path, monkeypatch, train_data_root, "a")
+        a = unbroken_64
         with monkeypatch.context() as m:
             m.setattr(SL.Metrics, "append", stop_at_row_10)
             try:
-                _run(tmp_path, monkeypatch, train_data_root, "b")
+                _run(tmp_path, monkeypatch, module_data_root, "b")
                 raise AssertionError("the stop at row 10 did not happen")
             except RuntimeError as e:
                 assert "stopped inside the row-10 write" in str(e), e
@@ -111,7 +138,7 @@ def test_stop_inside_an_eval_row_write_resumes_from_that_steps_checkpoint_and_re
         assert [r["step"] for r in rows] == [0, 5]
         stopped = torch.load(b / "checkpoints" / "step_10.pt", weights_only=True)
         assert stopped["current_step"] == 10 and all(n > 0 for _, n in stopped["train_sums"].values())
-        _run(tmp_path, monkeypatch, train_data_root, "b")
+        _run(tmp_path, monkeypatch, module_data_root, "b")
     finally:
         torch.set_num_threads(threads)
     log_b = open(tmp_path / "b.log").read()
@@ -120,7 +147,7 @@ def test_stop_inside_an_eval_row_write_resumes_from_that_steps_checkpoint_and_re
     hb, rows_b = SL.Metrics(str(b / "metrics.jsonl")).read()
     assert [r["step"] for r in rows_a] == [r["step"] for r in rows_b] == [0, 5, 10, 12]
     _assert_equal(rows_a, rows_b, "rows")
-    lines_a, lines_b = _step_lines(tmp_path / "a.log"), _step_lines(tmp_path / "b.log")
+    lines_a, lines_b = _step_lines(run_log(a)), _step_lines(tmp_path / "b.log")
     assert sorted(lines_a) == list(range(1, STEPS + 1)) and lines_a == lines_b
     for step in (4, 8, 12):
         _assert_equal(torch.load(a / "checkpoints" / f"step_{step}.pt", weights_only=True),

@@ -2148,12 +2148,26 @@ def legal_samples(H, T):
                 yield t, discard_legality(halfturns, i, tokens)
 
 
-def self_test():
+def self_test(part: int = 0, parts: int = 1):
     """Clean games pass every gate; each corruption, applied to a game that passes every gate, must fail its NAMED
     gate (another gate failing as well is allowed). Also: a one-loader cluster rolls over at the epoch boundary.
     T-041 meta-check (last): every name of gate_names() failed under a corruption of the right side
-    (gate_coverage_gaps); one line `self-test OK: N gate names, ...` on success."""
+    (gate_coverage_gaps); one line `self-test OK: N gate names, ...` on success.
+    part / parts (T-063): run only the cases whose index % parts == part (the setup runs in every part); pytest
+    runs the parts on separate workers and merges their reports with merge_self_test_parts. parts == 1 (the
+    default, `--test`) runs every case and merges at once. Returns the part's report."""
+    assert 0 <= part < parts, (part, parts)
     sides = collections.defaultdict(set)  # gate -> the sides ('parser' / 'gate') of the corruptions that failed it
+    cases, ran = [], []  # every case's name, in order; the indices this part runs
+
+    def case(name):
+        """Register the next case; True when this part runs it."""
+        cases.append(name)
+        if (len(cases) - 1) % parts == part:
+            ran.append(len(cases) - 1)
+            return True
+        return False
+
     clean_counts = {}  # game path -> its clean counters (a game's clean baseline is counted once)
 
     def record(gate, side):
@@ -2176,46 +2190,47 @@ def self_test():
     tonpuu, west = _named_game(TONPUU_SOUTH_LOG), _named_game(HANCHAN_WEST_LOG)
     bye_games = [_named_game(BYE_MID_LOG), _named_game(BYE_BETWEEN_LOG)]  # T-044: 2 rounds kept each
     run_24 = _named_game(RUN_24_LOG)  # T-043: the longest run is one below the threshold
-    clean = run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan, open_kan, open_kan_ron] + kan_games
-                + sorted(set(option_games.values())) + kyuushu_games + [tonpuu, west] + bye_games + [run_24],
-                TransformerTensorProcessor())
-    check(clean)
-    for k in ("round_wind_samples_E", "round_wind_samples_S", "round_wind_samples_W", "round_wind_tonpuu_samples"):
-        if not clean[k]:  # the bakaze gate saw every wind and a tonpuu game, or it proves nothing about them
-            raise SystemExit(f"self-test FAILED: the clean pool has no {k}")
-    bad = run([_named_game(g) for g in AFTER_OWN_DISCARD_LOGS])
-    got = tuple(bad[k] for k in ("games", "skipped_invalid", "skipped_invalid_after_own_discard", "parse_error"))
-    if got != (0, 3, 3, 0) or clean["skipped_invalid_after_own_discard"] != 0:
-        raise SystemExit(f"self-test FAILED: own-turn action after own discard: (games, skipped_invalid, after_own"
-                         f"_discard, parse_error) {got} != (0, 3, 3, 0), clean "
-                         f"{clean['skipped_invalid_after_own_discard']}")
-    if "games" not in failed_gates(bad):  # 3 real logs the parser rejects: no game parsed
-        raise SystemExit(f"self-test FAILED: 0 games parsed did not fail the games gate: {failed_gates(bad)}")
-    record("games", "parser")
-    print("self-test OK: own-turn action after own discard -> skipped_invalid_after_own_discard=3, parse_error=0 "
-          "(clean 0); games gate fails on 0 parsed games")
-    # T-044: the BYE games pass every gate on their kept part; T-043: the run-24 game is accepted
-    got = tuple(clean[k] for k in ("bye_truncated_games", "skipped_invalid_auto_played", "skipped_invalid_bye"))
-    if got != (2, 0, 0):
-        raise SystemExit(f"self-test FAILED: clean pool (bye_truncated_games, skipped_invalid_auto_played, "
-                         f"skipped_invalid_bye) {got} != (2, 0, 0)")
-    print("self-test OK: clean pool with 2 BYE-truncated games and a run-24 game -> every gate passes")
-    # T-043: an auto-played seat is rejected and named; with the parser's rule switched off, the gate catches it
-    autos = [_named_game(g) for g in AUTO_PLAYED_LOGS]
-    bad = run(autos)
-    got = tuple(bad[k] for k in ("games", "skipped_invalid", "skipped_invalid_auto_played", "parse_error"))
-    if got != (0, 3, 3, 0):
-        raise SystemExit(f"self-test FAILED: auto-played seat: (games, skipped_invalid, auto_played, parse_error) "
-                         f"{got} != (0, 3, 3, 0)")
-    print("self-test OK: auto-played seat -> skipped_invalid_auto_played=3, parse_error=0 (clean 0)")
-    with watch_gate_code() as (_, touched), mock.patch.object(process_xml, "_auto_played_seat", lambda rounds: None):
-        C = run(autos)
-    failed = failed_gates(C)
-    if C["games"] != 3 or set(failed) != {"auto_played_accepted"}:
-        raise SystemExit(f"self-test FAILED: parser without the auto-play rule: games {C['games']}, failed {failed} "
-                         f"(expected 3 games failing auto_played_accepted only)")
-    record("auto_played_accepted", "gate" if touched else "parser")
-    print(f"self-test OK: parser without the auto-play rule -> auto_played_accepted={failed['auto_played_accepted']}")
+    if case("clean pool; own-turn after own discard; BYE / run-24; auto-played seat"):
+        clean = run([f, ron3, red_kan_dora, chankan_ippatsu, early_ankan, open_kan, open_kan_ron] + kan_games
+                    + sorted(set(option_games.values())) + kyuushu_games + [tonpuu, west] + bye_games + [run_24],
+                    TransformerTensorProcessor())
+        check(clean)
+        for k in ("round_wind_samples_E", "round_wind_samples_S", "round_wind_samples_W", "round_wind_tonpuu_samples"):
+            if not clean[k]:  # the bakaze gate saw every wind and a tonpuu game, or it proves nothing about them
+                raise SystemExit(f"self-test FAILED: the clean pool has no {k}")
+        bad = run([_named_game(g) for g in AFTER_OWN_DISCARD_LOGS])
+        got = tuple(bad[k] for k in ("games", "skipped_invalid", "skipped_invalid_after_own_discard", "parse_error"))
+        if got != (0, 3, 3, 0) or clean["skipped_invalid_after_own_discard"] != 0:
+            raise SystemExit(f"self-test FAILED: own-turn action after own discard: (games, skipped_invalid, after_own"
+                             f"_discard, parse_error) {got} != (0, 3, 3, 0), clean "
+                             f"{clean['skipped_invalid_after_own_discard']}")
+        if "games" not in failed_gates(bad):  # 3 real logs the parser rejects: no game parsed
+            raise SystemExit(f"self-test FAILED: 0 games parsed did not fail the games gate: {failed_gates(bad)}")
+        record("games", "parser")
+        print("self-test OK: own-turn action after own discard -> skipped_invalid_after_own_discard=3, parse_error=0 "
+              "(clean 0); games gate fails on 0 parsed games")
+        # T-044: the BYE games pass every gate on their kept part; T-043: the run-24 game is accepted
+        got = tuple(clean[k] for k in ("bye_truncated_games", "skipped_invalid_auto_played", "skipped_invalid_bye"))
+        if got != (2, 0, 0):
+            raise SystemExit(f"self-test FAILED: clean pool (bye_truncated_games, skipped_invalid_auto_played, "
+                             f"skipped_invalid_bye) {got} != (2, 0, 0)")
+        print("self-test OK: clean pool with 2 BYE-truncated games and a run-24 game -> every gate passes")
+        # T-043: an auto-played seat is rejected and named; with the parser's rule switched off, the gate catches it
+        autos = [_named_game(g) for g in AUTO_PLAYED_LOGS]
+        bad = run(autos)
+        got = tuple(bad[k] for k in ("games", "skipped_invalid", "skipped_invalid_auto_played", "parse_error"))
+        if got != (0, 3, 3, 0):
+            raise SystemExit(f"self-test FAILED: auto-played seat: (games, skipped_invalid, auto_played, parse_error) "
+                             f"{got} != (0, 3, 3, 0)")
+        print("self-test OK: auto-played seat -> skipped_invalid_auto_played=3, parse_error=0 (clean 0)")
+        with watch_gate_code() as (_, touched), mock.patch.object(process_xml, "_auto_played_seat", lambda rounds: None):
+            C = run(autos)
+        failed = failed_gates(C)
+        if C["games"] != 3 or set(failed) != {"auto_played_accepted"}:
+            raise SystemExit(f"self-test FAILED: parser without the auto-play rule: games {C['games']}, failed {failed} "
+                             f"(expected 3 games failing auto_played_accepted only)")
+        record("auto_played_accepted", "gate" if touched else "parser")
+        print(f"self-test OK: parser without the auto-play rule -> auto_played_accepted={failed['auto_played_accepted']}")
 
     def expect_failure(name, gate, corrupt, game=f, absent=(), fields=()):
         """corrupt(H, T, tp) edits the parse in place; it may return a context manager that stays active while the
@@ -2224,6 +2239,8 @@ def self_test():
         (the named STATE fields drifted). The side of the corruption (T-041) is decided by watch_gate_code, never
         by hand: 'gate' when gate code differed at any WATCHED call (parse, count, index check) or right after
         corrupt returned (inside its context), else 'parser'; record() files it for every named gate."""
+        if not case(name):
+            return
         gates = (gate,) if isinstance(gate, str) else gate
         baseline = failed_gates(clean_count(game))
         if baseline:
@@ -2585,13 +2602,14 @@ def self_test():
 
     riichi_game = f if has_riichi(*process(f)) else _game_with(has_riichi)
     expect_failure("riichi offers dropped", "riichi_label_mismatch", drop_riichi_offers, game=riichi_game)
-    try:  # L10: an executed riichi that was not offered stops the parse
-        with mock.patch.object(legal, "riichi_allowed", lambda *a: False):
-            process(riichi_game)
-        raise SystemExit("self-test FAILED: an executed, un-offered riichi parsed without the REACH assert")
-    except AssertionError as e:
-        assert "riichi" in str(e), e
-        print("self-test OK: an executed, un-offered riichi raises at REACH step 1")
+    if case("L10 an executed, un-offered riichi raises"):
+        try:  # L10: an executed riichi that was not offered stops the parse
+            with mock.patch.object(legal, "riichi_allowed", lambda *a: False):
+                process(riichi_game)
+            raise SystemExit("self-test FAILED: an executed, un-offered riichi parsed without the REACH assert")
+        except AssertionError as e:
+            assert "riichi" in str(e), e
+            print("self-test OK: an executed, un-offered riichi raises at REACH step 1")
 
     def wrong_riichi_drawn_tile(H, T, tp):
         for t in (t for halfturns in H for t in halfturns if isinstance(t, DuringTurn) and t.stateObj.reaches[t.player]):
@@ -3634,15 +3652,41 @@ def self_test():
                    chi_index_into_pon)
     expect_failure("33 an extra x3 row in the post head", "round_wind_coverage", extra_post_x3_row)
 
-    from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster
-    dl = DataLoader(os.path.dirname(f), batch_size=1, log_func=lambda *_: None)
-    dl.file_list = dl.file_list[:1] or [f]
-    cluster = DataLoaderCluster([dl])
-    for _ in range(3):  # 1 game, 3 batches: two epoch boundaries
-        games, _tokens = next(cluster)
-        assert games, "loader rollover returned an empty batch"
-    print("self-test OK: one-loader cluster rolls over at the epoch boundary")
+    if case("one-loader cluster rollover"):
+        from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster
+        dl = DataLoader(os.path.dirname(f), batch_size=1, log_func=lambda *_: None)
+        dl.file_list = dl.file_list[:1] or [f]
+        cluster = DataLoaderCluster([dl])
+        for _ in range(3):  # 1 game, 3 batches: two epoch boundaries
+            games, _tokens = next(cluster)
+            assert games, "loader rollover returned an empty batch"
+        print("self-test OK: one-loader cluster rolls over at the epoch boundary")
 
+    report = {"part": part, "parts": parts, "cases": cases, "ran": ran, "sides": {g: sorted(s) for g, s in sides.items()}}
+    if parts == 1:
+        merge_self_test_parts([report])
+    return report
+
+
+def merge_self_test_parts(reports):
+    """The end of a self-test split into parts (T-063; one call of self_test() is its one part): every case ran in
+    exactly one part, each part saw the same case list, then the T-041 meta-check on the union of the parts' sides
+    (every gate name failed under a corruption of the right side). Prints the final two lines."""
+    n = {r["parts"] for r in reports}
+    if len(n) != 1 or sorted(r["part"] for r in reports) != list(range(n.pop())):
+        raise SystemExit(f"self-test FAILED: parts {sorted((r['part'], r['parts']) for r in reports)} are not one split")
+    cases = reports[0]["cases"]
+    if any(r["cases"] != cases for r in reports):
+        raise SystemExit("self-test FAILED: the parts saw different case lists")
+    ran = collections.Counter(i for r in reports for i in r["ran"])
+    missing = [cases[i] for i in range(len(cases)) if not ran[i]]
+    twice = [cases[i] if 0 <= i < len(cases) else i for i, k in sorted(ran.items()) if k > 1 or not 0 <= i < len(cases)]
+    if missing or twice:
+        raise SystemExit(f"self-test FAILED: case coverage of the parts: missing {missing}, more than once {twice}")
+    sides = collections.defaultdict(set)
+    for r in reports:
+        for gate, s in r["sides"].items():
+            sides[gate] |= set(s)
     # ---- T-041 meta-check: every gate name failed under a corruption of the right side
     names = gate_names()
     gaps = gate_coverage_gaps(names, sides, GATE_ONLY, UNTESTED_GATES)

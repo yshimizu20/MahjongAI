@@ -4,4 +4,5 @@ mahjong==2.0.0  # exact pin: a new release may reassign yaku ids / names (utils/
 requests
 matplotlib  # run_report figure (plan T-005)
 pytest>=7  # pytest.ini uses the pythonpath key (7.0+)
+pytest-xdist>=3.6,<4  # CI runs the suite on 4 workers (-n 4 --dist worksteal, T-063)
 psutil  # CPU RSS in the --measure-window memory sample (utils/phase_timing.py, T-057)

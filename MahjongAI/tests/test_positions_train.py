@@ -26,6 +26,7 @@ import torch
 
 from MahjongAI import supervised_learning as SL
 from MahjongAI.agents.encoder_conv import TransformerTensorProcessor
+from MahjongAI.tests.conftest import read_only_run, run_log
 from MahjongAI.tests.test_position_batcher import epoch_counter_problems, reference_steps
 from MahjongAI.tests.test_resume_rows import _assert_equal
 
@@ -60,18 +61,19 @@ def step_lines(path):
     return out
 
 
-def assert_runs_equal(tmp_path, a, b, checkpoints, ckpt_b=None):
-    ha, rows_a = SL.Metrics(str(tmp_path / a / "metrics.jsonl")).read()
-    hb, rows_b = SL.Metrics(str(tmp_path / b / "metrics.jsonl")).read()
+def assert_runs_equal(a, b, checkpoints, ckpt_b=None):
+    """a, b: run dirs (each with its log next to it, run_log); ckpt_b: another run dir to read b's checkpoints from."""
+    ha, rows_a = SL.Metrics(str(a / "metrics.jsonl")).read()
+    hb, rows_b = SL.Metrics(str(b / "metrics.jsonl")).read()
     assert [r["step"] for r in rows_a] == [r["step"] for r in rows_b] == [0, 5, 10, 12]
     _assert_equal({k: v for k, v in ha.items() if k != "started"}, {k: v for k, v in hb.items() if k != "started"},
                   "header")
     _assert_equal(rows_a, rows_b, "rows")
-    lines_a, lines_b = step_lines(tmp_path / f"{a}.log"), step_lines(tmp_path / f"{b}.log")
+    lines_a, lines_b = step_lines(run_log(a)), step_lines(run_log(b))
     assert sorted(lines_a) == list(range(1, STEPS + 1)) and lines_a == lines_b
     for step in checkpoints:
-        _assert_equal(torch.load(tmp_path / a / "checkpoints" / f"step_{step}.pt", weights_only=True),
-                      torch.load(tmp_path / (ckpt_b or b) / "checkpoints" / f"step_{step}.pt", weights_only=True),
+        _assert_equal(torch.load(a / "checkpoints" / f"step_{step}.pt", weights_only=True),
+                      torch.load((ckpt_b or b) / "checkpoints" / f"step_{step}.pt", weights_only=True),
                       f"step_{step}.pt")
 
 
@@ -94,14 +96,18 @@ def reference_epoch_counts(monkeypatch, root, n_steps):
     return reference_steps(stream(), SIZES, n_steps, tally=tally), tally
 
 
-@pytest.fixture
-def unbroken(tmp_path, monkeypatch, train_data_root):
-    """The unbroken positions-mode run "a" (save every 2 steps: a checkpoint for every even step)."""
-    _run(tmp_path, monkeypatch, train_data_root, "a", save_every=2)
-    return tmp_path / "a"
+@pytest.fixture(scope="module")
+def unbroken(module_data_root):
+    """The unbroken positions-mode run "a" (save every 2 steps: a checkpoint for every even step), built once per
+    module (T-063): SL.train sets its own threads and seeds, so the run does not depend on what ran before it. The
+    tests only read it (read_only_run checks that)."""
+    with pytest.MonkeyPatch.context() as m:
+        a = _run(module_data_root.parent, m, module_data_root, "a", save_every=2)
+    with read_only_run(a) as a:
+        yield a
 
 
-def test_unbroken_run_records_positions(tmp_path, monkeypatch, train_data_root, unbroken):
+def test_unbroken_run_records_positions(tmp_path, monkeypatch, module_data_root, unbroken):
     header, rows = SL.Metrics(str(unbroken / "metrics.jsonl")).read()
     config = header["config"]
     assert (config["batch_mode"], config["position_sizes"], config["device"], config["batch_size"]) == (
@@ -111,7 +117,7 @@ def test_unbroken_run_records_positions(tmp_path, monkeypatch, train_data_root, 
     assert last["games_admitted"] > 40 and set(last["games_by_epoch"]) >= {"0", "1"}  # crossed an epoch
     assert last["taken"]["discard"] == {str(SIZES["discard"]): STEPS}
     # per source epoch, every row's counters equal an independent reference over the same loader order
-    steps, tally = reference_epoch_counts(monkeypatch, train_data_root, STEPS)
+    steps, tally = reference_epoch_counts(monkeypatch, module_data_root, STEPS)
     for row in rows[1:]:
         s = row["step"]
         problems = epoch_counter_problems(row["positions"], steps[:s], tally[s - 1])
@@ -121,26 +127,26 @@ def test_unbroken_run_records_positions(tmp_path, monkeypatch, train_data_root, 
     for h in SL.HEADS:
         assert rows[-1]["heads"][h]["train_n"] == sum(int(k) * n for k, n in last["taken"][h].items()) - sum(
             int(k) * n for k, n in rows[-2]["positions"]["taken"][h].items())
-    lines = step_lines(tmp_path / "a.log")
+    lines = step_lines(run_log(unbroken))
     assert all(re.search(r" \| read [0-9a-f]{12} \| sample [0-9a-f]{12}$", ln) for ln in lines.values())
     ckpt = torch.load(unbroken / "checkpoints" / "step_12.pt", weights_only=True)
     assert ckpt["batcher_state"]["sizes"] == SIZES and "mps_rng_state" not in ckpt
 
 
-def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root,
+def test_kill_after_an_eval_row_before_the_save_resumes_to_the_unbroken_run(tmp_path, monkeypatch, module_data_root,
                                                                              unbroken):
-    b = _run(tmp_path, monkeypatch, train_data_root, "b")
+    b = _run(tmp_path, monkeypatch, module_data_root, "b")
     os.remove(b / "checkpoints" / "step_12.pt")
     header, rows = SL.Metrics(str(b / "metrics.jsonl")).read()
     SL.Metrics(str(b / "metrics.jsonl"))._write([header] + [r for r in rows if r["step"] <= 10])
     resumed_from = torch.load(b / "checkpoints" / "step_8.pt", weights_only=True)
     assert resumed_from["batcher_state"]["buffers"]["discard"]["cols"] is not None  # carried rows in the state
-    _run(tmp_path, monkeypatch, train_data_root, "b")
+    _run(tmp_path, monkeypatch, module_data_root, "b")
     assert "resuming at step 8;" in open(tmp_path / "b.log").read()
-    assert_runs_equal(tmp_path, "a", "b", (4, 8, 12))
+    assert_runs_equal(unbroken, tmp_path / "b", (4, 8, 12))
 
 
-def test_stop_inside_an_eval_row_write_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root, unbroken):
+def test_stop_inside_an_eval_row_write_resumes_to_the_unbroken_run(tmp_path, monkeypatch, module_data_root, unbroken):
     append = SL.Metrics.append
 
     def stop_at_row_10(self, row):
@@ -151,13 +157,13 @@ def test_stop_inside_an_eval_row_write_resumes_to_the_unbroken_run(tmp_path, mon
     with monkeypatch.context() as m:
         m.setattr(SL.Metrics, "append", stop_at_row_10)
         with pytest.raises(RuntimeError, match="stopped inside the row-10 write"):
-            _run(tmp_path, monkeypatch, train_data_root, "b")
-    _run(tmp_path, monkeypatch, train_data_root, "b")
+            _run(tmp_path, monkeypatch, module_data_root, "b")
+    _run(tmp_path, monkeypatch, module_data_root, "b")
     assert "resuming at step 10;" in open(tmp_path / "b.log").read()
-    assert_runs_equal(tmp_path, "a", "b", (4, 8, 12))
+    assert_runs_equal(unbroken, tmp_path / "b", (4, 8, 12))
 
 
-def test_stop_inside_a_fill_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root, unbroken):
+def test_stop_inside_a_fill_resumes_to_the_unbroken_run(tmp_path, monkeypatch, module_data_root, unbroken):
     """An interrupt right after the 9th cluster draw (inside step 3's fill, its game not admitted yet): the draw is
     undone, the stop checkpoint keeps the admitted games, the resume ends equal to the unbroken run."""
     make = SL.train_cluster
@@ -179,14 +185,14 @@ def test_stop_inside_a_fill_resumes_to_the_unbroken_run(tmp_path, monkeypatch, t
     with monkeypatch.context() as m:
         m.setattr(SL, "train_cluster", stopping_cluster)
         with pytest.raises(KeyboardInterrupt):
-            _run(tmp_path, monkeypatch, train_data_root, "b")
+            _run(tmp_path, monkeypatch, module_data_root, "b")
     stop = re.search(r"STOP at step (\d+): KeyboardInterrupt", open(tmp_path / "b.log").read())
     assert stop and 0 < int(stop.group(1)) < 6, stop
-    _run(tmp_path, monkeypatch, train_data_root, "b")
-    assert_runs_equal(tmp_path, "a", "b", (8, 12))
+    _run(tmp_path, monkeypatch, module_data_root, "b")
+    assert_runs_equal(unbroken, tmp_path / "b", (8, 12))
 
 
-def test_failure_after_the_forward_before_the_commit_keeps_the_step(tmp_path, monkeypatch, train_data_root, unbroken):
+def test_failure_after_the_forward_before_the_commit_keeps_the_step(tmp_path, monkeypatch, module_data_root, unbroken):
     """Update 7 fails in clip_grad_norm_ (after its forward and backward). The stop checkpoint is step_6.pt: model,
     optimizer, scheduler, RNG (from before the failed forward), train sums and the committed counters equal the
     unbroken run's step_6.pt; the buffers stay whole [R2] (the unbroken step_6 rows, then the rows of the games step
@@ -202,7 +208,7 @@ def test_failure_after_the_forward_before_the_commit_keeps_the_step(tmp_path, mo
     with monkeypatch.context() as m:
         m.setattr(torch.nn.utils, "clip_grad_norm_", fail_once)
         with pytest.raises(RuntimeError, match="forced failure in update 7"):
-            _run(tmp_path, monkeypatch, train_data_root, "b")
+            _run(tmp_path, monkeypatch, module_data_root, "b")
     b = tmp_path / "b" / "checkpoints"
     assert sorted(os.listdir(b)) == ["step_4.pt", "step_6.pt"]
     ref = torch.load(unbroken / "checkpoints" / "step_6.pt", weights_only=True)
@@ -220,17 +226,17 @@ def test_failure_after_the_forward_before_the_commit_keeps_the_step(tmp_path, mo
         _assert_equal(rb["buffers"][h]["provenance"], sb["buffers"][h]["provenance"][:n], f"{h} provenance prefix")
         if n:
             _assert_equal(rb["buffers"][h]["cols"], [c[:n] for c in sb["buffers"][h]["cols"]], f"{h} rows prefix")
-    _run(tmp_path, monkeypatch, train_data_root, "b")
-    assert_runs_equal(tmp_path, "a", "b", (8, 12))
+    _run(tmp_path, monkeypatch, module_data_root, "b")
+    assert_runs_equal(unbroken, tmp_path / "b", (8, 12))
 
 
-def test_stop_after_step_saves_step_k_and_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root,
+def test_stop_after_step_saves_step_k_and_resumes_to_the_unbroken_run(tmp_path, monkeypatch, module_data_root,
                                                                        unbroken):
     """--stop-after-step 6 (not an eval or save step of run b): train returns normally, step_6.pt equals the
     unbroken run's step_6.pt in every field (scheduler and LR on the 12-step horizon, train sums of the open
     interval, batcher state, RNG), no worker process is left; a start without the bound resumes at step 6 and ends
     equal to the unbroken run. A second start with the same bound stops at once and saves nothing new."""
-    b = _run(tmp_path, monkeypatch, train_data_root, "b", stop_after_step=6)
+    b = _run(tmp_path, monkeypatch, module_data_root, "b", stop_after_step=6)
     assert not multiprocessing.active_children(), multiprocessing.active_children()
     log = open(tmp_path / "b.log").read()
     assert "stopped after update 6 (--stop-after-step 6, total_steps 12)" in log and "Training completed." not in log
@@ -239,13 +245,13 @@ def test_stop_after_step_saves_step_k_and_resumes_to_the_unbroken_run(tmp_path, 
     _assert_equal(torch.load(unbroken / "checkpoints" / "step_6.pt", weights_only=True),
                   torch.load(b / "checkpoints" / "step_6.pt", weights_only=True), "stop checkpoint step_6.pt")
     mtime = os.path.getmtime(b / "checkpoints" / "step_6.pt")
-    _run(tmp_path, monkeypatch, train_data_root, "b", stop_after_step=6)
+    _run(tmp_path, monkeypatch, module_data_root, "b", stop_after_step=6)
     assert os.path.getmtime(b / "checkpoints" / "step_6.pt") == mtime
     assert len(step_lines(tmp_path / "b.log")) == 6  # no update after the bound
-    _run(tmp_path, monkeypatch, train_data_root, "b")
+    _run(tmp_path, monkeypatch, module_data_root, "b")
     assert "resuming at step 6;" in open(tmp_path / "b.log").read()
     assert "Training completed." in open(tmp_path / "b.log").read()
-    assert_runs_equal(tmp_path, "a", "b", (4, 8, 12))
+    assert_runs_equal(unbroken, tmp_path / "b", (4, 8, 12))
 
 
 class InterruptAtLine:
@@ -285,24 +291,24 @@ class InterruptAtLine:
 
 @pytest.mark.parametrize("at", ["step_rng = None", "train_sums[h][1] += out.y.numel()"],
                          ids=["before_the_rng_snapshot_is_cleared", "inside_the_train_sums_update"])
-def test_an_interrupt_after_the_commit_never_saves_a_half_finished_update(tmp_path, monkeypatch, train_data_root,
+def test_an_interrupt_after_the_commit_never_saves_a_half_finished_update(tmp_path, monkeypatch, module_data_root,
                                                                           unbroken, at):
     """An interrupt after update 7's commit, before the step's RNG snapshot is cleared or inside its train-sums update
     (Codex round 2): no stop checkpoint holds the previous step's RNG or half-added train sums. The resume (from
     step_4.pt) ends equal to the unbroken run."""
     with InterruptAtLine("current_step += 1", 7, at) as trace:
         with pytest.raises(KeyboardInterrupt, match="interrupt before line"):
-            _run(tmp_path, monkeypatch, train_data_root, "b")
+            _run(tmp_path, monkeypatch, module_data_root, "b")
     assert trace.fired
     assert "no checkpoint: the stop came inside an optimizer update" in open(tmp_path / "b.log").read()
     assert sorted(os.listdir(tmp_path / "b" / "checkpoints")) == ["step_4.pt"]
-    _run(tmp_path, monkeypatch, train_data_root, "b")
+    _run(tmp_path, monkeypatch, module_data_root, "b")
     assert "resuming at step 4;" in open(tmp_path / "b.log").read()
-    assert_runs_equal(tmp_path, "a", "b", (8, 12))
+    assert_runs_equal(unbroken, tmp_path / "b", (8, 12))
 
 
 @pytest.mark.parametrize("where", ["after_the_row_append", "inside_the_peak_reset"])
-def test_a_failure_after_an_eval_row_is_on_disk_resumes_to_the_unbroken_run(tmp_path, monkeypatch, train_data_root,
+def test_a_failure_after_an_eval_row_is_on_disk_resumes_to_the_unbroken_run(tmp_path, monkeypatch, module_data_root,
                                                                             unbroken, where):
     """Row 10 is on disk, then a RuntimeError: right after Metrics.append returns (before the interval resets), or in
     the buffer-peak reset (train sums already reset) (Codex round 2). The stop checkpoint step_10.pt holds the closed
@@ -330,12 +336,12 @@ def test_a_failure_after_an_eval_row_is_on_disk_resumes_to_the_unbroken_run(tmp_
     with monkeypatch.context() as m:
         m.setattr(*patch)
         with pytest.raises(RuntimeError, match="failure after the row-10 append"):
-            _run(tmp_path, monkeypatch, train_data_root, "b")
+            _run(tmp_path, monkeypatch, module_data_root, "b")
     assert [r["step"] for r in SL.Metrics(str(tmp_path / "b" / "metrics.jsonl")).read()[1]] == [0, 5, 10]
     assert os.path.exists(tmp_path / "b" / "checkpoints" / "step_10.pt")
-    _run(tmp_path, monkeypatch, train_data_root, "b")
+    _run(tmp_path, monkeypatch, module_data_root, "b")
     assert "resuming at step 10;" in open(tmp_path / "b.log").read()
-    assert_runs_equal(tmp_path, "a", "b", (4, 8, 12))
+    assert_runs_equal(unbroken, tmp_path / "b", (4, 8, 12))
 
 
 # ---------------------------------------------------------------- run identity
