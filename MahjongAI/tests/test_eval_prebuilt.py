@@ -37,11 +37,14 @@ def reference_evaluate(model, ids, games, tensors):
 
 
 @pytest.fixture(scope="module")
-def val_and_games(tmp_path_factory):
-    """ValSet.load on the fixture validation day (production path) and the same games parsed (the reference input)."""
+def val_and_games(tmp_path_factory, session_pool_sizes):
+    """ValSet.load on the fixture validation day (production path: the production pool sizes, conftest
+    session_pool_sizes) and the same games parsed (the reference input)."""
     from MahjongAI.tests.conftest import make_wide_val_root
     root = make_wide_val_root(tmp_path_factory.mktemp("wide") / "data")
     mp = pytest.MonkeyPatch()
+    for k, v in session_pool_sizes.items():
+        mp.setattr(SL, k, v)
     mp.setattr(SL, "DATA_ROOT", root)
     mp.setattr(SL, "VAL_GAMES", N_VAL)
     val = SL.ValSet.load(lambda *_: None)
