@@ -4,7 +4,13 @@ loader's os.walk does not enter linked directories.
 Under pytest-xdist (CI: -n 4, T-063) each worker process sets its torch default to 1 thread (tests that need a count
 set it and restore it; SL.train sets its own), each part of the gates self-test (the longest test) starts a worker's
 first chunk at t=0, and a pool of >= 8 data workers waits for big_pool_slot (one such pool at a time across workers).
-A serial run keeps its order and thread default."""
+A serial run keeps its order and thread default.
+
+Pool sizes of the test session (T-065, serial and xdist alike): every trainer run builds its validation set and prior
+in the trainer (PRIOR_WORKERS 0) and trains with 2 data workers (DATA_WORKERS 2). Each spawned worker imports torch,
+and CI is CPU-bound: the spawns were 71 % of the suite's CPU. Neither size is a run-identity key or changes a batch,
+row or checkpoint (test_startup_pool, test_prior_workers, test_worker_count, test_worker_sweep prove it, with sizes of
+their own). A test that claims the production sizes takes `production_pools`."""
 import contextlib
 import hashlib
 import pathlib
@@ -13,6 +19,7 @@ import pytest
 
 SELF_TEST = "test_gates.py::test_gates_self_test"  # its parts: SELF_TEST[0], SELF_TEST[1], ...
 BIG_POOL = 8  # a pool of this many data workers or more takes big_pool_slot
+TEST_POOLS = {"PRIOR_WORKERS": 0, "DATA_WORKERS": 2}  # the test session's supervised_learning pool sizes (T-065)
 
 
 def _xdist_worker(config) -> bool:
@@ -56,6 +63,29 @@ def pytest_collection_modifyitems(config, items):
     at = {starts[k % n] + k // n: item for k, item in enumerate(parts)}
     fill = iter(rest)
     items[:] = [at[i] if i in at else next(fill) for i in range(len(items))]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def session_pool_sizes():
+    """TEST_POOLS on supervised_learning for the whole session, set before every module fixture (session scope); a
+    test's own monkeypatch overrides it for that test. Yields the production sizes it replaced. (Read here, not at
+    import: pytest imports this file as `conftest` and the tests import it as `MahjongAI.tests.conftest`, two
+    modules.)"""
+    from MahjongAI import supervised_learning as SL
+    production = {k: getattr(SL, k) for k in TEST_POOLS}
+    with pytest.MonkeyPatch.context() as m:
+        for k, v in TEST_POOLS.items():
+            m.setattr(SL, k, v)
+        yield production
+
+
+@pytest.fixture
+def production_pools(monkeypatch, session_pool_sizes):
+    """The production pool sizes for one test (a module fixture uses session_pool_sizes itself)."""
+    from MahjongAI import supervised_learning as SL
+    for k, v in session_pool_sizes.items():
+        monkeypatch.setattr(SL, k, v)
+    return session_pool_sizes
 
 
 @pytest.fixture(scope="session")
