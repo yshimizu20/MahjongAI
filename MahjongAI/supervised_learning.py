@@ -38,6 +38,7 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 
+from MahjongAI.agents.compiled_heads import COMPILE_ON_LINE, CompiledHeads
 from MahjongAI.agents.encoder_conv import (EMBD_SIZE, LEGACY_ARCH, N_LAYERS, EncoderConvModel, PrebuiltGame,
                                            TransformerTensorProcessor, build_game, count_parameters)
 from MahjongAI.utils.baselines import fit_bias_prior, greedy_hits, score_bias, shanten_best, uniform_legal
@@ -468,7 +469,8 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, embd_size: int = EMBD_SIZE,
           n_layers: int = N_LAYERS, row0_tol: float = None, batch_mode: str = "games", position_sizes: dict = None,
           device: str = "cpu", stop_after_step: int = None, phase_timing: bool = False, measure_window: tuple = None,
-          data_workers: int = None, data_prefetch: int = None, torch_threads: int = None):
+          data_workers: int = None, data_prefetch: int = None, torch_threads: int = None,
+          compile_heads: bool = False):
     """position_sizes: {head: step size N} of positions mode (default DEFAULT_SIZES): a step takes N discard rows and
     0, N or 2 N during / post rows (position_batcher.side_take); games mode takes none.
     stop_after_step: stop once this many updates are done (after that step's eval / save), with a checkpoint of that
@@ -484,7 +486,11 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     data_workers / data_prefetch / torch_threads (T-061): None = DATA_WORKERS / DATA_PREFETCH / TORCH_THREADS; each
     >= 1. The workers' count and prefetch window change no batch (the loaders own the order) and are no run-identity
     key; torch_threads is one (the config records the value used; it changes the float reduction order). The startup
-    pools (prior, validation) keep PRIOR_WORKERS / PRIOR_PREFETCH; the data workers keep one torch thread each."""
+    pools (prior, validation) keep PRIOR_WORKERS / PRIOR_PREFETCH; the data workers keep one torch thread each.
+    compile_heads (--compile, T-050): positions mode only, training updates run each head's network after the token
+    embedder through one torch.compile(dynamic=False) callable per head (agents/compiled_heads.py); evaluation, the
+    checkpoint keys and the run identity stay as without it (a run resumes across the flag). Off: no compile code
+    runs."""
     row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
     assert batch_mode in BATCH_MODES and device in DEVICES, (batch_mode, device)
     if batch_mode == "positions":
@@ -494,6 +500,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     assert stop_after_step is None or stop_after_step > 0, f"stop_after_step {stop_after_step}: must be > 0"
     assert batch_mode == "positions" or not phase_timing, "phase timing is a positions-mode setting"
     assert batch_mode == "positions" or measure_window is None, "the measure window is a positions-mode setting"
+    assert batch_mode == "positions" or not compile_heads, "--compile is a positions-mode setting"
     for name, value in (("data_workers", data_workers), ("data_prefetch", data_prefetch),
                         ("torch_threads", torch_threads)):
         assert value is None or (isinstance(value, int) and value >= 1), f"{name} {value!r}: must be an integer >= 1"
@@ -502,7 +509,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     try:
         _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
                embd_size, n_layers, row0_tol, batch_mode, position_sizes, torch.device(device),
-               stop_after_step, phase_timing, measure_window, torch_threads)
+               stop_after_step, phase_timing, measure_window, torch_threads, compile_heads)
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
@@ -512,7 +519,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
            expect_prior_ce, expect_shanten, workers, embd_size: int, n_layers: int,
            row0_tol: float, batch_mode: str, position_sizes, device: torch.device,
            stop_after_step, phase_timing: bool = False, measure_window: tuple = None,
-           torch_threads: int = TORCH_THREADS):
+           torch_threads: int = TORCH_THREADS, compile_heads: bool = False):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
@@ -533,6 +540,12 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     assert n_params == expected_params, f"{n_params} parameters, expected {expected_params}"
     log(f"model {model_name}: embd_size {embd_size}, n_layers {n_layers}, {n_params:,} parameters")
     log(f"batch mode {batch_mode}" + (f" {position_sizes}" if position_sizes else "") + f", device {device}")
+    # --compile (T-050): the training updates' per-head callables, outside the model (evaluation and checkpoints use
+    # the model alone); compiled lazily at each (head, B) signature's first update. None without the flag.
+    cores = None
+    if compile_heads:
+        cores = CompiledHeads(model)
+        log(COMPILE_ON_LINE)
     # validation runs on the CPU: the model itself on a CPU run, else a CPU copy (deepcopy: no RNG draw) whose weights
     # are refreshed before each eval
     eval_model = model if device.type == "cpu" else copy.deepcopy(model).to("cpu")
@@ -811,7 +824,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
                 step_rng = rng_state(device)
                 if probe is not None:
                     probe.mark("rng")
-                results = model.forward_heads(batches, mark=None if probe is None else probe.mark)
+                results = model.forward_heads(batches, mark=None if probe is None else probe.mark, cores=cores)
                 if probe is not None:
                     probe.mark("results")  # the previous step's outputs are released by this assignment
 
@@ -901,6 +914,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
                 save_checkpoint()
             log_mps_memory(" (final)")
             phase_stop()
+            if cores is not None:
+                log(cores.summary())
             log(f"stopped after update {current_step} (--stop-after-step {stop_after_step}, total_steps "
                 f"{total_steps}): a start on this run dir resumes here")
             return
@@ -916,6 +931,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         raise
     log_mps_memory(" (final)")
     phase_stop()
+    if cores is not None:
+        log(cores.summary())
     log("Training completed.")
 
 
@@ -950,6 +967,7 @@ def run_header(args) -> str:
             + (f", stop after step {args.stop_after_step}" if args.stop_after_step is not None else "")
             + (", phase timing" if args.phase_timing else "")
             + (f", measure window {args.measure_window[0]},{args.measure_window[1]}" if args.measure_window else "")
+            + (", compile" if getattr(args, "compile", False) else "")
             + (f", data workers {DATA_WORKERS if args.data_workers is None else args.data_workers}, data prefetch "
                f"{DATA_PREFETCH if args.data_prefetch is None else args.data_prefetch}, torch threads "
                f"{TORCH_THREADS if args.torch_threads is None else args.torch_threads}" if tuned else "")
@@ -1012,6 +1030,9 @@ if __name__ == "__main__":
     parser.add_argument("--torch-threads", type=positive_int, default=None, metavar="T",
                         help=f"the trainer's torch threads, training and CPU eval (default {TORCH_THREADS}; T-061); a "
                              "run-identity key: a resume needs the same T")
+    parser.add_argument("--compile", action="store_true",
+                        help="positions mode: compile each head's network after the token embedder for training updates "
+                             "(torch.compile per head, dynamic=False; evaluation eager; T-050)")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -1031,6 +1052,11 @@ if __name__ == "__main__":
         parser.error("--position-sizes needs --batch-mode positions")
     if (args.phase_timing or args.measure_window) and args.batch_mode != "positions":
         parser.error("--phase-timing and --measure-window need --batch-mode positions")
+    if args.compile and args.batch_mode != "positions":
+        parser.error("--compile needs --batch-mode positions")
+    if args.compile and args.device != "mps":
+        # T-050 tested --compile on MPS only; CPU Inductor kernels deadlocked in libomp with > 1 thread on this Mac
+        parser.error("--compile needs --device mps")
     if args.measure_window and not (args.stop_after_step == args.eval_every == args.save_every
                                     == sum(args.measure_window)):
         last = sum(args.measure_window)
@@ -1046,7 +1072,7 @@ if __name__ == "__main__":
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
               args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol,
               args.batch_mode, args.position_sizes, args.device, args.stop_after_step, args.phase_timing,
-              args.measure_window, args.data_workers, args.data_prefetch, args.torch_threads)
+              args.measure_window, args.data_workers, args.data_prefetch, args.torch_threads, args.compile)
 
     if args.profile:
         pr = cProfile.Profile()
