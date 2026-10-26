@@ -220,11 +220,13 @@ def test_the_compiled_callables_stay_outside_the_model(compile_globals):
     assert list(copy.deepcopy(model).state_dict()) == keys
 
 
+@pytest.mark.mps  # local only (this Mac): three CPU trainer runs cost 368 s on Linux CI (T-065's CI time bar);
+# --compile itself needs --device mps, and test_a_compiled_mps_run_resumes_eager covers the real path there
 def test_a_compiled_run_resumes_eager_to_the_eager_run(tmp_path, monkeypatch, train_data_root, compile_globals):
     """CPU, positions mode, the compiler a counting stub (eager cores): a --compile run stopped at step 8, resumed
     without --compile to step 12, ends equal to the eager run (rows, step lines, checkpoints 4, 8, 12: the same keys
     and values). Every evaluation calls no core; the compiled part logs the startup line and the summary line, the
-    eager part neither."""
+    eager part neither. Marked mps to keep it off Linux CI (cost), although it runs on the CPU."""
     calls = CountingCompiler()
     monkeypatch.setattr(CH, "compile_core", calls)
     evaluate, during_eval = SL.ValSet.evaluate, []
