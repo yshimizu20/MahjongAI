@@ -656,6 +656,11 @@ class MultiHeadAttention(nn.Module):
             q: Query tensor of shape [B, Q, EMBD_SIZE]
             attn_mask: Optional boolean tensor of shape [B, 1, T].
                        True = keep (valid position), False = mask out (padded position)
+
+        Torch 2.13 on MPS (T-064): a train-mode full-row call (Q > 1, dropout_p > 0) under torch.no_grad() raises
+        NotImplementedError ("scaled_dot_product_attention for MPS does not support dropout"); with gradients on it
+        runs. No production path does that: training runs with gradients on, and every no_grad forward (evaluate,
+        the viewer, the self-play player) runs in eval mode, dropout 0.
         """
         B, T, _ = k.shape
         Q = q.shape[1]

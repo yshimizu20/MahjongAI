@@ -22,8 +22,11 @@ Full-row chunks (T-058, 128 x 2): off the CPU the first block runs on ROW_CHUNK-
 Dropout off, train and eval: losses, logits, every gradient, the update and the AdamW moments of the chunked model are
 within the measured unchunked-vs-unchunked MPS noise (floored at the chunking's float32 rounding, measured on the CPU),
 the RNG states after the step equal. Dropout on (draws differ by design): per-element mean and variance over seeds
-match the unchunked model's. A 128 x 2 resume is within the run-to-run noise. Driver memory stays flat with chunks and
-grows without (each control in its own process)."""
+match the unchunked model's (the draws run with gradients on, as in training: T-064). A train-mode 128 x 2 step with
+every dropout on runs on MPS (T-064 guard). A 128 x 2 resume is within the run-to-run noise. Driver memory stays flat
+with chunks and grows without (each control in its own process).
+Torch >= 2.13 (T-064): the two grows-without controls are skipped with LEAK_CONTROL_REASON (that torch has no driver
+leak to reproduce); their stays-flat partners run on every version."""
 import glob
 import json
 import math
@@ -401,6 +404,21 @@ MEMORY_ROWS = {"during": 48, "discard": 512, "post": 160}  # rows per step, draw
 MEMORY_SLOPE = 0.5  # MiB/step: the padded loop must stay below; the unpadded control must exceed it
 
 
+def leak_controls_skipped(version: str) -> bool:
+    """True on torch >= 2.13 (T-064). TorchVersion compares release numbers: as strings, "2.5.1" >= "2.13"."""
+    return torch.torch_version.TorchVersion(version) >= (2, 13)
+
+
+# T-064 (pytest.ini names this exception to "a skip is a fail"): torch 2.13 has no T-056 / T-058 driver leak, so these
+# negative controls (the fix removed -> the slope must exceed MEMORY_SLOPE) have nothing to reproduce there. They run
+# on torch 2.5.1; on torch >= 2.13 they are skipped with exactly this reason (the suite gate allows no other skip).
+TORCH_2_13 = leak_controls_skipped(torch.__version__)
+LEAK_CONTROL_REASON = ("T-064: torch >= 2.13 has no T-056 / T-058 MPS driver leak to reproduce (T-060 Part 3: "
+                       "slopes 0.0018 / 0.0105 MiB/step, need >= 0.5); this control runs on torch 2.5.1")
+VERSION_GATED = {"test_mps_driver_memory_grows_without_the_unique_padding",
+                 "test_mps_driver_memory_grows_without_row_chunks"}
+
+
 def driver_memory_slope(games, seed: int, steps=MEMORY_STEPS, arch=None, rows=None) -> tuple:
     """(slope MiB/step, {step: driver MiB}) of torch.mps.driver_allocated_memory in a 64 x 1 MPS training loop
     (forward_heads, backward, AdamW, one loss read per step as in the trainer), sampled every MEMORY_EVERY steps, the
@@ -440,6 +458,7 @@ def test_mps_driver_memory_stays_flat_when_the_unique_count_changes(games):
     assert slope < MEMORY_SLOPE, (slope, samples)
 
 
+@pytest.mark.skipif(TORCH_2_13, reason=LEAK_CONTROL_REASON)
 def test_mps_driver_memory_grows_without_the_unique_padding(games, monkeypatch):
     """The negative control: UNIQUE_BUCKET 1 (no padding, the raw U) must fail the flat-memory check."""
     monkeypatch.setattr(EC, "UNIQUE_BUCKET", 1)
@@ -728,6 +747,8 @@ def encode_draws(seeds, chunked: bool, monkeypatch, dropout="all", chunk_patch=N
     """[len(seeds), B, 8, EMBD] first-block outputs (the last 8 positions, the state row included) of the seed-0
     128 x 2 model on MPS, dropout on, one encode per seed, on fixed random inputs (B = 200 rows: one full chunk and one
     padded). The first block's output is the last block's input (a pre-hook reads it): the chunked values themselves.
+    Gradients stay on, as in training (T-064): torch 2.13's MPS SDPA raises on dropout under no_grad; the read
+    values are detached, so no graph outlives its encode.
     chunk_patch(block, x, mask, forward): replaces a chunk call (a negative control)."""
     set_chunks(monkeypatch, chunked)
     model = chunk_model(MPS, dropout=dropout)
@@ -737,8 +758,9 @@ def encode_draws(seeds, chunked: bool, monkeypatch, dropout="all", chunk_patch=N
     mask[..., -1] = True
     forward = EC.EncoderBlock.forward
     outs = []
-    hook = model.blocks[-1].register_forward_pre_hook(lambda module, args: outs.append(args[0][:, -8:].cpu()))
-    with monkeypatch.context() as mp, torch.no_grad():
+    hook = model.blocks[-1].register_forward_pre_hook(lambda module, args: outs.append(args[0][:, -8:].detach().cpu()))
+    assert torch.is_grad_enabled()
+    with monkeypatch.context() as mp:
         if chunk_patch:
             mp.setattr(EC.EncoderBlock, "forward", lambda self, x, m, state_row_only=False: forward(
                 self, x, m, state_row_only) if state_row_only else chunk_patch(self, x, m, forward))
@@ -797,6 +819,29 @@ def test_the_dropout_distribution_check_fails_a_broken_chunk(monkeypatch, broken
     assert not (z2 < MEAN_Z2 and VAR_RATIO[0] <= ratio <= VAR_RATIO[1]), (broken, z2, ratio)
 
 
+def test_a_train_mode_128x2_mps_step_with_attention_dropout_runs(games, monkeypatch):
+    """T-064 guard, on torch 2.5.1 and 2.13: the trainer's case on MPS (the shipped chunk rule, every dropout on,
+    gradients on) runs forward_heads and backward with finite losses and gradients. A spy proves the full-row
+    attention reached SDPA with dropout_p > 0 on MPS tensors that need a gradient, the call that torch 2.13's MPS
+    SDPA accepts (under no_grad it raises: MultiHeadAttention.forward)."""
+    calls, sdpa = [], torch.nn.functional.scaled_dot_product_attention
+
+    def spy(q, k, v, *args, **kwargs):
+        calls.append((q.device.type, kwargs.get("dropout_p"), q.requires_grad))
+        return sdpa(q, k, v, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy)
+    model = chunk_model(MPS, dropout=True)
+    torch.manual_seed(1)
+    results = model.forward_heads(fixture_batches(games))
+    sum(r.loss for r in results.values()).backward()
+    print(f"\n128x2 MPS train step, dropout on: {len(calls)} SDPA calls, e.g. {calls[:1]}; losses "
+          f"{ {h: round(r.loss.item(), 4) for h, r in results.items()} }")
+    assert calls and set(calls) == {("mps", EC.DROPOUT_RATIO, True)}, calls
+    assert_finite("loss", ((h, r.loss.detach()) for h, r in results.items()))
+    assert_finite("gradient", ((n, p.grad) for n, p in model.named_parameters()))
+
+
 @pytest.fixture(scope="module")
 def chunk_runs(tmp_path_factory, mps_root):
     """128 x 2 MPS positions-mode runs, dropout on, the first block chunked (rows 60 / 400 / 1,600 pad to whole
@@ -852,6 +897,7 @@ def test_mps_driver_memory_stays_flat_with_row_chunks():
     assert slope < MEMORY_SLOPE, (slope, samples)
 
 
+@pytest.mark.skipif(TORCH_2_13, reason=LEAK_CONTROL_REASON)
 def test_mps_driver_memory_grows_without_row_chunks():
     """The negative control: the first block on the step's rows (a size that changes every step) must fail."""
     slope, samples = chunk_memory_in_a_fresh_process(False, seed=3)

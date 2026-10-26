@@ -1,16 +1,15 @@
 name: mahjong
 channels:
-  - pytorch
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
-  - pytorch
   - numpy
   - jupyter
   - ipykernel
   - pip
   - pip:
+      - torch==2.13.0  # pip: the conda pytorch channel stops at 2.5.1; exact pin as requirements.txt (T-060)
       - mahjong==2.0.0  # exact pin: utils/agari.py and utils/win_oracles.py read 2.x yaku names / ids (T-036)
       - requests
       - matplotlib  # run_report figure (plan T-005)

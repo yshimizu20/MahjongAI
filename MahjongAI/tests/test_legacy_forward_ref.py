@@ -3,10 +3,13 @@ computed from the 9eb24c0 code before T-055 changed the model module: two fixtur
 every head (per-head randperm), dropout on, then backward. The sha256 of the selected labels, the logits, the losses,
 every gradient and the final CPU RNG state must equal the frozen values. A change of the per-head RNG order (randperm,
 then that head's forward and dropout, in during / discard / post order) or of any float op changes a digest.
-The digests are of this machine's float results (CPU, TORCH_THREADS threads)."""
+The digests are of this machine's float results (CPU, TORCH_THREADS threads) under one torch: one set per torch
+major.minor (T-064), each computed from the 9eb24c0 code under that torch, so on every version the test still
+says "main equals the 9eb24c0 code, bit for bit". A torch with no set fails, never skips."""
 import glob
 import hashlib
 import os
+import re
 
 import pytest
 import torch
@@ -21,8 +24,10 @@ GATE_GAMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "g
 GAMES = ("2021010101gm-00a9-0000-6422c07e.log", "2021010521gm-00a9-0000-e76b4550.log")
 SAMPLE_SIZE = 40
 
-# computed on 9eb24c0 (T-010 tip, before T-055), CPU, 4 threads
-FROZEN = {
+# Keyed by torch major.minor (T-064). "2.5": computed on 9eb24c0 (T-010 tip, before T-055) under torch 2.5.1, CPU,
+# 4 threads. A new key needs the T-064 D1 procedure first (op trace: the change is platform floats, not ours),
+# then the digests of the 9eb24c0 code under that torch, never main's.
+FROZEN_BY_TORCH = {"2.5": {
     "heads": ["during", "discard", "post"],
     "during.y": "f182bbfab4f00732",
     "during.logits": "326c33807a8758f1",
@@ -77,7 +82,74 @@ FROZEN = {
     "grad.post_head.weight": "96868679218473c7",
     "grad.post_head.bias": "7e7b1384cf415cd9",
     "rng": "92964edc20a11bd4",
-}
+}, "2.13": {
+    # Computed on 9eb24c0 under torch 2.13.0 (CPU, 4 threads). T-064 D1: "platform floats". The 2.13 vs 2.5.1
+    # tensors pass the comparator (labels and RNG exact; logits, losses, gradients within tolerance); the op traces
+    # align once data-movement ops (slice / slice_backward / detach: no float math) are left out; every changed op
+    # comes from 3 aten.mean.dim origins of relative output difference <= 1.3e-7.
+    "heads": ["during", "discard", "post"],
+    "during.y": "f182bbfab4f00732",
+    "during.logits": "9c66848666a1069f",
+    "during.loss": "35dfa89f6a3377f5",
+    "discard.y": "3cdeda39624e3d5f",
+    "discard.logits": "15a56b530daaeded",
+    "discard.loss": "37d89504ab086880",
+    "post.y": "1096135d614af7fb",
+    "post.logits": "bb7578fa4e6106af",
+    "post.loss": "aba98b27428393ab",
+    "grad.token_embedder.type_embedding.weight": "bc398598a051a591",
+    "grad.token_embedder.tile_embedding.weight": "445f9ff6edafdd1c",
+    "grad.token_embedder.tsumogiri_embedding.weight": "9ca1ffb068371e01",
+    "grad.token_embedder.during_naki_embedding.weight": "b3e0ef201a340c66",
+    "grad.token_embedder.post_naki_embedding.weight": "11ce38b1032962ec",
+    "grad.blocks.0.self_attention.key_proj.weight": "b7d479ac398f30b5",
+    "grad.blocks.0.self_attention.key_proj.bias": "a4e889e97cfa9c91",
+    "grad.blocks.0.self_attention.query_proj.weight": "70d2809594d008bc",
+    "grad.blocks.0.self_attention.query_proj.bias": "8d5199964d1e6b7f",
+    "grad.blocks.0.self_attention.value_proj.weight": "edba33b9b336cf03",
+    "grad.blocks.0.self_attention.value_proj.bias": "aa0da9128b8e3c29",
+    "grad.blocks.0.self_attention.proj.weight": "6b929ac51204f5fb",
+    "grad.blocks.0.self_attention.proj.bias": "7a9084c8c2b3dcc5",
+    "grad.blocks.0.ffwd.net.0.weight": "052e8c164757ba3b",
+    "grad.blocks.0.ffwd.net.0.bias": "da64eda68cf75cf5",
+    "grad.blocks.0.ffwd.net.2.weight": "efa415bc230eaea5",
+    "grad.blocks.0.ffwd.net.2.bias": "5152b2a256c9fa2f",
+    "grad.blocks.0.ln1.weight": "6218768e72ac9ab3",
+    "grad.blocks.0.ln1.bias": "00b737b46a1045ed",
+    "grad.blocks.0.ln2.weight": "ca6d4d648b0e5683",
+    "grad.blocks.0.ln2.bias": "b6053b5001c92a94",
+    "grad.state_net.suit_conv1d_1.weight": "2ca2109cb93e2ef2",
+    "grad.state_net.suit_conv1d_1.bias": "ec8b53eddada980d",
+    "grad.state_net.suit_conv1d_2.weight": "7de299123272947a",
+    "grad.state_net.suit_conv1d_2.bias": "6c9cefebd9ffe048",
+    "grad.state_net.honors_fc1.weight": "ed07a46600c157bb",
+    "grad.state_net.honors_fc1.bias": "f82ae7493376c3f6",
+    "grad.state_net.honors_fc2.weight": "dafe7a397b0c14b7",
+    "grad.state_net.honors_fc2.bias": "c07664926be6d738",
+    "grad.state_net.reds_fc.weight": "58a65a1c5ff78b11",
+    "grad.state_net.reds_fc.bias": "406ad9dcd0f67493",
+    "grad.state_net.fc_main_1.weight": "b8694170132306cc",
+    "grad.state_net.fc_main_1.bias": "1d56a3efcda58874",
+    "grad.state_net.fc_main_2.weight": "c996774d56e8ba89",
+    "grad.state_net.fc_main_2.bias": "1fe54accb3aa6290",
+    "grad.ln_f.weight": "e58d94252efe7ff2",
+    "grad.ln_f.bias": "43db1dc9bacd76db",
+    "grad.discard_head.weight": "c8e8bbd00744b340",
+    "grad.discard_head.bias": "63c48d848b52e14d",
+    "grad.during_head.weight": "3eaaa0d11fd98452",
+    "grad.during_head.bias": "323a6911f701905a",
+    "grad.post_head.weight": "71e8880e6f274454",
+    "grad.post_head.bias": "7d30752e28c82ef9",
+    "rng": "92964edc20a11bd4",
+}}
+
+
+def frozen_for(version: str) -> dict:
+    """The frozen 9eb24c0 digests of this torch version (its major.minor); an AssertionError when there are none."""
+    key = ".".join(version.split("+")[0].split(".")[:2])
+    assert key in FROZEN_BY_TORCH, (f"no frozen digests for torch {version}: run the T-064 D1 procedure, then add "
+                                    f"the 9eb24c0 digests under this torch as FROZEN_BY_TORCH[{key!r}]")
+    return FROZEN_BY_TORCH[key]
 
 
 def _digest(t: torch.Tensor) -> str:
@@ -113,13 +185,23 @@ def legacy_digests(sample_size=SAMPLE_SIZE, model_seed=0) -> dict:
 
 def test_games_mode_forward_equals_the_frozen_9eb24c0_reference():
     got = legacy_digests()
-    assert FROZEN, f"no frozen reference: {got}"
-    diff = {k: (FROZEN.get(k), got.get(k)) for k in FROZEN.keys() | got.keys() if FROZEN.get(k) != got.get(k)}
+    frozen = frozen_for(torch.__version__)
+    assert frozen, f"no frozen reference: {got}"
+    diff = {k: (frozen.get(k), got.get(k)) for k in frozen.keys() | got.keys() if frozen.get(k) != got.get(k)}
     assert not diff, diff
+
+
+def test_frozen_for_picks_the_set_of_the_torch_major_minor():
+    """Negative controls of the lookup: another minor ("2.50" is not "2.5") or an unknown version fails."""
+    assert frozen_for("2.5.1") is frozen_for("2.5.0+cpu") is FROZEN_BY_TORCH["2.5"]
+    for version in ("2.50.1", "2.99.0", "3.5.1"):
+        with pytest.raises(AssertionError, match=rf"no frozen digests for torch {re.escape(version)}: run the T-064"):
+            frozen_for(version)
 
 
 @pytest.mark.parametrize("change", [{"sample_size": SAMPLE_SIZE - 1}, {"model_seed": 1}])
 def test_the_frozen_reference_detects_a_change(change):
     """Negative control: another cap or other weights move the digests."""
+    frozen = frozen_for(torch.__version__)
     got = legacy_digests(**change)
-    assert any(FROZEN.get(k) != v for k, v in got.items())
+    assert any(frozen.get(k) != v for k, v in got.items())
