@@ -11,12 +11,16 @@ T3 a resume with another total_steps (12 -> 24) gives the step lines (LR, games,
 T5 migrate_lr_schedule: a steps_cosine run switched in a new run dir resumes without any flag, the LR of every new
    update = lr_at of its logged games; a stop inside the copy or between the checkpoint and header writes is refused
    by the trainer and completed by a re-run; an unrelated mismatch still fails; a games-mode state without its games
-   counter and a run already on games_cosine_v1 are refused; the source is never written (read_only_run).
+   counter and a run already on games_cosine_v1 are refused; the source is never written (read_only_run). The
+   migration never removes a folder it did not stage (a source at the staging path, an unrelated folder there, another
+   migration's staging folder), refuses a new run dir migrated from another source (or from a source checkpoint
+   changed since), and completes an interrupted migration from its snapshot after the source changed.
 T6 a corpus other than the recorded one is refused without --lr-cycle-games; with its sha recorded, the default runs.
 Also: a steps_cosine run dir (no lr_schedule) resumes on its old formula.
 Negative controls (each must fail the test's check): the LR read from total_steps (T2, T3), g counted from the resume
 (T4 in test_positions_train, T5).
 The test runs use small constants (test_positions_train: LR_WARMUP 3, TEST_LR_CYCLE_GAMES 16: horizon 32 games)."""
+import hashlib
 import math
 import os
 import re
@@ -28,7 +32,7 @@ from torch.optim.optimizer import register_optimizer_step_pre_hook
 
 from MahjongAI import migrate_lr_schedule as MIG
 from MahjongAI import supervised_learning as SL
-from MahjongAI.tests.conftest import TEST_LR_CYCLE_GAMES, read_only_run, run_log
+from MahjongAI.tests.conftest import TEST_LR_CYCLE_GAMES, read_only_run, run_log, tree_digest
 from MahjongAI.tests.test_positions_train import LR_WARMUP, _run, step_lines
 from MahjongAI.tests.test_resume_rows import _assert_equal
 
@@ -438,7 +442,7 @@ def test_an_interrupted_migration_is_refused_by_the_trainer_and_completed_by_a_r
     metrics._write([dict(header, config=dict(header["config"], embd_size=128))] + rows)
     with pytest.raises(AssertionError, match=r"metrics.jsonl header is from another run: embd_size 128 -> 64"):
         _run(tmp_path, monkeypatch, module_data_root, "N")
-    with pytest.raises(AssertionError, match="is neither the migrated header nor the source's file"):
+    with pytest.raises(AssertionError, match="is neither the migrated header nor the snapshot of the source's file"):
         MIG.migrate(str(legacy), str(new), TEST_LR_CYCLE_GAMES)
     open(metrics.path, "w").write(saved)
     # the re-run completes it, a third run does nothing, the trainer resumes without any flag
@@ -467,9 +471,9 @@ def test_the_migration_refuses_what_it_cannot_switch(tmp_path, monkeypatch, trai
         MIG.migrate(str(legacy), str(tmp_path / "default_new"))
     # an existing folder that is no migration of the source, and the source itself
     (tmp_path / "other" / "checkpoints").mkdir(parents=True)
-    with pytest.raises(AssertionError, match="exists without step_6.pt: not a migration of"):
+    with pytest.raises(AssertionError, match="exists without lr_migration.json: not a migration made by this tool"):
         MIG.migrate(str(legacy), str(tmp_path / "other"), TEST_LR_CYCLE_GAMES)
-    with pytest.raises(AssertionError, match="the new run dir must be another folder"):
+    with pytest.raises(AssertionError, match="overlap: the new run dir and its staging folder must be outside"):
         MIG.migrate(str(legacy), str(legacy) + "/", TEST_LR_CYCLE_GAMES)
     # a run already on games_cosine_v1
     on_games = _run(tmp_path, monkeypatch, train_data_root, "on_games", steps=1)
@@ -478,7 +482,7 @@ def test_the_migration_refuses_what_it_cannot_switch(tmp_path, monkeypatch, trai
     # a games-mode steps_cosine state without its games counter (loader states before T-045)
     games = _run(tmp_path, monkeypatch, train_data_root, "games", steps=1, batch_mode="games")
     _as_steps_cosine(games, 1)
-    MIG.Migration(str(games), str(tmp_path / "games_new"), TEST_LR_CYCLE_GAMES)  # with the counter: accepted
+    MIG.migrate(str(games), str(tmp_path / "games_ok"), TEST_LR_CYCLE_GAMES)  # with the counter: accepted
     path = games / "checkpoints" / "step_1.pt"
     ckpt = torch.load(path, weights_only=True)
     for state in ckpt["loader_state"]["loaders"]:
@@ -486,4 +490,88 @@ def test_the_migration_refuses_what_it_cannot_switch(tmp_path, monkeypatch, trai
     torch.save(ckpt, path)
     with pytest.raises(AssertionError, match=r"loader states \[0\] have no `accepted` counter"):
         MIG.migrate(str(games), str(tmp_path / "games_new"), TEST_LR_CYCLE_GAMES)
-    assert not any((tmp_path / n).exists() for n in ("bad_new", "default_new", "on_games_new", "games_new"))
+    # a refusal leaves nothing: no new run dir, no staging folder
+    assert not any((tmp_path / f"{n}{x}").exists() for n in ("bad_new", "default_new", "on_games_new", "games_new")
+                   for x in ("", ".migrating"))
+
+
+def _set_total_steps(run_dir, total_steps):
+    """The run with another total_steps in its checkpoints and header (config_mismatch skips that key)."""
+    for path in (run_dir / "checkpoints").glob("step_*.pt"):
+        ckpt = torch.load(path, weights_only=True)
+        ckpt["config"]["total_steps"] = total_steps
+        torch.save(ckpt, path)
+    metrics = SL.Metrics(str(run_dir / "metrics.jsonl"))
+    header, rows = metrics.read()
+    metrics._write([dict(header, config=dict(header["config"], total_steps=total_steps))] + rows)
+
+
+def test_the_migration_never_removes_a_folder_it_did_not_stage(tmp_path, legacy):
+    # a source at the staging path of the new run dir (<new>.migrating): refused before anything is written
+    src = _copy_run(legacy, tmp_path, "S.migrating")
+    before = tree_digest(src)
+    with pytest.raises(AssertionError, match="overlap: the new run dir and its staging folder must be outside"):
+        MIG.migrate(str(src), str(tmp_path / "S"), TEST_LR_CYCLE_GAMES)
+    assert tree_digest(src) == before and not (tmp_path / "S").exists()
+    # an unrelated folder at the staging path
+    other = tmp_path / "U.migrating"
+    other.mkdir()
+    (other / "keep.txt").write_text("not a migration")
+    with pytest.raises(AssertionError, match=r"U.migrating exists and is not a staging folder of the migration"):
+        MIG.migrate(str(legacy), str(tmp_path / "U"), TEST_LR_CYCLE_GAMES)
+    assert tree_digest(other) == {"U.migrating/keep.txt": hashlib.sha256(b"not a migration").hexdigest()}
+    assert not (tmp_path / "U").exists()
+    # the staging folder of a migration of another source into the same new run dir
+    w = _copy_run(legacy, tmp_path, "W")
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(MIG.Migration, "_migrate_checkpoint", _stop)
+        with pytest.raises(KeyboardInterrupt):
+            MIG.migrate(str(w), str(tmp_path / "V"), TEST_LR_CYCLE_GAMES)
+    staged = tree_digest(tmp_path / "V.migrating")
+    with pytest.raises(AssertionError, match=r"V.migrating exists and is not a staging folder of the migration"):
+        MIG.migrate(str(legacy), str(tmp_path / "V"), TEST_LR_CYCLE_GAMES)
+    assert tree_digest(tmp_path / "V.migrating") == staged and not (tmp_path / "V").exists()
+
+
+def test_a_new_run_dir_migrated_from_another_source_is_refused(tmp_path, legacy):
+    # L2 differs from the fixture run only in total_steps, which config_mismatch skips
+    l2 = _copy_run(legacy, tmp_path, "L2")
+    _set_total_steps(l2, 24)
+    new = tmp_path / "N"
+    MIG.migrate(str(legacy), str(new), TEST_LR_CYCLE_GAMES)
+    migrated = tree_digest(new)
+    with pytest.raises(AssertionError, match=r"N is the migration of .*, not of .*L2"):
+        MIG.migrate(str(l2), str(new), TEST_LR_CYCLE_GAMES)
+    # the same source path, its recorded checkpoint changed since the migration
+    src = _copy_run(legacy, tmp_path, "S")
+    new2 = tmp_path / "N2"
+    MIG.migrate(str(src), str(new2), TEST_LR_CYCLE_GAMES)
+    _set_total_steps(src, 24)
+    with pytest.raises(AssertionError, match=r"S/checkpoints/step_6.pt changed since .*N2 was migrated from it"):
+        MIG.migrate(str(src), str(new2), TEST_LR_CYCLE_GAMES)
+    assert tree_digest(new) == migrated
+
+
+@pytest.mark.parametrize("change", ["rows_appended", "source_resumed"])
+def test_an_interrupted_migration_completes_from_its_snapshot_after_the_source_changed(tmp_path, monkeypatch,
+                                                                                      module_data_root, legacy, change):
+    """Stopped between the checkpoint and header writes; then the source changes: a row appended to its metrics, or
+    the source run resumed on its own schedule to step 8 (a newer checkpoint, its log and rows). The re-run completes
+    the migration of step 6 from the snapshot it copied."""
+    monkeypatch.setattr(SL, "LR_WARMUP", LR_WARMUP)
+    src = _copy_run(legacy, tmp_path, "S")
+    new = tmp_path / "N"
+    with monkeypatch.context() as m:
+        m.setattr(MIG.Migration, "_migrate_header", _stop)
+        with pytest.raises(KeyboardInterrupt):
+            MIG.migrate(str(src), str(new), TEST_LR_CYCLE_GAMES)
+    if change == "rows_appended":
+        metrics = SL.Metrics(str(src / "metrics.jsonl"))
+        header, rows = metrics.read()
+        metrics._write([header] + rows + [dict(rows[-1], step=rows[-1]["step"] + 1)])
+    else:
+        _run(tmp_path, monkeypatch, module_data_root, "S", lr_cycle_games=None, stop_after_step=8)
+        assert SL.find_latest_checkpoint(str(src / "checkpoints"))[0] == 8
+    assert MIG.migrate(str(src), str(new), TEST_LR_CYCLE_GAMES) == "migrated the header"
+    assert_migrated(new, legacy)
+    assert MIG.migrate(str(src), str(new), TEST_LR_CYCLE_GAMES) == "already migrated: nothing to do"
