@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from MahjongAI import supervised_learning as SL
-from MahjongAI.tests.conftest import read_only_run, run_log
+from MahjongAI.tests.conftest import TEST_LR_CYCLE_GAMES, read_only_run, run_log
 
 
 class Schedule(NamedTuple):
@@ -50,7 +50,8 @@ def _run(tmp_path, monkeypatch, root, name, arch=(64, 1)):
     sc = SCHEDULES[arch]
     # the 128 x 2 init model sits 0.059 below uniform-legal on the fixture's post head: the T-010 run's --row0-tol 0.1
     SL.train("encoder_conv", sc.steps, str(run_dir), log, eval_every=sc.eval_every, save_every=sc.save_every,
-             embd_size=arch[0], n_layers=arch[1], row0_tol=0.1 if arch != (64, 1) else None)
+             embd_size=arch[0], n_layers=arch[1], row0_tol=0.1 if arch != (64, 1) else None,
+             lr_cycle_games=TEST_LR_CYCLE_GAMES)
     return run_dir
 
 

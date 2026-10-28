@@ -10,7 +10,9 @@ unbroken run; the second one's stop checkpoint equals the unbroken run's checkpo
 after a commit and before the update's RNG snapshot and train sums are final saves no checkpoint; a failure after an
 eval row is on disk resumes with that row's interval closed. Both resume to the unbroken run.
 Stop bound (T-056): --stop-after-step stops after update K with a checkpoint of step K equal to the unbroken run's,
-on the same LR horizon, and no worker left; the resume ends equal to the unbroken run.
+and no worker left; the resume ends equal to the unbroken run. T-067 (T4): K is past the LR warmup, inside the cosine
+over games read; the resume's LR series (step lines), counters, sample identities, RNG and weights are exact, and a
+resume that counts g from the checkpoint (the negative control) fails the comparison.
 Counters: every eval row's per-source-epoch counters (games, rows in / out per head) equal an independent reference
 over the trainer's loader order (prepare_batches per game, the plain-Python emit rule).
 Identity: batch mode, sizes and device are run-identity keys; a config without them reads as games mode on the CPU."""
@@ -26,26 +28,30 @@ import torch
 
 from MahjongAI import supervised_learning as SL
 from MahjongAI.agents.encoder_conv import TransformerTensorProcessor
-from MahjongAI.tests.conftest import read_only_run, run_log
+from MahjongAI.tests.conftest import TEST_LR_CYCLE_GAMES, read_only_run, run_log
 from MahjongAI.tests.test_position_batcher import epoch_counter_problems, reference_steps
 from MahjongAI.tests.test_resume_rows import _assert_equal
 
 STEPS, EVAL_EVERY, SAVE_EVERY = 12, 5, 4  # rows 0, 5, 10, 12; checkpoints 4, 8, 12
 SIZES = {"during": 60, "discard": 1600, "post": 400}  # ~3-4 fixture games a step: 12 steps cross epoch 0
+# T-067: a 3-update warmup and TEST_LR_CYCLE_GAMES (horizon 32 games): a 12-step run crosses warmup, the cosine, the
+# horizon end and the floor, so every resume comparison here covers the whole LR schedule
+LR_WARMUP = 3
 
 
 def _run(tmp_path, monkeypatch, root, name, steps=STEPS, save_every=SAVE_EVERY, sizes=SIZES, device="cpu",
-         batch_mode="positions", stop_after_step=None, **arch):
+         batch_mode="positions", stop_after_step=None, lr_cycle_games=TEST_LR_CYCLE_GAMES, **arch):
     """arch: embd_size / n_layers / row0_tol of SL.train (the defaults when absent)."""
     monkeypatch.setattr(SL, "DATA_ROOT", root)
     monkeypatch.setattr(SL, "VAL_GAMES", 2)
     monkeypatch.setattr(SL, "PRIOR_GAMES", 2)
+    monkeypatch.setattr(SL, "LR_WARMUP", LR_WARMUP)
     threads = torch.get_num_threads()
     try:
         SL.train("encoder_conv", steps, str(tmp_path / name), SL.RunLog(str(tmp_path / f"{name}.log")),
                  eval_every=EVAL_EVERY, save_every=save_every, batch_mode=batch_mode,
                  position_sizes=sizes if batch_mode == "positions" else None, device=device,
-                 stop_after_step=stop_after_step, **arch)
+                 stop_after_step=stop_after_step, lr_cycle_games=lr_cycle_games, **arch)
     finally:
         torch.set_num_threads(threads)
     return tmp_path / name
@@ -194,9 +200,9 @@ def test_stop_inside_a_fill_resumes_to_the_unbroken_run(tmp_path, monkeypatch, m
 
 def test_failure_after_the_forward_before_the_commit_keeps_the_step(tmp_path, monkeypatch, module_data_root, unbroken):
     """Update 7 fails in clip_grad_norm_ (after its forward and backward). The stop checkpoint is step_6.pt: model,
-    optimizer, scheduler, RNG (from before the failed forward), train sums and the committed counters equal the
-    unbroken run's step_6.pt; the buffers stay whole [R2] (the unbroken step_6 rows, then the rows of the games step
-    7's fill drew, in order). The resume ends equal to the unbroken run."""
+    optimizer (its LR included), last update, RNG (from before the failed forward), train sums and the committed
+    counters equal the unbroken run's step_6.pt; the buffers stay whole [R2] (the unbroken step_6 rows, then the rows
+    of the games step 7's fill drew, in order). The resume ends equal to the unbroken run."""
     clip, calls = torch.nn.utils.clip_grad_norm_, [0]
 
     def fail_once(*a, **k):
@@ -230,12 +236,20 @@ def test_failure_after_the_forward_before_the_commit_keeps_the_step(tmp_path, mo
     assert_runs_equal(unbroken, tmp_path / "b", (8, 12))
 
 
+@pytest.mark.parametrize("bug", [None, "games_reset_on_resume"])
 def test_stop_after_step_saves_step_k_and_resumes_to_the_unbroken_run(tmp_path, monkeypatch, module_data_root,
-                                                                       unbroken):
+                                                                       unbroken, bug):
     """--stop-after-step 6 (not an eval or save step of run b): train returns normally, step_6.pt equals the
-    unbroken run's step_6.pt in every field (scheduler and LR on the 12-step horizon, train sums of the open
-    interval, batcher state, RNG), no worker process is left; a start without the bound resumes at step 6 and ends
-    equal to the unbroken run. A second start with the same bound stops at once and saves nothing new."""
+    unbroken run's step_6.pt in every field (optimizer state with the LR of update 6, the last update's LR and games,
+    train sums of the open interval, batcher state, RNG), no worker process is left; a start without the bound
+    resumes at step 6 and ends equal to the unbroken run. A second start with the same bound stops at once and saves
+    nothing new. Update 6 is past the warmup and inside the cosine; the updates after it reach the floor (T-067)."""
+    lr_at, lines = SL.lr_at, step_lines(run_log(unbroken))
+    lr_games = {s: re.search(r" \| lr (\S+) games (\d+) \| ", ln).groups() for s, ln in lines.items()}
+    horizon = TEST_LR_CYCLE_GAMES * SL.LR_CYCLES
+    lr6, g6 = float(lr_games[6][0]), int(lr_games[6][1])
+    assert 6 - 1 >= LR_WARMUP and SL.LR_FLOOR < lr6 < SL.LR_PEAK and g6 < horizon, lr_games[6]
+    assert float(lr_games[12][0]) == SL.LR_FLOOR and int(lr_games[12][1]) >= horizon, lr_games[12]
     b = _run(tmp_path, monkeypatch, module_data_root, "b", stop_after_step=6)
     assert not multiprocessing.active_children(), multiprocessing.active_children()
     log = open(tmp_path / "b.log").read()
@@ -248,10 +262,20 @@ def test_stop_after_step_saves_step_k_and_resumes_to_the_unbroken_run(tmp_path, 
     _run(tmp_path, monkeypatch, module_data_root, "b", stop_after_step=6)
     assert os.path.getmtime(b / "checkpoints" / "step_6.pt") == mtime
     assert len(step_lines(tmp_path / "b.log")) == 6  # no update after the bound
-    _run(tmp_path, monkeypatch, module_data_root, "b")
+    with monkeypatch.context() as m:
+        if bug:  # g counted from the resume: the checkpoint's games lost
+            base = SL.games_read_of_state(torch.load(b / "checkpoints" / "step_6.pt", weights_only=True))
+            m.setattr(SL, "lr_at", lambda g, k, s: lr_at(g - base, k, s))
+        _run(tmp_path, monkeypatch, module_data_root, "b")
     assert "resuming at step 6;" in open(tmp_path / "b.log").read()
     assert "Training completed." in open(tmp_path / "b.log").read()
-    assert_runs_equal(unbroken, tmp_path / "b", (4, 8, 12))
+    if bug:
+        with pytest.raises(AssertionError):
+            assert_runs_equal(unbroken, tmp_path / "b", (4, 8, 12))
+        lines_b = step_lines(tmp_path / "b.log")
+        assert lines_b[7] != lines[7] and lines_b[7].split(" | lr ")[1] != lines[7].split(" | lr ")[1]
+    else:
+        assert_runs_equal(unbroken, tmp_path / "b", (4, 8, 12))
 
 
 class InterruptAtLine:

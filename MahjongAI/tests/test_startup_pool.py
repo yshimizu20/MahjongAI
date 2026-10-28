@@ -18,6 +18,7 @@ from MahjongAI import supervised_learning as SL
 from MahjongAI.agents.encoder_conv import PrebuiltGame, TransformerTensorProcessor
 from MahjongAI.process_xml import process
 from MahjongAI.utils.dataloader import DataLoader, UnexpectedSkip
+from MahjongAI.tests.conftest import TEST_LR_CYCLE_GAMES
 from MahjongAI.utils.game_workers import DataWorkerError, GameWorkers
 
 
@@ -240,7 +241,8 @@ def test_errors_around_the_accepted_prefix_boundary_equal_serial(monkeypatch, wi
 
 # ---------------------------------------------------------------- lifecycle of every startup phase
 def _train(tmp_path, steps=2):
-    SL.train("encoder_conv", steps, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 1, 1)
+    SL.train("encoder_conv", steps, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 1, 1,
+             lr_cycle_games=TEST_LR_CYCLE_GAMES)
 
 
 @pytest.fixture

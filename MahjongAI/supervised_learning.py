@@ -14,6 +14,13 @@ is both an eval and a save step evals (row written) first, then saves. The final
 a --stop-after-step stop at an earlier step keeps the schedule and adds a checkpoint of that step (no extra eval
 row).
 
+LR schedule (T-067, games_cosine_v1): lr_at(g, k), keyed to the games read g, not to total_steps: a linear warmup over
+LR_WARMUP updates, then one cosine from LR_PEAK to LR_FLOOR over LR_CYCLES passes of the corpus (LR_CYCLE_GAMES games
+each; another corpus needs --lr-cycle-games), held at LR_FLOOR after. A pause, a resume or a longer total_steps never
+moves the curve. Each step log line has the LR its update applied and g (`lr <lr> games <g>`); each eval row has
+`games_read` and `lr` of its last update. A run dir written before T-067 resumes on its steps_cosine schedule (cosine
+to 0 at total_steps); python -m MahjongAI.migrate_lr_schedule switches one to games_cosine_v1 in a new run dir.
+
 Run dir: train.log, metrics.jsonl (a header row, then one row per eval), checkpoints/step_<s>.pt. Starting again on
 the same run dir resumes from its latest checkpoint: the run config and the val ids must match (total_steps may
 change; a config written before T-010 has no architecture keys and reads as 64 x 1), rows of a later step are dropped,
@@ -99,6 +106,20 @@ DEVICES = ("cpu", "mps")
 # T-055: the run-identity keys of a config written before T-055 (2-game batches on the CPU)
 LEGACY_RUN = {"batch_mode": "games", "position_sizes": None, "device": "cpu"}
 MPS_MEMORY_EVERY = 100  # steps between the MPS memory log lines (T-055)
+# T-067: the LR schedule keyed to GAMES READ (lr_at): linear warmup over LR_WARMUP updates, then one cosine from
+# LR_PEAK to LR_FLOOR over LR_CYCLES passes of LR_CYCLE_GAMES games, held at LR_FLOOR after. total_steps is only the
+# stop point. Every value is in the run identity (config["lr_schedule"]).
+LR_SCHEDULE = "games_cosine_v1"
+LR_CYCLE_GAMES = 225_176  # one pass of the 2021 corpus: epoch-0 games_admitted of the T-061 128x2 run's step_94000.pt
+LR_CYCLE_CORPUS = "fbe702b00b96e85df0df1bdd7b230c1f8067aae1fb95c5f0140d2118ed992625"  # its train_files_sha256
+# and its acceptance policy (that run's expected_skips, frozen here): the default count holds for both only
+LR_CYCLE_SKIPS = ["invalid:Against human", "invalid:Auto-played seat", "invalid:BYE", "invalid:Kansaki",
+                  "invalid:Own-turn action after own discard", "invalid:Red tiles", "invalid:Three players"]
+LR_CYCLES = 2  # horizon: 450,352 games
+LR_PEAK, LR_FLOOR = learning_rate, 1e-4
+LR_WARMUP = 1000  # updates
+# a config written before T-067 has no lr_schedule: the warmup + cosine to 0 at total_steps over updates (LambdaLR)
+LEGACY_LR_SCHEDULE = {"name": "steps_cosine"}
 
 
 class RunLog:
@@ -391,8 +412,52 @@ def with_legacy_arch(config: dict) -> dict:
 
 
 def with_legacy_run(config: dict) -> dict:
-    """with_legacy_arch, and the LEGACY_RUN value of each T-055 key the config does not have (games, cpu)."""
-    return {**LEGACY_RUN, **with_legacy_arch(config)}
+    """with_legacy_arch, and the LEGACY_RUN value of each T-055 key the config does not have (games, cpu); a config
+    without lr_schedule reads as steps_cosine (T-067)."""
+    return {**LEGACY_RUN, "lr_schedule": dict(LEGACY_LR_SCHEDULE), **with_legacy_arch(config)}
+
+
+def lr_at(g: int, k: int, schedule: dict) -> float:
+    """The LR of a games_cosine_v1 update (T-067): k = the updates completed before it, g = the games read when it
+    runs (after its data admission). Linear warmup over the first `warmup` updates (k = 0 gives 0, as LambdaLR did),
+    then a cosine from `peak` to `floor` over cycles x cycle_games games, held at `floor` after."""
+    if k < schedule["warmup"]:
+        return schedule["peak"] * k / schedule["warmup"]
+    t = min(g / (schedule["cycles"] * schedule["cycle_games"]), 1.0)
+    return schedule["floor"] + (schedule["peak"] - schedule["floor"]) * 0.5 * (1.0 + math.cos(math.pi * t))
+
+
+def games_cosine_schedule(train_sha256: str, expected_skips, lr_cycle_games: int = None) -> dict:
+    """config["lr_schedule"] of a games_cosine_v1 run. lr_cycle_games None: LR_CYCLE_GAMES, which holds only for the
+    corpus it was counted on (LR_CYCLE_CORPUS under LR_CYCLE_SKIPS); another corpus needs --lr-cycle-games N."""
+    if lr_cycle_games is None:
+        assert train_sha256 == LR_CYCLE_CORPUS and sorted(expected_skips) == LR_CYCLE_SKIPS, (
+            f"train_files_sha256 {train_sha256} / expected_skips {sorted(expected_skips)} is not the corpus "
+            f"LR_CYCLE_GAMES {LR_CYCLE_GAMES} was counted on ({LR_CYCLE_CORPUS}, {LR_CYCLE_SKIPS}): give "
+            "--lr-cycle-games N, the games one pass of this corpus admits")
+        lr_cycle_games = LR_CYCLE_GAMES
+    assert isinstance(lr_cycle_games, int) and lr_cycle_games >= 1, f"lr_cycle_games {lr_cycle_games!r}: must be >= 1"
+    return {"name": LR_SCHEDULE, "cycle_games": lr_cycle_games, "cycles": LR_CYCLES, "peak": LR_PEAK,
+            "floor": LR_FLOOR, "warmup": LR_WARMUP}
+
+
+def games_read(cluster: DataLoaderCluster, batcher) -> int:
+    """g of the LR schedule (T-067): games read so far, whole run (every epoch, across resumes). Positions mode: the
+    games the batcher admitted; games mode: the games the loaders returned in batches (a no-sample batch included)."""
+    if batcher is not None:
+        return sum(batcher.games_admitted.values())
+    return sum(dl.accepted for dl in cluster.dataloaders)
+
+
+def games_read_of_state(checkpoint: dict) -> int:
+    """games_read of the run state a checkpoint holds; an AssertionError when it has no trustworthy counter (a
+    games-mode loader state written before T-045 has no `accepted`)."""
+    if "batcher_state" in checkpoint:
+        return sum(checkpoint["batcher_state"]["games_admitted"].values())
+    loaders = checkpoint["loader_state"]["loaders"]
+    missing = [i for i, s in enumerate(loaders) if "accepted" not in s]
+    assert not missing, f"loader states {missing} have no `accepted` counter (written before T-045): no games count"
+    return sum(s["accepted"] for s in loaders)
 
 
 def config_mismatch(saved: dict, current: dict) -> dict:
@@ -464,15 +529,31 @@ def find_latest_checkpoint(checkpoint_dir: str):
     return max(found) if found else (0, None)
 
 
+def migration_staging(run_dir: str) -> str:
+    """The folder migrate_lr_schedule copies a run into before it renames it to run_dir (T-067)."""
+    return os.path.normpath(run_dir) + ".migrating"
+
+
+def refuse_interrupted_migration(run_dir: str):
+    """A start on a run dir without a checkpoint while its migration_staging folder exists would start a fresh run in
+    place of the migrated one: refused before anything is written (the CLI and _train call it before creating the
+    run dir)."""
+    assert find_latest_checkpoint(os.path.join(run_dir, "checkpoints"))[1] or not os.path.exists(
+        migration_staging(run_dir)), (f"{migration_staging(run_dir)} exists: an interrupted lr-schedule migration into "
+                                      f"{run_dir}; re-run python -m MahjongAI.migrate_lr_schedule")
+
+
 def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_every: int = EVAL_EVERY_STEPS,
           save_every: int = SAVE_EVERY_STEPS, expect_prior_ce=None, expect_shanten=None, embd_size: int = EMBD_SIZE,
           n_layers: int = N_LAYERS, row0_tol: float = None, batch_mode: str = "games", position_sizes: dict = None,
           device: str = "cpu", stop_after_step: int = None, phase_timing: bool = False, measure_window: tuple = None,
-          data_workers: int = None, data_prefetch: int = None, torch_threads: int = None):
+          data_workers: int = None, data_prefetch: int = None, torch_threads: int = None,
+          lr_cycle_games: int = None):
     """position_sizes: {head: step size N} of positions mode (default DEFAULT_SIZES): a step takes N discard rows and
     0, N or 2 N during / post rows (position_batcher.side_take); games mode takes none.
     stop_after_step: stop once this many updates are done (after that step's eval / save), with a checkpoint of that
-    step; total_steps stays the LR horizon, so a resume continues the same schedule (T-056). None: run to total_steps.
+    step; the LR schedule does not move, so a resume continues it (T-056; a steps_cosine run keeps total_steps as its
+    horizon). None: run to total_steps.
     phase_timing: positions mode only, a PhaseProbe (utils/phase_probe.py) marks each operation of the step, eval and
     save, and the marks give each step's phase times, one `phase-time` line per step (utils/phase_timing.py, T-057); a
     mark syncs the device (MPS). No run-identity key: the training math is unchanged.
@@ -484,7 +565,11 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     data_workers / data_prefetch / torch_threads (T-061): None = DATA_WORKERS / DATA_PREFETCH / TORCH_THREADS; each
     >= 1. The workers' count and prefetch window change no batch (the loaders own the order) and are no run-identity
     key; torch_threads is one (the config records the value used; it changes the float reduction order). The startup
-    pools (prior, validation) keep PRIOR_WORKERS / PRIOR_PREFETCH; the data workers keep one torch thread each."""
+    pools (prior, validation) keep PRIOR_WORKERS / PRIOR_PREFETCH; the data workers keep one torch thread each.
+    lr_cycle_games (T-067, --lr-cycle-games): the games of one pass, for a corpus other than LR_CYCLE_CORPUS (None: the
+    recorded LR_CYCLE_GAMES, refused on another corpus); a run-identity key (config["lr_schedule"]). A run dir whose
+    checkpoint has no lr_schedule resumes on its steps_cosine schedule (no lr_cycle_games); migrate_lr_schedule
+    switches one to games_cosine_v1 in a new run dir."""
     row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
     assert batch_mode in BATCH_MODES and device in DEVICES, (batch_mode, device)
     if batch_mode == "positions":
@@ -495,14 +580,14 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     assert batch_mode == "positions" or not phase_timing, "phase timing is a positions-mode setting"
     assert batch_mode == "positions" or measure_window is None, "the measure window is a positions-mode setting"
     for name, value in (("data_workers", data_workers), ("data_prefetch", data_prefetch),
-                        ("torch_threads", torch_threads)):
+                        ("torch_threads", torch_threads), ("lr_cycle_games", lr_cycle_games)):
         assert value is None or (isinstance(value, int) and value >= 1), f"{name} {value!r}: must be an integer >= 1"
     torch_threads = TORCH_THREADS if torch_threads is None else torch_threads
     workers = make_workers(timing=phase_timing or measure_window is not None, n=data_workers, prefetch=data_prefetch)
     try:
         _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
                embd_size, n_layers, row0_tol, batch_mode, position_sizes, torch.device(device),
-               stop_after_step, phase_timing, measure_window, torch_threads)
+               stop_after_step, phase_timing, measure_window, torch_threads, lr_cycle_games)
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
@@ -512,8 +597,9 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
            expect_prior_ce, expect_shanten, workers, embd_size: int, n_layers: int,
            row0_tol: float, batch_mode: str, position_sizes, device: torch.device,
            stop_after_step, phase_timing: bool = False, measure_window: tuple = None,
-           torch_threads: int = TORCH_THREADS):
+           torch_threads: int = TORCH_THREADS, lr_cycle_games: int = None):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    refuse_interrupted_migration(run_dir)
     os.makedirs(checkpoint_dir, exist_ok=True)
     metrics = Metrics(os.path.join(run_dir, "metrics.jsonl"))
     torch.set_num_threads(torch_threads)
@@ -538,18 +624,37 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     eval_model = model if device.type == "cpu" else copy.deepcopy(model).to("cpu")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    warmup_steps = min(1000, total_steps // 10)  # a 300-step smoke must leave warmup; a 1,100-step run must not collapse
-
-    def lr_lambda(step: int) -> float:  # linear warmup, then cosine decay to ~0 at total_steps
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / float(max(1, total_steps - warmup_steps))))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     cluster = train_cluster(log, batch_size, workers)
     dataloaders = cluster.dataloaders
     batcher = PositionBatcher(cluster, position_sizes) if batch_mode == "positions" else None
+    train_sha256 = train_files_sha256(cluster)
+
+    # T-067: the LR schedule, before any startup work (the corpus guard stops a run early). A checkpoint without
+    # lr_schedule (written before T-067) resumes on its steps_cosine schedule; a fresh run and a games_cosine_v1 run
+    # get games_cosine_schedule, which the identity check below compares with the checkpoint's.
+    latest_step, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
+    checkpoint = torch.load(latest_checkpoint, map_location="cpu", weights_only=True) if latest_checkpoint else None
+    if checkpoint is not None and with_legacy_run(checkpoint["config"])["lr_schedule"] == LEGACY_LR_SCHEDULE:
+        assert lr_cycle_games is None, (
+            f"{latest_checkpoint} is a steps_cosine run (before T-067): --lr-cycle-games is a {LR_SCHEDULE} setting; "
+            "resume it without, or switch it first with python -m MahjongAI.migrate_lr_schedule")
+        lr_schedule = dict(LEGACY_LR_SCHEDULE)
+    else:
+        lr_schedule = games_cosine_schedule(train_sha256, EXPECTED_SKIPS, lr_cycle_games)
+    scheduler = None  # games_cosine_v1: the LR is set right before each optimizer.step() (lr_at)
+    if lr_schedule == LEGACY_LR_SCHEDULE:
+        # a 300-step smoke must leave warmup; a 1,100-step run must not collapse
+        warmup_steps = min(1000, total_steps // 10)
+
+        def lr_lambda(step: int) -> float:  # linear warmup, then cosine decay to ~0 at total_steps
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * (step - warmup_steps) / float(max(1, total_steps - warmup_steps))))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    log(f"LR schedule {lr_schedule}" + (f" (horizon {lr_schedule['cycles'] * lr_schedule['cycle_games']:,} games)"
+                                        if scheduler is None else f" (cosine to 0 at total_steps {total_steps})"))
     val = ValSet.load(log)
     train_ids = {os.path.basename(f) for dl in dataloaders for f in dl.file_list}
     assert not train_ids & set(val.ids), f"train and validation games overlap: {sorted(train_ids & set(val.ids))[:5]}"
@@ -557,36 +662,42 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     config = {
         "model": model_name, "total_steps": total_steps, "batch_size": batch_size, "lr": learning_rate,
         "train_years": list(TRAIN_YEARS), "data_seed": DATA_SEED, "model_seed": MODEL_SEED,
-        "train_files": sum(len(dl.file_list) for dl in dataloaders), "train_files_sha256": train_files_sha256(cluster),
+        "train_files": sum(len(dl.file_list) for dl in dataloaders), "train_files_sha256": train_sha256,
         "val_year": VAL_YEAR, "val_days": list(VAL_DAYS), "val_games": VAL_GAMES, "val_seed": VAL_SEED,
         "prior_games": PRIOR_GAMES, "prior_seed": PRIOR_SEED, "prior_l2": PRIOR_L2,
         "expected_skips": sorted(EXPECTED_SKIPS), "torch_threads": torch_threads,
         "embd_size": embd_size, "n_layers": n_layers, "n_params": n_params,
         "batch_mode": batch_mode, "position_sizes": position_sizes, "device": device.type,
+        "lr_schedule": lr_schedule,
     }
 
     current_step, rows, header = 0, [], None
     train_sums = {h: [0.0, 0] for h in HEADS}  # train-mode batch loss x n, n; since the last eval row
-    latest_step, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
+    # T-067: {"lr", "games"} of the last update (the LR it applied, the games read when it ran), None before the first
+    # (or from a checkpoint written before T-067); the switches of the LR schedule (migrate_lr_schedule), oldest first
+    last_update, schedule_history = None, []
     if latest_checkpoint:
-        checkpoint = torch.load(latest_checkpoint, map_location="cpu", weights_only=True)
         mismatch = config_mismatch(checkpoint["config"], config)
         assert not mismatch, (f"{latest_checkpoint} is from another run config: {_mismatch_text(mismatch)}; "
                               "resume with the same config or start a new run dir")
         assert checkpoint["val_ids"] == val.ids, f"{latest_checkpoint}: validation games differ"
         if checkpoint["config"]["total_steps"] != total_steps:
-            log(f"total_steps {checkpoint['config']['total_steps']} -> {total_steps} (cosine horizon recomputed)")
+            log(f"total_steps {checkpoint['config']['total_steps']} -> {total_steps} "
+                + ("(cosine horizon recomputed)" if scheduler is not None else "(the stop point only: the LR follows "
+                   "the games read)"))
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])  # moves its state to the parameters' device
         misplaced = {k for state in optimizer.state.values() for k, v in state.items()
                      if torch.is_tensor(v) and k != "step" and v.device.type != device.type}
         assert not misplaced, f"optimizer state {sorted(misplaced)} is not on {device} after the load"
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        # The optimizer state restores the LR of the saved schedule; recompute it on THIS run's horizon
-        # (total_steps may have changed) so the first resumed update already uses it.
-        for group, base_lr in zip(optimizer.param_groups, scheduler.base_lrs):
-            group["lr"] = base_lr * lr_lambda(scheduler.last_epoch)
-        scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
+        if scheduler is not None:  # steps_cosine (before T-067)
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            # The optimizer state restores the LR of the saved schedule; recompute it on THIS run's horizon
+            # (total_steps may have changed) so the first resumed update already uses it.
+            for group, base_lr in zip(optimizer.param_groups, scheduler.base_lrs):
+                group["lr"] = base_lr * lr_lambda(scheduler.last_epoch)
+            scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
+        last_update, schedule_history = checkpoint.get("last_update"), checkpoint.get("schedule_history", [])
         cluster.load_state_dict(checkpoint["loader_state"])
         if batcher is not None:
             batcher.load_state_dict(checkpoint["batcher_state"])
@@ -598,8 +709,17 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         header, _ = metrics.read()
         assert header is not None, f"{metrics.path} is missing: cannot resume a run without its header"
         mismatch = config_mismatch(header["config"], config)
+        # a migration stopped between its checkpoint write and its header write (T-067): only lr_schedule differs
+        interrupted = (set(mismatch) == {"lr_schedule"} and bool(schedule_history)
+                       and with_legacy_run(header["config"])["lr_schedule"] == LEGACY_LR_SCHEDULE)
+        assert not interrupted, (
+            f"{metrics.path} header is steps_cosine, {latest_checkpoint} {lr_schedule['name']}: an interrupted "
+            f"lr-schedule migration; re-run python -m MahjongAI.migrate_lr_schedule <source run dir> {run_dir}")
         assert not mismatch and header["val_ids"] == val.ids, (
             f"{metrics.path} header is from another run" + (f": {_mismatch_text(mismatch)}" if mismatch else ""))
+        assert header.get("schedule_history", []) == schedule_history, (
+            f"{metrics.path} header schedule_history {header.get('schedule_history', [])} != {latest_checkpoint}'s "
+            f"{schedule_history}")
         rows = metrics.truncate_after(current_step)
         if any(r["step"] == current_step for r in rows):
             # row current_step is on disk, so its interval is closed: a stop after the row's write and before the
@@ -727,8 +847,10 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             assert all(abs(v) <= row0_tol for v in gaps.values()), f"row 0 is not near uniform-legal: {gaps}"
         bad = {h: heads[h]["ce"] for h in HEADS if not math.isfinite(heads[h]["ce"])}
         assert not bad, f"non-finite val CE at step {current_step}: {bad}"
+        # T-067: the games read and the LR of the row's last update (row 0: the games read so far, no LR)
         row = {"type": "eval", "step": current_step, "total_steps": total_steps,
-               "lr": optimizer.param_groups[0]["lr"], "heads": heads}
+               "games_read": games_read(cluster, batcher) if last_update is None else last_update["games"],
+               "lr": None if last_update is None else last_update["lr"], "heads": heads}
         if batcher is not None:
             row["positions"] = batcher.report()
             log(f"step {current_step} | positions: games admitted {row['positions']['games_admitted']}, buffered "
@@ -749,7 +871,9 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         state = {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
+            **({} if scheduler is None else {"scheduler_state_dict": scheduler.state_dict()}),  # steps_cosine only
+            "last_update": last_update,
+            "schedule_history": schedule_history,
             "current_step": current_step,
             "loader_state": cluster.state_dict(),
             "prior_bias": bias,
@@ -768,8 +892,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         if probe is not None:
             probe.mark("save")
 
-    # total_steps counts optimizer UPDATES: a batch without samples does not consume the budget, so the
-    # cosine horizon and the number of updates agree. A persistent data failure aborts.
+    # total_steps counts optimizer UPDATES: a batch without samples does not consume the budget (on a steps_cosine
+    # run, the cosine horizon and the number of updates agree). A persistent data failure aborts.
     batches_without_update = 0
     consistent = True  # False from optimizer.step() until the step count, RNG snapshot and train sums match the update
     step_rng = None  # positions mode: the RNG state before the forward of a step not committed yet
@@ -847,12 +971,20 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             consistent = False
             if timer is not None:
                 timer.begin("opt_step")
+            # T-067: g after this update's data admission (games mode: its batches; positions mode: its peek), the LR
+            # set right before the step (games_cosine_v1; a steps_cosine run's LambdaLR set it at the last step)
+            g = games_read(cluster, batcher)
+            if scheduler is None:
+                for group in optimizer.param_groups:
+                    group["lr"] = lr_at(g, current_step, lr_schedule)
+            last_update = {"lr": optimizer.param_groups[0]["lr"], "games": g}
             optimizer.step()
             if probe is not None:
                 probe.mark("opt_step")
             if timer is not None:
                 timer.begin("sched_step")
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
             if probe is not None:
                 probe.mark("sched_step")
             if window is not None:  # the update's completion: the window's endpoint time (a sync on MPS)
@@ -881,7 +1013,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             else:  # the files admitted since the last update, and the provenance of the rows this update trained on
                 trace = f" | read {batch_files_hash(read)} | sample {sample_digest}"
             log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results)
-                + trace)
+                + f" | lr {last_update['lr']!r} games {last_update['games']}" + trace)
             consumed = []
             if current_step % MPS_MEMORY_EVERY == 0:
                 log_mps_memory()
@@ -948,6 +1080,7 @@ def run_header(args) -> str:
             f"save every {args.save_every}, embd_size {args.embd_size}, n_layers {args.n_layers}, batch mode "
             f"{args.batch_mode}, device {args.device})"
             + (f", stop after step {args.stop_after_step}" if args.stop_after_step is not None else "")
+            + (f", lr cycle games {args.lr_cycle_games}" if args.lr_cycle_games is not None else "")
             + (", phase timing" if args.phase_timing else "")
             + (f", measure window {args.measure_window[0]},{args.measure_window[1]}" if args.measure_window else "")
             + (f", data workers {DATA_WORKERS if args.data_workers is None else args.data_workers}, data prefetch "
@@ -996,7 +1129,7 @@ if __name__ == "__main__":
                              f"{','.join(str(DEFAULT_SIZES[h]) for h in HEADS)})")
     parser.add_argument("--device", choices=DEVICES, default="cpu", help="training device (validation: the CPU)")
     parser.add_argument("--stop-after-step", type=int, default=None, metavar="K",
-                        help="stop after update K with a checkpoint; max_steps stays the LR horizon (T-056)")
+                        help="stop after update K with a checkpoint; the LR schedule does not move (T-056, T-067)")
     parser.add_argument("--phase-timing", action="store_true",
                         help="positions mode: one line per step with the time of each phase (wait, admit, transfer, "
                              "forward, backward, update, overhead), from the phase probe's marks (a device sync each; "
@@ -1012,6 +1145,9 @@ if __name__ == "__main__":
     parser.add_argument("--torch-threads", type=positive_int, default=None, metavar="T",
                         help=f"the trainer's torch threads, training and CPU eval (default {TORCH_THREADS}; T-061); a "
                              "run-identity key: a resume needs the same T")
+    parser.add_argument("--lr-cycle-games", type=positive_int, default=None, metavar="N",
+                        help=f"games of one pass of the corpus, for the LR schedule (default {LR_CYCLE_GAMES:,}, only "
+                             "on the corpus it was counted on; T-067); a run-identity key: a resume needs the same N")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -1038,6 +1174,7 @@ if __name__ == "__main__":
 
     run_dir = args.run_dir = (args.run_dir or os.path.join(
         "runs", f"{args.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+    refuse_interrupted_migration(run_dir)  # before the run dir and its train.log exist (T-067)
     os.makedirs(run_dir, exist_ok=True)
     log = RunLog(os.path.join(run_dir, "train.log"))
     log(run_header(args))
@@ -1046,7 +1183,7 @@ if __name__ == "__main__":
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
               args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol,
               args.batch_mode, args.position_sizes, args.device, args.stop_after_step, args.phase_timing,
-              args.measure_window, args.data_workers, args.data_prefetch, args.torch_threads)
+              args.measure_window, args.data_workers, args.data_prefetch, args.torch_threads, args.lr_cycle_games)
 
     if args.profile:
         pr = cProfile.Profile()
