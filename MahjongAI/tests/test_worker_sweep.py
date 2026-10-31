@@ -54,7 +54,8 @@ def test_absent_flags_equal_the_explicit_defaults(tmp_path, monkeypatch, train_d
     assert set(ha["config"]) == {"model", "total_steps", "batch_size", "lr", "train_years", "data_seed", "model_seed",
                                  "train_files", "train_files_sha256", "val_year", "val_days", "val_games", "val_seed",
                                  "prior_games", "prior_seed", "prior_l2", "expected_skips", "torch_threads",
-                                 "embd_size", "n_layers", "n_params", "batch_mode", "position_sizes", "device"}
+                                 "embd_size", "n_layers", "n_params", "batch_mode", "position_sizes", "device",
+                                 "lr_schedule"}
     _assert_equal({k: v for k, v in ha.items() if k != "started"}, {k: v for k, v in hb.items() if k != "started"},
                   "header")
     _assert_equal(rows_a, rows_b, "rows")
@@ -102,7 +103,7 @@ def _args(**kw):
     base = dict(model_name="encoder_conv", max_steps=100, run_dir="runs/x", eval_every=50, save_every=50,
                 embd_size=64, n_layers=1, batch_mode="positions", device="mps", stop_after_step=None,
                 phase_timing=False, measure_window=(2, 3), profile=False, data_workers=None, data_prefetch=None,
-                torch_threads=None)
+                torch_threads=None, lr_cycle_games=None)
     return argparse.Namespace(**{**base, **kw})
 
 

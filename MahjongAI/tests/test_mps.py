@@ -13,6 +13,9 @@ checkpoints are compared in full: the same keys at every level, every value exac
 and the train loss sums, which (with the val CE) are within 10 x the measured run-to-run noise of two unbroken MPS runs
 (nn.Embedding backward on MPS is not deterministic on torch 2.5.1). A resume without the optimizer state or the MPS RNG
 state, and a final checkpoint without its optimizer state or prior, with wrong Adam moments or train sums, must fail.
+The runs follow the T-067 games schedule with the small test constants (test_positions_train._run: warmup 3 updates,
+horizon 32 games), so the 12 steps cross the warmup, the cosine and the floor; the LR of every update (step lines,
+optimizer state, last_update, eval rows) is exact and equals lr_at of its games read.
 Load [R14]: an MPS checkpoint loads on the CPU in the viewer (infer.load_model) and the self-play player
 (ModelPlayer); their logits equal the CPU model of the same weights.
 Driver memory (T-056): a training loop whose batches change the token embedder's unique count U nearly every step
@@ -215,8 +218,8 @@ def noise_class(path: tuple):
 
 def checkpoint_diffs(x: dict, y: dict, names=("x", "y")) -> dict:
     """{"mismatch": [...], noise class: max |diff|} of two checkpoints: the key sets equal at every level (the
-    optimizer and scheduler states, prior_bias and train_sums included), every value exact but the noisy ones
-    (noise_class), which must be finite (an AssertionError otherwise)."""
+    optimizer state with its LR, last_update, schedule_history, prior_bias and train_sums included), every value exact
+    but the noisy ones (noise_class), which must be finite (an AssertionError otherwise)."""
     out = {"mismatch": [], **{c: 0.0 for c in FLOORS}}
 
     def walk(a, b, path):
@@ -337,22 +340,35 @@ def test_the_checkpoint_comparison_fails_a_doctored_resumed_checkpoint(mps_runs,
 
 
 def test_mps_resume_repeats_the_data_path_of_the_unbroken_mps_run(mps_runs):
-    """Exact on MPS: every step reads the same files and trains on the same rows (read hash, sample digest); the
-    loader and batcher states and the CPU and MPS RNG states of every checkpoint, and the batcher counters of every
-    row, are equal."""
-    tail = re.compile(r" \| read [0-9a-f]{12} \| sample [0-9a-f]{12}$")
+    """Exact on MPS: every step reads the same files and trains on the same rows (read hash, sample digest) at the
+    same LR and games read, each LR = lr_at of its games (T-067); the loader and batcher states, the CPU and MPS RNG
+    states and the last update's LR and games of every checkpoint, and the batcher counters, LR and games read of
+    every row, are equal."""
+    tail = re.compile(r" \| lr (\S+) games (\d+) \| read [0-9a-f]{12} \| sample [0-9a-f]{12}$")
     lines_a, lines_b = step_lines(mps_runs / "a.log"), step_lines(mps_runs / "b.log")
     assert sorted(lines_a) == sorted(lines_b) == list(range(1, 13))
-    assert {s: tail.search(ln).group() for s, ln in lines_a.items()} == {s: tail.search(ln).group()
-                                                                         for s, ln in lines_b.items()}
+    tails_a = {s: tail.search(ln) for s, ln in lines_a.items()}
+    assert {s: m.group() for s, m in tails_a.items()} == {s: tail.search(ln).group() for s, ln in lines_b.items()}
+    schedule = torch.load(mps_runs / "a" / "checkpoints" / "step_12.pt", map_location="cpu",
+                          weights_only=True)["config"]["lr_schedule"]
+    assert schedule["warmup"] < 12 and schedule["name"] == "games_cosine_v1", schedule
+    off = {s: m.groups() for s, m in tails_a.items()
+           if abs(float(m.group(1)) - SL.lr_at(int(m.group(2)), s - 1, schedule)) > 1e-12}
+    assert not off, off
+    lrs = [float(tails_a[s].group(1)) for s in range(1, 13)]
+    assert lrs[-1] == schedule["floor"] and any(schedule["floor"] < lr < schedule["peak"] for lr in lrs[schedule[
+        "warmup"]:]), lrs  # the steps cross the cosine to the floor
     for step in (4, 8, 12):
         a, b = (torch.load(mps_runs / r / "checkpoints" / f"step_{step}.pt", map_location="cpu", weights_only=True)
                 for r in ("a", "b"))
         for key in ("current_step", "loader_state", "batcher_state", "config", "val_ids", "torch_rng_state",
-                    "mps_rng_state"):
+                    "mps_rng_state", "last_update", "schedule_history"):
             _assert_equal(a[key], b[key], f"step_{step}.pt.{key}")
+        _assert_equal([g["lr"] for g in a["optimizer_state_dict"]["param_groups"]],
+                      [g["lr"] for g in b["optimizer_state_dict"]["param_groups"]], f"step_{step}.pt LR")
     rows_a, rows_b = (SL.Metrics(str(mps_runs / r / "metrics.jsonl")).read()[1] for r in ("a", "b"))
-    _assert_equal([r.get("positions") for r in rows_a], [r.get("positions") for r in rows_b], "rows positions")
+    _assert_equal([(r.get("positions"), r["lr"], r["games_read"]) for r in rows_a],
+                  [(r.get("positions"), r["lr"], r["games_read"]) for r in rows_b], "rows positions, LR, games")
 
 
 def test_val_rows_of_an_mps_run_equal_cpu_eval_of_its_weights(mps_runs, mps_root):

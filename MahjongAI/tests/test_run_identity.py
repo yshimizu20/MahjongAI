@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from MahjongAI import supervised_learning as SL
-from MahjongAI.tests.conftest import read_only_run, run_log
+from MahjongAI.tests.conftest import TEST_LR_CYCLE_GAMES, read_only_run, run_log
 
 
 def test_config_mismatch_names_the_changed_keys():
@@ -35,13 +35,14 @@ def test_resume_with_other_torch_threads_is_rejected(tmp_path, monkeypatch, trai
     threads = torch.get_num_threads()
     try:
         monkeypatch.setattr(SL, "TORCH_THREADS", 2)
-        SL.train("encoder_conv", 1, str(run_dir), log, eval_every=1, save_every=1)
+        SL.train("encoder_conv", 1, str(run_dir), log, eval_every=1, save_every=1, lr_cycle_games=TEST_LR_CYCLE_GAMES)
         assert os.path.exists(run_dir / "checkpoints" / "step_1.pt")
         monkeypatch.setattr(SL, "TORCH_THREADS", 3)
         with pytest.raises(AssertionError, match=r"another run config: torch_threads 2 -> 3;"):
-            SL.train("encoder_conv", 2, str(run_dir), log, eval_every=1, save_every=1)
+            SL.train("encoder_conv", 2, str(run_dir), log, eval_every=1, save_every=1,
+                     lr_cycle_games=TEST_LR_CYCLE_GAMES)
         monkeypatch.setattr(SL, "TORCH_THREADS", 2)  # the same config resumes (the run extended to 2 steps)
-        SL.train("encoder_conv", 2, str(run_dir), log, eval_every=1, save_every=1)
+        SL.train("encoder_conv", 2, str(run_dir), log, eval_every=1, save_every=1, lr_cycle_games=TEST_LR_CYCLE_GAMES)
         assert os.path.exists(run_dir / "checkpoints" / "step_2.pt")
     finally:
         torch.set_num_threads(threads)
@@ -71,7 +72,8 @@ def test_step_log_line_hashes_the_consumed_files_in_order(tmp_path, monkeypatch,
     monkeypatch.setattr(SL, "train_cluster", recording_cluster)
     threads = torch.get_num_threads()
     try:
-        SL.train("encoder_conv", 3, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 3, 3)
+        SL.train("encoder_conv", 3, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 3, 3,
+                 lr_cycle_games=TEST_LR_CYCLE_GAMES)
     finally:
         torch.set_num_threads(threads)
     lines = [ln for ln in open(tmp_path / "train.log") if re.search(r"\] step \d+ \| (?!val)", ln)]
@@ -103,7 +105,8 @@ def _arch_run(tmp_path, monkeypatch, train_data_root, steps, embd_size=64, n_lay
     threads = torch.get_num_threads()
     try:
         SL.train("encoder_conv", steps, str(run_dir), SL.RunLog(str(tmp_path / f"{name}.log")), eval_every=1,
-                 save_every=1, embd_size=embd_size, n_layers=n_layers, row0_tol=row0_tol)
+                 save_every=1, embd_size=embd_size, n_layers=n_layers, row0_tol=row0_tol,
+                 lr_cycle_games=TEST_LR_CYCLE_GAMES)
     finally:
         torch.set_num_threads(threads)
     return run_dir

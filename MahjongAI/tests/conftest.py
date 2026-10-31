@@ -10,7 +10,10 @@ Pool sizes of the test session (T-065, serial and xdist alike): every trainer ru
 in the trainer (PRIOR_WORKERS 0) and trains with 2 data workers (DATA_WORKERS 2). Each spawned worker imports torch,
 and CI is CPU-bound: the spawns were 71 % of the suite's CPU. Neither size is a run-identity key or changes a batch,
 row or checkpoint (test_startup_pool, test_prior_workers, test_worker_count, test_worker_sweep prove it, with sizes of
-their own). A test that claims the production sizes takes `production_pools`."""
+their own). A test that claims the production sizes takes `production_pools`.
+
+LR schedule (T-067): the fixture corpus is not the one LR_CYCLE_GAMES was counted on, so every trainer run gives
+lr_cycle_games (the CLI's --lr-cycle-games) = TEST_LR_CYCLE_GAMES unless a test sets its own."""
 import contextlib
 import hashlib
 import pathlib
@@ -20,6 +23,7 @@ import pytest
 SELF_TEST = "test_gates.py::test_gates_self_test"  # its parts: SELF_TEST[0], SELF_TEST[1], ...
 BIG_POOL = 8  # a pool of this many data workers or more takes big_pool_slot
 TEST_POOLS = {"PRIOR_WORKERS": 0, "DATA_WORKERS": 2}  # the test session's supervised_learning pool sizes (T-065)
+TEST_LR_CYCLE_GAMES = 16  # --lr-cycle-games of the test runs: horizon 32 games, inside a 12-step positions run (T-067)
 
 
 def _xdist_worker(config) -> bool:

@@ -20,6 +20,7 @@ from MahjongAI.agents.encoder_conv import EncoderConvModel, TransformerTensorPro
 from MahjongAI.utils.dataloader import DataLoader, DataLoaderCluster, UnexpectedSkip
 from MahjongAI.process_xml import InvalidGameException, process
 from MahjongAI.utils import dataloader as DL
+from MahjongAI.tests.conftest import TEST_LR_CYCLE_GAMES
 from MahjongAI.utils.game_workers import DataWorkerError, GameWorkers, RemoteError
 
 
@@ -415,10 +416,12 @@ def test_train_starts_workers_lazily_and_stops_them_on_every_stop_path(tmp_path,
     threads = torch.get_num_threads()
     try:
         if stop == "normal":
-            SL.train("encoder_conv", 3, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 3, 3)
+            SL.train("encoder_conv", 3, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 3, 3,
+                     lr_cycle_games=TEST_LR_CYCLE_GAMES)
         else:
             with pytest.raises(RuntimeError if stop == "error" else KeyboardInterrupt):
-                SL.train("encoder_conv", 3, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 3, 3)
+                SL.train("encoder_conv", 3, str(tmp_path / "run"), SL.RunLog(str(tmp_path / "train.log")), 3, 3,
+                         lr_cycle_games=TEST_LR_CYCLE_GAMES)
     finally:
         torch.set_num_threads(threads)
     w, val_pool, prior_pool = _Recorded.made
