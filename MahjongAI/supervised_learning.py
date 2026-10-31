@@ -41,6 +41,7 @@ import pstats
 import re
 import signal
 import subprocess
+import threading
 from datetime import datetime
 from typing import NamedTuple
 
@@ -108,6 +109,9 @@ DEVICES = ("cpu", "mps")
 # T-055: the run-identity keys of a config written before T-055 (2-game batches on the CPU)
 LEGACY_RUN = {"batch_mode": "games", "position_sizes": None, "device": "cpu"}
 MPS_MEMORY_EVERY = 100  # steps between the MPS memory log lines (T-055)
+# T-068: the updates of a process before its one `(warm)` MPS memory line, utils/mem_guard.py's driver baseline (an
+# eval row before the first update of a process is cold)
+MPS_WARM_UPDATES = 100
 # T-067: the LR schedule keyed to GAMES READ (lr_at): linear warmup over LR_WARMUP updates, then one cosine from
 # LR_PEAK to LR_FLOOR over LR_CYCLES passes of LR_CYCLE_GAMES games, held at LR_FLOOR after. total_steps is only the
 # stop point. Every value is in the run identity (config["lr_schedule"]).
@@ -545,11 +549,50 @@ def migration_staging(run_dir: str) -> str:
 def restore_sigint() -> bool:
     """Python's KeyboardInterrupt handler for SIGINT when the process started with SIGINT ignored, as every background
     job of a non-interactive shell does (a script's `cmd &`, nohup inside one): the stop signal of pause_timer and
-    utils/mem_guard.py must reach the trainer's stop path (a checkpoint, then the stop; T-068). True if it was ignored."""
+    utils/mem_guard.py must reach the trainer's stop path (a checkpoint, then the stop; T-068). With it, startup stops
+    on a SIGINT and the training loop takes SigintStop (which leaves an ignored SIGINT ignored). True if it was
+    ignored."""
     if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
         return False
     signal.signal(signal.SIGINT, signal.default_int_handler)
     return True
+
+
+class SigintStop:
+    """The SIGINT handler of the training loop (T-068): a SIGINT only requests a stop, which the loop takes at the next
+    step boundary (check(): after a step's commit and log, and after an eval / save) by raising KeyboardInterrupt
+    there, so the stop path (`STOP at step k: KeyboardInterrupt`, a checkpoint, the re-raise) always saves a whole
+    update; a KeyboardInterrupt inside an optimizer update saves none, and up to save_every updates were lost. A
+    second SIGINT while the stop is pending raises KeyboardInterrupt at once (the escape hatch: an interrupt anywhere,
+    as before T-068). install() takes SIGINT only in the main thread and over a Python-level handler that does not
+    ignore it; restore() puts the previous handler back."""
+
+    def __init__(self):
+        self.requested = False
+        self.previous = None  # the handler install() replaced; None when it did not install
+
+    def __call__(self, signum, frame):
+        if self.requested:
+            raise KeyboardInterrupt("a second SIGINT while a stop was pending")
+        self.requested = True  # nothing else here: the handler runs between any two bytecodes (a log write included)
+
+    def install(self) -> "SigintStop":
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.getsignal(signal.SIGINT)
+            if previous not in (signal.SIG_IGN, None):  # None: a handler not set from Python, which cannot be restored
+                self.previous = previous
+                signal.signal(signal.SIGINT, self)
+        return self
+
+    def restore(self):
+        if self.previous is not None:
+            signal.signal(signal.SIGINT, self.previous)
+            self.previous = None
+
+    def check(self, step: int):
+        """At a step boundary: the requested stop, as a KeyboardInterrupt."""
+        if self.requested:
+            raise KeyboardInterrupt(f"SIGINT: the stop requested, taken at the step boundary of step {step}")
 
 
 def refuse_interrupted_migration(run_dir: str):
@@ -829,7 +872,9 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
 
     def log_mps_memory(when: str = ""):
         """One MPS memory sample. when: "" for the every-MPS_MEMORY_EVERY-steps line (before that step's eval / save),
-        " (post-eval/save)" right after an eval or a save, " (final)" after the last save of the run (T-056)."""
+        " (post-eval/save)" right after an eval or a save, " (final)" after the last save of the run (T-056),
+        " (warm)" once, after the MPS_WARM_UPDATES-th update of this process (before that step's eval / save; T-068:
+        mem_guard's driver baseline)."""
         if device.type == "mps":
             log(f"mps memory at step {current_step}{when}: driver {torch.mps.driver_allocated_memory() / 2**20:.0f} "
                 f"MB, current {torch.mps.current_allocated_memory() / 2**20:.0f} MB")
@@ -919,14 +964,17 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     batches_without_update = 0
     consistent = True  # False from optimizer.step() until the step count, RNG snapshot and train sums match the update
     step_rng = None  # positions mode: the RNG state before the forward of a step not committed yet
+    updates_here = 0  # the updates of this process (MPS_WARM_UPDATES)
     if probe is not None:
         probe.mark("init", step=current_step)
+    stop = SigintStop().install()  # T-068: a SIGINT stops the loop at the next step boundary
     try:
         if is_eval_step(current_step) and not any(r["step"] == current_step for r in rows):
             evaluate()  # row 0 of a fresh run, or the row a stop / kill lost after its checkpoint
             after_eval_save()
         consumed = []  # the files of the batches drawn since the last update, in order (a no-sample batch included)
         while current_step < total_steps:
+            stop.check(current_step)  # a boundary: after the last step's eval / save (or the resume's first row)
             if stop_after_step is not None and current_step >= stop_after_step:
                 break  # at the top of the loop: the last update, its eval row and its save are done
             if probe is not None:
@@ -1037,12 +1085,16 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results)
                 + f" | lr {last_update['lr']!r} games {last_update['games']}" + trace)
             consumed = []
+            updates_here += 1
             if current_step % MPS_MEMORY_EVERY == 0:
                 log_mps_memory()
+            if updates_here == MPS_WARM_UPDATES:
+                log_mps_memory(" (warm)")
             if probe is not None:
                 probe.mark("log")
             if window is not None:
                 window.step_end(current_step)
+            stop.check(current_step)  # a boundary: the update is committed and logged, its eval / save not run
 
             if is_eval_step(current_step):
                 evaluate() if window is None else window.timed("eval", current_step, evaluate)
@@ -1068,6 +1120,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         else:
             log("no checkpoint: the stop came inside an optimizer update")
         raise
+    finally:
+        stop.restore()
     log_mps_memory(" (final)")
     phase_stop()
     log("Training completed.")

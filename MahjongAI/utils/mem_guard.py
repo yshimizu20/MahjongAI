@@ -5,14 +5,18 @@
 
 Every EVERY_S seconds the guard reads the swap used (`sysctl vm.swapusage`) and the `mps memory ... driver <N> MB`
 lines the trainer appended to train.log since the guard started (phase_timing.MPS_MEMORY_RE). It sends SIGINT to the
-trainer (which saves a checkpoint and stops; a resume is the same command, a fresh process) ONCE, when
+trainer (which stops at the next step boundary with a checkpoint; a resume is the same command, a fresh process) ONCE,
+when
   swap    swap used > its value at the guard's start + SWAP_LIMIT_MB, or
-  driver  the latest driver MB > the first post-eval driver MB + DRIVER_LIMIT_MB.
-The driver baseline is the first `(post-eval/save)` line of a step > 0: the row-0 line of a fresh run comes before any
-update (~8 MB against ~8.9 GB in training), so no baseline and no driver trigger exist before it. Start the guard
-right after the trainer: lines logged before the guard starts are not read (train.log keeps every earlier process).
-One line per check on stdout (the readings, the limits and the decision); the guard exits when the pid is gone. MB:
-2**20 bytes, as the trainer's log and sysctl print them.
+  driver  the latest driver MB (a line of any kind) > the warm driver MB + DRIVER_LIMIT_MB.
+The warm baseline is the trainer's `(warm)` line, logged once per process after its MPS_WARM_UPDATES-th update (100):
+an eval row logged before any update of the process (row 0 of a fresh run; the row a resume recomputes) is cold (~8 MB
+against ~8.9 GB in training), so no baseline and no driver trigger exist before the warm line; until then (<= 100
+updates) only the swap trigger applies. Start the guard right after the trainer: lines logged before the guard starts
+are not read (train.log keeps every earlier process), so a guard started after the warm line has no driver trigger.
+The pid must be > 0 (os.kill of 0 or a negative pid signals a process group, -1 every process). One line per check
+on stdout (the readings, the limits and the decision); the guard exits when the pid is gone. MB: 2**20 bytes, as the
+trainer's log and sysctl print them.
 """
 import argparse
 import os
@@ -26,8 +30,8 @@ from MahjongAI.utils.phase_timing import MPS_MEMORY_RE
 
 EVERY_S = 60
 SWAP_LIMIT_MB = 1024  # 1 GB over the start value
-DRIVER_LIMIT_MB = 1536  # 1.5 GB over the first post-eval value
-POST_EVAL = "(post-eval/save)"
+DRIVER_LIMIT_MB = 1536  # 1.5 GB over the warm value
+WARM = "(warm)"  # supervised_learning: after the MPS_WARM_UPDATES-th update of the process
 SWAP_RE = re.compile(r"used = (?P<value>\d+(?:\.\d+)?)(?P<unit>[MG])")
 
 
@@ -82,7 +86,7 @@ class MemGuard:
     def observe(self, swap_used: float, new_lines) -> tuple:
         """(status line, fire): fire is True only on the first check where a limit is crossed."""
         for step, when, mb in driver_readings(new_lines):
-            if self.driver_base is None and when == POST_EVAL and step > 0:
+            if self.driver_base is None and when == WARM:
                 self.driver_base = mb
             self.driver_now = mb
         swap_up = swap_used - self.swap_start
@@ -96,7 +100,7 @@ class MemGuard:
             self.fired = "; ".join(reasons)
         base = "-" if self.driver_base is None else f"{self.driver_base}, {self.driver_now - self.driver_base:+d}"
         driver = ("driver -" if self.driver_now is None
-                  else f"driver {self.driver_now} MB (post-eval base {base} / limit +{self.driver_limit:.0f})")
+                  else f"driver {self.driver_now} MB (warm base {base} / limit +{self.driver_limit:.0f})")
         decision = (f"SIGINT ({self.fired})" if fire else f"already sent SIGINT ({self.fired}): waiting for the exit"
                     if self.fired else "ok")
         return (f"swap used {swap_used:.0f} MB (start {self.swap_start:.0f}, {swap_up:+.0f} / limit "
@@ -113,6 +117,14 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def check_pid(pid) -> int:
+    """The trainer's pid, an int > 0: os.kill(0, ...) signals the guard's own process group, os.kill(-1, ...) every
+    process the user owns, os.kill(-n, ...) process group n."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError(f"pid {pid!r}: the trainer's pid must be an integer > 0")
+    return pid
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -120,10 +132,12 @@ def now_text() -> str:
 def run(pid: int, tail, read_swap=read_swap_used, alive=pid_alive, send=os.kill, sleep=time.sleep, now=now_text,
         out=print, every: float = EVERY_S) -> MemGuard:
     """The guard loop: a check right away, then every `every` s, until the pid is gone. Every reader, the signal, the
-    clock and the sleep are arguments (the self-test drives them)."""
+    clock and the sleep are arguments (the self-test drives them). A pid <= 0 is refused before any reading or
+    signal."""
+    check_pid(pid)
     guard = MemGuard(read_swap())
     out(f"[{now()}] mem_guard: pid {pid}, swap used at start {guard.swap_start:.0f} MB, limits swap "
-        f"+{guard.swap_limit:.0f} MB, driver +{guard.driver_limit:.0f} MB over the first post-eval value; every "
+        f"+{guard.swap_limit:.0f} MB, driver +{guard.driver_limit:.0f} MB over the warm value; every "
         f"{every:g} s", flush=True)
     while alive(pid):
         line, fire = guard.observe(read_swap(), tail())
@@ -163,18 +177,31 @@ def _drive(swaps: list, logs: list) -> tuple:
 
 
 def self_test():
-    """No signal when flat (and at the limits, and on a row-0 line far below training); exactly one SIGINT for each
-    trigger, however long it stays crossed; swap output and log tails parse."""
+    """No signal when flat (and at the limits, and on a cold eval line far below training: row 0 of a fresh run, the
+    row a resume recomputes before its first update); the warm line is the baseline; exactly one SIGINT for each
+    trigger, however long it stays crossed; before the warm line only the swap trigger; a pid <= 0 is refused with
+    nothing sent; swap output and log tails parse."""
     assert parse_swap_used("vm.swapusage: total = 10240.00M  used = 9602.19M  free = 637.81M  (encrypted)") == 9602.19
     assert parse_swap_used("vm.swapusage: total = 2.00G  used = 1.50G  free = 0.50G") == 1536.0
-    training = [[_mps(0, 8, " (post-eval/save)")], [_mps(100, 8952)], [_mps(5000, 8862, " (post-eval/save)")],
-                [], [_mps(5100, 8964), "[t] step 5100 | loss"]]
+    training = [[_mps(0, 8, " (post-eval/save)")], [_mps(100, 8952), _mps(100, 8950, " (warm)")],
+                [_mps(5000, 8862, " (post-eval/save)")], [], [_mps(5100, 8964), "[t] step 5100 | loss"]]
     sent, lines, guard = _drive([9000.0] * 6, training)
-    assert not sent and guard.driver_base == 8862 and guard.fired is None, (sent, lines)
+    assert not sent and guard.driver_base == 8950 and guard.fired is None, (sent, lines)
     assert all(line.endswith("| ok") for line in lines[1:-1]), lines
-    print("  flat: no signal (row-0 8 MB line is no baseline; driver +102 MB)")
+    print("  fresh start, flat: no signal (row-0 8 MB line is no baseline; warm base 8950, driver +14 MB)")
 
-    at_limits = training + [[_mps(5200, 8862 + DRIVER_LIMIT_MB)]]
+    # a resume from step_5000.pt whose row 5000 was lost: the row is recomputed before any update (a cold 30 MB line of
+    # a step > 0, the old baseline), then the warm line after the process's 100th update
+    resume = [[_mps(5000, 30, " (post-eval/save)")], [_mps(5100, 8900)], [_mps(5100, 8910, " (warm)")],
+              [_mps(5200, 8990)], [_mps(10000, 8870, " (post-eval/save)")]]
+    sent, lines, guard = _drive([9000.0] * 6, resume)
+    assert not sent and guard.driver_base == 8910, (sent, lines)
+    # the negative control: the first post-eval line of a step > 0 (the old baseline) would have stopped this run
+    old_base = next(mb for step, when, mb in driver_readings(resume[0]) if when == "(post-eval/save)" and step > 0)
+    assert 8900 - old_base > DRIVER_LIMIT_MB, "the cold row must be a false stop under the old baseline"
+    print(f"  resume with a lost eval row: no signal (cold {old_base} MB line is no baseline; warm base 8910)")
+
+    at_limits = training + [[_mps(5200, 8950 + DRIVER_LIMIT_MB)]]
     sent, _, _ = _drive([9000.0] * 6 + [9000.0 + SWAP_LIMIT_MB], at_limits)
     assert not sent
     print("  at the limits exactly: no signal")
@@ -184,15 +211,31 @@ def self_test():
     assert "already sent SIGINT" in lines[5] and "already sent SIGINT" in lines[6] and "SIGINT sent" in lines[-1]
     print("  swap trigger: one SIGINT, none after")
 
-    driver_up = training + [[_mps(5200, 8862 + DRIVER_LIMIT_MB + 1)], [_mps(5300, 11000)]]
+    driver_up = training + [[_mps(5200, 8950 + DRIVER_LIMIT_MB + 1)], [_mps(5300, 11000)]]
     sent, lines, _ = _drive([9000.0] * 8, driver_up)
     assert sent == [(7, signal.SIGINT)] and f"driver +{DRIVER_LIMIT_MB + 1} MB > {DRIVER_LIMIT_MB}" in lines[6], lines
-    print("  driver trigger: one SIGINT, none after")
+    assert "warm base 8950" in lines[6], lines
+    print("  driver growth after the warm line: one SIGINT, none after")
 
-    no_base = [[_mps(0, 8, " (post-eval/save)")], [_mps(100, 8952)], [_mps(200, 12000)]]  # before any post-eval line
+    no_base = [[_mps(0, 8, " (post-eval/save)")], [_mps(50, 12000)], [_mps(5000, 12500, " (post-eval/save)")]]
     sent, _, guard = _drive([9000.0] * 4, no_base)
     assert not sent and guard.driver_base is None
-    print("  no post-eval baseline yet: no driver trigger")
+    sent, lines, guard = _drive([9000.0, 9000.0, 10100.0, 9000.0], no_base)
+    assert sent == [(7, signal.SIGINT)] and guard.driver_base is None and "swap +1100" in lines[2], lines
+    print("  no warm line yet: no driver trigger, the swap trigger still fires")
+
+    for pid in (0, -1, -7, True, None, 7.0):
+        calls = []
+        try:
+            run(pid, lambda: calls.append("tail") or [], read_swap=lambda: calls.append("swap") or 9000.0,
+                alive=lambda p: calls.append("alive") or False, send=lambda p, s: calls.append(("send", p, s)),
+                sleep=lambda s: None, now=lambda: "t", out=lambda line, flush=False: calls.append("out"))
+        except ValueError as e:
+            assert "must be an integer > 0" in str(e), e
+        else:
+            raise AssertionError(f"pid {pid!r} accepted")
+        assert calls == [], (pid, calls)
+    print("  pid 0, -1, -7, True, None, 7.0: refused before any reading or signal")
     print("mem_guard self-test OK")
 
 
@@ -206,5 +249,8 @@ if __name__ == "__main__":
     if args.test:
         self_test()
         raise SystemExit(0)
-    assert args.pid and args.log, "give the trainer's pid and its train.log"
+    if args.pid is None or args.log is None:
+        ap.error("give the trainer's pid and its train.log")
+    if args.pid <= 0:
+        ap.error(f"pid {args.pid}: must be > 0 (0 or a negative pid signals a process group, -1 every process)")
     run(args.pid, LogTail(args.log), every=args.every)

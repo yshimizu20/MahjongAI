@@ -21,6 +21,17 @@ def test_mem_guard_self_test():
     mem_guard.self_test()
 
 
+def test_mem_guard_cli_refuses_a_nonpositive_pid(tmp_path):
+    """os.kill(-1, SIGINT) signals every process of the user, 0 or -n a process group: the CLI exits 2 before any
+    reading (run() refuses them too: the self-test, with a mocked signal function)."""
+    import subprocess
+    import sys
+    for pid in ("0", "-1"):
+        done = subprocess.run([sys.executable, "-m", "MahjongAI.utils.mem_guard", "--", pid, str(tmp_path / "train.log")],
+                              capture_output=True, text=True)
+        assert done.returncode == 2 and f"pid {pid}: must be > 0" in done.stderr, (pid, done)
+
+
 def test_mem_guard_reads_only_complete_lines_appended_after_its_start(tmp_path):
     log = tmp_path / "train.log"
     log.write_text(mem_guard._mps(0, 8, " (post-eval/save)") + "\n")
