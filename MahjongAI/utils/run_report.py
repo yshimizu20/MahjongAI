@@ -81,13 +81,14 @@ def resamples(n_games: int) -> np.ndarray:
     return np.random.default_rng(BOOTSTRAP_SEED).integers(0, n_games, size=(BOOTSTRAP, n_games))
 
 
-def paired_delta(n: np.ndarray, gain: np.ndarray, idx: np.ndarray):
-    """Δ = Σ gain / Σ n, and the QUANTILE of Δ over the resamples `idx` (a resample with Σ n = 0 counts as Δ = 0)."""
+def paired_delta(n: np.ndarray, gain: np.ndarray, idx: np.ndarray, q: float = QUANTILE):
+    """Δ = Σ gain / Σ n, and the q quantile (default QUANTILE) of Δ over the resamples `idx` (a resample with Σ n = 0
+    counts as Δ = 0)."""
     total = n.sum()
     assert total > 0, "no samples"
     nb, gb = n[idx].sum(axis=1), gain[idx].sum(axis=1)
     db = np.divide(gb, nb, out=np.zeros_like(gb), where=nb > 0)
-    return gain.sum() / total, float(np.quantile(db, QUANTILE))
+    return gain.sum() / total, float(np.quantile(db, q))
 
 
 def gate_results(header: dict, rows: list) -> list:
