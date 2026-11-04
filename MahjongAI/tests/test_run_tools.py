@@ -1,12 +1,17 @@
 """T-068 run tools: the self-tests of utils/fit_gap.py, utils/compare_runs.py and utils/mem_guard.py, mem_guard's log
 tail on a real file, and fit_gap end to end on a 1-update fixture run (CPU): its val CE equals the logged row's, and a
 logged row changed by more than VAL_TOL raises."""
+import os
+
 import pytest
 
 from MahjongAI import supervised_learning as SL
 from MahjongAI.tests.test_positions_train import _run
 from MahjongAI.utils import compare_runs, fit_gap, mem_guard
 from MahjongAI.utils.phase_timing import CheckError
+
+# subprocesses import MahjongAI from the repo root (CI runs pytest from MahjongAI/tests)
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def test_fit_gap_self_test():
@@ -28,7 +33,7 @@ def test_mem_guard_cli_refuses_a_nonpositive_pid(tmp_path):
     import sys
     for pid in ("0", "-1"):
         done = subprocess.run([sys.executable, "-m", "MahjongAI.utils.mem_guard", "--", pid, str(tmp_path / "train.log")],
-                              capture_output=True, text=True)
+                              cwd=REPO, capture_output=True, text=True)
         assert done.returncode == 2 and f"pid {pid}: must be > 0" in done.stderr, (pid, done)
 
 
@@ -71,5 +76,5 @@ def test_a_trainer_started_as_a_background_job_still_stops_on_sigint():
              "signal.default_int_handler, SL.restore_sigint())")
     for cmd, expect in ((f"'{sys.executable}' -c '{probe}' & wait", "Handlers.SIG_IGN True True False"),
                         (f"'{sys.executable}' -c '{probe}'", "<built-in function default_int_handler> False True False")):
-        out = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True, check=True).stdout.strip()
+        out = subprocess.run(["/bin/sh", "-c", cmd], cwd=REPO, capture_output=True, text=True, check=True).stdout.strip()
         assert out == expect, (cmd, out)
