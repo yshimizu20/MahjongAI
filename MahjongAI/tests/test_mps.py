@@ -926,13 +926,14 @@ TRAIN_SIZES = {"during": 60, "discard": 200, "post": 60}
 
 
 @pytest.mark.parametrize("stop, samples", [
-    (None, [(0, " (post-eval/save)"), (2, ""), (4, ""), (5, " (post-eval/save)"), (5, " (final)")]),
-    (3, [(0, " (post-eval/save)"), (2, ""), (3, " (final)")]),  # --stop-after-step: after the stop checkpoint
+    (None, [(0, " (post-eval/save)"), (2, ""), (3, " (warm)"), (4, ""), (5, " (post-eval/save)"), (5, " (final)")]),
+    (3, [(0, " (post-eval/save)"), (2, ""), (3, " (warm)"), (3, " (final)")]),  # --stop-after-step: after the stop
 ])
 def test_the_mps_memory_line(tmp_path, monkeypatch, train_data_root, stop, samples):
-    """The every-MPS_MEMORY_EVERY-steps line, a line after each eval / save (row 0 included) and a final line after
-    the last save of the run (T-056)."""
+    """The every-MPS_MEMORY_EVERY-steps line, a line after each eval / save (row 0 included), a final line after the
+    last save of the run (T-056) and one warm line after the MPS_WARM_UPDATES-th update of the process (T-068)."""
     monkeypatch.setattr(SL, "MPS_MEMORY_EVERY", 2)
+    monkeypatch.setattr(SL, "MPS_WARM_UPDATES", 3)
     _run(tmp_path, monkeypatch, train_data_root, "m", steps=5, save_every=5, sizes=TRAIN_SIZES, device="mps",
          stop_after_step=stop)
     lines = [ln for ln in open(tmp_path / "m.log") if "mps memory" in ln]

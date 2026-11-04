@@ -16,6 +16,9 @@ T5 migrate_lr_schedule: a steps_cosine run switched in a new run dir resumes wit
    migration's staging folder), refuses a new run dir migrated from another source (or from a source checkpoint
    changed since), and completes an interrupted migration from its snapshot after the source changed.
 T6 a corpus other than the recorded one is refused without --lr-cycle-games; with its sha recorded, the default runs.
+T7 (T-068) --lr-cycles N: the count is saved in lr_schedule.cycles (default LR_CYCLES), the logged horizon and every
+   update's LR follow cycles x cycle_games, a resume with the same N continues and one with another N (or none) is
+   refused; a steps_cosine run takes no --lr-cycles.
 Also: a steps_cosine run dir (no lr_schedule) resumes on its old formula.
 Negative controls (each must fail the test's check): the LR read from total_steps (T2, T3), g counted from the resume
 (T4 in test_positions_train, T5).
@@ -331,6 +334,8 @@ def test_a_steps_cosine_run_resumes_on_its_old_formula(tmp_path, monkeypatch, mo
     run = _copy_run(legacy, tmp_path, "old")
     with pytest.raises(AssertionError, match=r"step_6.pt is a steps_cosine run \(before T-067\): --lr-cycle-games"):
         _run(tmp_path, monkeypatch, module_data_root, "old")
+    with pytest.raises(AssertionError, match=r"steps_cosine run \(before T-067\): --lr-cycle-games and --lr-cycles"):
+        _run(tmp_path, monkeypatch, module_data_root, "old", lr_cycle_games=None, lr_cycles=1)  # T-068
     _run(tmp_path, monkeypatch, module_data_root, "old", lr_cycle_games=None)
     log = open(tmp_path / "old.log").read()
     assert "resuming at step 6;" in log and "LR schedule {'name': 'steps_cosine'}" in log
@@ -575,3 +580,41 @@ def test_an_interrupted_migration_completes_from_its_snapshot_after_the_source_c
     assert MIG.migrate(str(src), str(new), TEST_LR_CYCLE_GAMES) == "migrated the header"
     assert_migrated(new, legacy)
     assert MIG.migrate(str(src), str(new), TEST_LR_CYCLE_GAMES) == "already migrated: nothing to do"
+
+
+# ---------------------------------------------------------------- T7 (T-068): --lr-cycles
+def test_lr_cycles_sets_the_cosine_span():
+    default = SL.games_cosine_schedule("0" * 64, [], 100)
+    one = SL.games_cosine_schedule("0" * 64, [], 100, 1)
+    assert default["cycles"] == SL.LR_CYCLES == 2 and one == dict(default, cycles=1)
+    one = dict(one, warmup=0)
+    assert abs(SL.lr_at(50, 5, one) - (SL.LR_PEAK + SL.LR_FLOOR) / 2) < TOL  # the midpoint of 1 x 100 games
+    assert SL.lr_at(100, 5, one) == SL.LR_FLOOR < SL.lr_at(100, 5, dict(one, cycles=2))
+    for bad in (0, 1.0):
+        with pytest.raises(AssertionError, match="lr_cycles .*must be >= 1"):
+            SL.games_cosine_schedule("0" * 64, [], 100, bad)
+    from MahjongAI.tests.test_worker_sweep import _args
+    assert SL.run_header(_args(lr_cycles=1)).endswith("device mps), lr cycles 1, measure window 2,3")
+
+
+def test_a_one_cycle_run_ends_its_cosine_at_one_pass_and_keeps_its_count(tmp_path, monkeypatch, module_data_root):
+    """8 updates on --lr-cycles 1 (horizon 16 games): the header, the horizon log line and every update's LR follow
+    1 x TEST_LR_CYCLE_GAMES; the 2-cycle curve does not (an update between 16 and 32 games sits at the floor). A resume
+    with the same count continues; one with another count, or the default, is another run."""
+    schedule = dict(TEST_SCHEDULE, cycles=1)
+    with Observed(monkeypatch) as obs:
+        run = _run(tmp_path, monkeypatch, module_data_root, "c1", steps=8, lr_cycles=1)
+    header, _ = SL.Metrics(str(run / "metrics.jsonl")).read()
+    assert header["config"]["lr_schedule"] == schedule
+    assert f"(horizon {TEST_LR_CYCLE_GAMES:,} games)" in open(tmp_path / "c1.log").read()
+    assert len(obs.steps) == 8 and not lr_problems(obs.steps, schedule)
+    assert lr_problems(obs.steps, TEST_SCHEDULE), "the 1-cycle LR series equals the 2-cycle one"
+    lrs = {k: (lrs[0], g) for k, (lrs, g) in enumerate(obs.steps)}
+    assert any(k >= LR_WARMUP and TEST_LR_CYCLE_GAMES <= g < HORIZON and lr == SL.LR_FLOOR
+               for k, (lr, g) in lrs.items()), lrs
+    for other, text in ((2, "'cycles': 1.* -> .*'cycles': 2"), (None, "'cycles': 1.* -> .*'cycles': 2")):
+        with pytest.raises(AssertionError, match=rf"step_8.pt is from another run config: lr_schedule .*{text}"):
+            _run(tmp_path, monkeypatch, module_data_root, "c1", steps=9, lr_cycles=other)
+    _run(tmp_path, monkeypatch, module_data_root, "c1", steps=9, lr_cycles=1)
+    assert SL.find_latest_checkpoint(str(run / "checkpoints"))[0] == 9
+    assert torch.load(run / "checkpoints" / "step_9.pt", weights_only=True)["config"]["lr_schedule"] == schedule

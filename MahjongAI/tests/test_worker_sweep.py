@@ -103,7 +103,7 @@ def _args(**kw):
     base = dict(model_name="encoder_conv", max_steps=100, run_dir="runs/x", eval_every=50, save_every=50,
                 embd_size=64, n_layers=1, batch_mode="positions", device="mps", stop_after_step=None,
                 phase_timing=False, measure_window=(2, 3), profile=False, data_workers=None, data_prefetch=None,
-                torch_threads=None, lr_cycle_games=None)
+                torch_threads=None, lr_cycle_games=None, lr_cycles=None)
     return argparse.Namespace(**{**base, **kw})
 
 

@@ -15,11 +15,12 @@ a --stop-after-step stop at an earlier step keeps the schedule and adds a checkp
 row).
 
 LR schedule (T-067, games_cosine_v1): lr_at(g, k), keyed to the games read g, not to total_steps: a linear warmup over
-LR_WARMUP updates, then one cosine from LR_PEAK to LR_FLOOR over LR_CYCLES passes of the corpus (LR_CYCLE_GAMES games
-each; another corpus needs --lr-cycle-games), held at LR_FLOOR after. A pause, a resume or a longer total_steps never
-moves the curve. Each step log line has the LR its update applied and g (`lr <lr> games <g>`); each eval row has
-`games_read` and `lr` of its last update. A run dir written before T-067 resumes on its steps_cosine schedule (cosine
-to 0 at total_steps); python -m MahjongAI.migrate_lr_schedule switches one to games_cosine_v1 in a new run dir.
+LR_WARMUP updates, then one cosine from LR_PEAK to LR_FLOOR over LR_CYCLES passes of the corpus (--lr-cycles, T-068;
+LR_CYCLE_GAMES games each; another corpus needs --lr-cycle-games), held at LR_FLOOR after. A pause, a resume or a longer
+total_steps never moves the curve. Each step log line has the LR its update applied and g (`lr <lr> games <g>`); each
+eval row has `games_read` and `lr` of its last update. A run dir written before T-067 resumes on its steps_cosine
+schedule (cosine to 0 at total_steps); python -m MahjongAI.migrate_lr_schedule switches one to games_cosine_v1 in a
+new run dir.
 
 Run dir: train.log, metrics.jsonl (a header row, then one row per eval), checkpoints/step_<s>.pt. Starting again on
 the same run dir resumes from its latest checkpoint: the run config and the val ids must match (total_steps may
@@ -38,7 +39,9 @@ import os
 import pathlib
 import pstats
 import re
+import signal
 import subprocess
+import threading
 from datetime import datetime
 from typing import NamedTuple
 
@@ -106,6 +109,9 @@ DEVICES = ("cpu", "mps")
 # T-055: the run-identity keys of a config written before T-055 (2-game batches on the CPU)
 LEGACY_RUN = {"batch_mode": "games", "position_sizes": None, "device": "cpu"}
 MPS_MEMORY_EVERY = 100  # steps between the MPS memory log lines (T-055)
+# T-068: the updates of a process before its one `(warm)` MPS memory line, utils/mem_guard.py's driver baseline (an
+# eval row before the first update of a process is cold)
+MPS_WARM_UPDATES = 100
 # T-067: the LR schedule keyed to GAMES READ (lr_at): linear warmup over LR_WARMUP updates, then one cosine from
 # LR_PEAK to LR_FLOOR over LR_CYCLES passes of LR_CYCLE_GAMES games, held at LR_FLOOR after. total_steps is only the
 # stop point. Every value is in the run identity (config["lr_schedule"]).
@@ -115,7 +121,7 @@ LR_CYCLE_CORPUS = "fbe702b00b96e85df0df1bdd7b230c1f8067aae1fb95c5f0140d2118ed992
 # and its acceptance policy (that run's expected_skips, frozen here): the default count holds for both only
 LR_CYCLE_SKIPS = ["invalid:Against human", "invalid:Auto-played seat", "invalid:BYE", "invalid:Kansaki",
                   "invalid:Own-turn action after own discard", "invalid:Red tiles", "invalid:Three players"]
-LR_CYCLES = 2  # horizon: 450,352 games
+LR_CYCLES = 2  # horizon: 450,352 games; --lr-cycles N sets another count (T-068)
 LR_PEAK, LR_FLOOR = learning_rate, 1e-4
 LR_WARMUP = 1000  # updates
 # a config written before T-067 has no lr_schedule: the warmup + cosine to 0 at total_steps over updates (LambdaLR)
@@ -200,16 +206,19 @@ class ValSet:
         _check_tensor_skips(processor, "the validation set", files)
 
     @classmethod
-    def load(cls, log: RunLog) -> "ValSet":
+    def load(cls, log: RunLog, year: str = None, seed: int = None) -> "ValSet":
         """The first VAL_GAMES accepted games, parsed and built (VAL_BUILD) by a pool of PRIOR_WORKERS (0 = in the
-        trainer), closed on every exit of the read."""
+        trainer), closed on every exit of the read. year None: the validation set (VAL_YEAR, VAL_DAYS, VAL_SEED); a
+        year (utils/fit_gap.py, T-068): every day of it in the loader order of `seed`, built and scored alike."""
+        days, seed = (VAL_DAYS, VAL_SEED) if year is None else (None, seed)
+        year = VAL_YEAR if year is None else year
         workers = GameWorkers(PRIOR_WORKERS, VAL_BUILD, window=PRIOR_PREFETCH) if PRIOR_WORKERS else None
         try:
-            loader = DataLoader(str(DATA_ROOT / VAL_YEAR), 1, log, days=VAL_DAYS, seed=VAL_SEED,
+            loader = DataLoader(str(DATA_ROOT / year), 1, log, days=days, seed=seed,
                                 expected_skips=EXPECTED_SKIPS, logged_skips=LOGGED_SKIPS, workers=workers)
-            assert loader.file_list, f"no validation games for {VAL_YEAR} {VAL_DAYS}"
-            log(f"Validation: first {VAL_GAMES} accepted games of {len(loader.file_list)} files "
-                f"({VAL_YEAR} {VAL_DAYS[0]}..{VAL_DAYS[-1]}, seed {VAL_SEED})")
+            assert loader.file_list, f"no games for {year} {days}"
+            log(f"{'Validation' if days else 'Games'}: first {VAL_GAMES} accepted games of {len(loader.file_list)} "
+                f"files ({year}" + (f" {days[0]}..{days[-1]}" if days else "") + f", seed {seed})")
             games = [_next_game(loader) for _ in range(VAL_GAMES)]
             log(f"  {VAL_GAMES} games from {loader.current_index} files; skipped {dict(loader.skipped)}")
         finally:
@@ -427,17 +436,20 @@ def lr_at(g: int, k: int, schedule: dict) -> float:
     return schedule["floor"] + (schedule["peak"] - schedule["floor"]) * 0.5 * (1.0 + math.cos(math.pi * t))
 
 
-def games_cosine_schedule(train_sha256: str, expected_skips, lr_cycle_games: int = None) -> dict:
+def games_cosine_schedule(train_sha256: str, expected_skips, lr_cycle_games: int = None, lr_cycles: int = None) -> dict:
     """config["lr_schedule"] of a games_cosine_v1 run. lr_cycle_games None: LR_CYCLE_GAMES, which holds only for the
-    corpus it was counted on (LR_CYCLE_CORPUS under LR_CYCLE_SKIPS); another corpus needs --lr-cycle-games N."""
+    corpus it was counted on (LR_CYCLE_CORPUS under LR_CYCLE_SKIPS); another corpus needs --lr-cycle-games N.
+    lr_cycles None: LR_CYCLES (T-068, --lr-cycles N): the passes the cosine spans, horizon lr_cycles x cycle_games."""
     if lr_cycle_games is None:
         assert train_sha256 == LR_CYCLE_CORPUS and sorted(expected_skips) == LR_CYCLE_SKIPS, (
             f"train_files_sha256 {train_sha256} / expected_skips {sorted(expected_skips)} is not the corpus "
             f"LR_CYCLE_GAMES {LR_CYCLE_GAMES} was counted on ({LR_CYCLE_CORPUS}, {LR_CYCLE_SKIPS}): give "
             "--lr-cycle-games N, the games one pass of this corpus admits")
         lr_cycle_games = LR_CYCLE_GAMES
+    lr_cycles = LR_CYCLES if lr_cycles is None else lr_cycles
     assert isinstance(lr_cycle_games, int) and lr_cycle_games >= 1, f"lr_cycle_games {lr_cycle_games!r}: must be >= 1"
-    return {"name": LR_SCHEDULE, "cycle_games": lr_cycle_games, "cycles": LR_CYCLES, "peak": LR_PEAK,
+    assert isinstance(lr_cycles, int) and lr_cycles >= 1, f"lr_cycles {lr_cycles!r}: must be >= 1"
+    return {"name": LR_SCHEDULE, "cycle_games": lr_cycle_games, "cycles": lr_cycles, "peak": LR_PEAK,
             "floor": LR_FLOOR, "warmup": LR_WARMUP}
 
 
@@ -534,6 +546,55 @@ def migration_staging(run_dir: str) -> str:
     return os.path.normpath(run_dir) + ".migrating"
 
 
+def restore_sigint() -> bool:
+    """Python's KeyboardInterrupt handler for SIGINT when the process started with SIGINT ignored, as every background
+    job of a non-interactive shell does (a script's `cmd &`, nohup inside one): the stop signal of pause_timer and
+    utils/mem_guard.py must reach the trainer's stop path (a checkpoint, then the stop; T-068). With it, startup stops
+    on a SIGINT and the training loop takes SigintStop (which leaves an ignored SIGINT ignored). True if it was
+    ignored."""
+    if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+        return False
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    return True
+
+
+class SigintStop:
+    """The SIGINT handler of the training loop (T-068): a SIGINT only requests a stop, which the loop takes at the next
+    step boundary (check(): after a step's commit and log, and after an eval / save) by raising KeyboardInterrupt
+    there, so the stop path (`STOP at step k: KeyboardInterrupt`, a checkpoint, the re-raise) always saves a whole
+    update; a KeyboardInterrupt inside an optimizer update saves none, and up to save_every updates were lost. A
+    second SIGINT while the stop is pending raises KeyboardInterrupt at once (the escape hatch: an interrupt anywhere,
+    as before T-068). install() takes SIGINT only in the main thread and over a Python-level handler that does not
+    ignore it; restore() puts the previous handler back."""
+
+    def __init__(self):
+        self.requested = False
+        self.previous = None  # the handler install() replaced; None when it did not install
+
+    def __call__(self, signum, frame):
+        if self.requested:
+            raise KeyboardInterrupt("a second SIGINT while a stop was pending")
+        self.requested = True  # nothing else here: the handler runs between any two bytecodes (a log write included)
+
+    def install(self) -> "SigintStop":
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.getsignal(signal.SIGINT)
+            if previous not in (signal.SIG_IGN, None):  # None: a handler not set from Python, which cannot be restored
+                self.previous = previous
+                signal.signal(signal.SIGINT, self)
+        return self
+
+    def restore(self):
+        if self.previous is not None:
+            signal.signal(signal.SIGINT, self.previous)
+            self.previous = None
+
+    def check(self, step: int):
+        """At a step boundary: the requested stop, as a KeyboardInterrupt."""
+        if self.requested:
+            raise KeyboardInterrupt(f"SIGINT: the stop requested, taken at the step boundary of step {step}")
+
+
 def refuse_interrupted_migration(run_dir: str):
     """A start on a run dir without a checkpoint while its migration_staging folder exists would start a fresh run in
     place of the migrated one: refused before anything is written (the CLI and _train call it before creating the
@@ -548,7 +609,7 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
           n_layers: int = N_LAYERS, row0_tol: float = None, batch_mode: str = "games", position_sizes: dict = None,
           device: str = "cpu", stop_after_step: int = None, phase_timing: bool = False, measure_window: tuple = None,
           data_workers: int = None, data_prefetch: int = None, torch_threads: int = None,
-          lr_cycle_games: int = None):
+          lr_cycle_games: int = None, lr_cycles: int = None):
     """position_sizes: {head: step size N} of positions mode (default DEFAULT_SIZES): a step takes N discard rows and
     0, N or 2 N during / post rows (position_batcher.side_take); games mode takes none.
     stop_after_step: stop once this many updates are done (after that step's eval / save), with a checkpoint of that
@@ -569,7 +630,9 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     lr_cycle_games (T-067, --lr-cycle-games): the games of one pass, for a corpus other than LR_CYCLE_CORPUS (None: the
     recorded LR_CYCLE_GAMES, refused on another corpus); a run-identity key (config["lr_schedule"]). A run dir whose
     checkpoint has no lr_schedule resumes on its steps_cosine schedule (no lr_cycle_games); migrate_lr_schedule
-    switches one to games_cosine_v1 in a new run dir."""
+    switches one to games_cosine_v1 in a new run dir.
+    lr_cycles (T-068, --lr-cycles): the passes of the corpus the cosine spans (None: LR_CYCLES); a run-identity key
+    (config["lr_schedule"]["cycles"]): a resume needs the same count; a steps_cosine run takes none."""
     row0_tol = UNIFORM_ROW0_TOL if row0_tol is None else row0_tol
     assert batch_mode in BATCH_MODES and device in DEVICES, (batch_mode, device)
     if batch_mode == "positions":
@@ -580,14 +643,15 @@ def train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_eve
     assert batch_mode == "positions" or not phase_timing, "phase timing is a positions-mode setting"
     assert batch_mode == "positions" or measure_window is None, "the measure window is a positions-mode setting"
     for name, value in (("data_workers", data_workers), ("data_prefetch", data_prefetch),
-                        ("torch_threads", torch_threads), ("lr_cycle_games", lr_cycle_games)):
+                        ("torch_threads", torch_threads), ("lr_cycle_games", lr_cycle_games),
+                        ("lr_cycles", lr_cycles)):
         assert value is None or (isinstance(value, int) and value >= 1), f"{name} {value!r}: must be an integer >= 1"
     torch_threads = TORCH_THREADS if torch_threads is None else torch_threads
     workers = make_workers(timing=phase_timing or measure_window is not None, n=data_workers, prefetch=data_prefetch)
     try:
         _train(model_name, total_steps, run_dir, log, eval_every, save_every, expect_prior_ce, expect_shanten, workers,
                embd_size, n_layers, row0_tol, batch_mode, position_sizes, torch.device(device),
-               stop_after_step, phase_timing, measure_window, torch_threads, lr_cycle_games)
+               stop_after_step, phase_timing, measure_window, torch_threads, lr_cycle_games, lr_cycles)
     finally:  # every stop path: normal end, exception, KeyboardInterrupt
         if workers is not None:
             workers.close()
@@ -597,7 +661,7 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
            expect_prior_ce, expect_shanten, workers, embd_size: int, n_layers: int,
            row0_tol: float, batch_mode: str, position_sizes, device: torch.device,
            stop_after_step, phase_timing: bool = False, measure_window: tuple = None,
-           torch_threads: int = TORCH_THREADS, lr_cycle_games: int = None):
+           torch_threads: int = TORCH_THREADS, lr_cycle_games: int = None, lr_cycles: int = None):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     refuse_interrupted_migration(run_dir)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -636,12 +700,13 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     latest_step, latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
     checkpoint = torch.load(latest_checkpoint, map_location="cpu", weights_only=True) if latest_checkpoint else None
     if checkpoint is not None and with_legacy_run(checkpoint["config"])["lr_schedule"] == LEGACY_LR_SCHEDULE:
-        assert lr_cycle_games is None, (
-            f"{latest_checkpoint} is a steps_cosine run (before T-067): --lr-cycle-games is a {LR_SCHEDULE} setting; "
-            "resume it without, or switch it first with python -m MahjongAI.migrate_lr_schedule")
+        assert lr_cycle_games is None and lr_cycles is None, (
+            f"{latest_checkpoint} is a steps_cosine run (before T-067): --lr-cycle-games and --lr-cycles are "
+            f"{LR_SCHEDULE} settings; resume it without, or switch it first with python -m "
+            "MahjongAI.migrate_lr_schedule")
         lr_schedule = dict(LEGACY_LR_SCHEDULE)
     else:
-        lr_schedule = games_cosine_schedule(train_sha256, EXPECTED_SKIPS, lr_cycle_games)
+        lr_schedule = games_cosine_schedule(train_sha256, EXPECTED_SKIPS, lr_cycle_games, lr_cycles)
     scheduler = None  # games_cosine_v1: the LR is set right before each optimizer.step() (lr_at)
     if lr_schedule == LEGACY_LR_SCHEDULE:
         # a 300-step smoke must leave warmup; a 1,100-step run must not collapse
@@ -807,7 +872,9 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
 
     def log_mps_memory(when: str = ""):
         """One MPS memory sample. when: "" for the every-MPS_MEMORY_EVERY-steps line (before that step's eval / save),
-        " (post-eval/save)" right after an eval or a save, " (final)" after the last save of the run (T-056)."""
+        " (post-eval/save)" right after an eval or a save, " (final)" after the last save of the run (T-056),
+        " (warm)" once, after the MPS_WARM_UPDATES-th update of this process (before that step's eval / save; T-068:
+        mem_guard's driver baseline)."""
         if device.type == "mps":
             log(f"mps memory at step {current_step}{when}: driver {torch.mps.driver_allocated_memory() / 2**20:.0f} "
                 f"MB, current {torch.mps.current_allocated_memory() / 2**20:.0f} MB")
@@ -897,14 +964,17 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
     batches_without_update = 0
     consistent = True  # False from optimizer.step() until the step count, RNG snapshot and train sums match the update
     step_rng = None  # positions mode: the RNG state before the forward of a step not committed yet
+    updates_here = 0  # the updates of this process (MPS_WARM_UPDATES)
     if probe is not None:
         probe.mark("init", step=current_step)
+    stop = SigintStop().install()  # T-068: a SIGINT stops the loop at the next step boundary
     try:
         if is_eval_step(current_step) and not any(r["step"] == current_step for r in rows):
             evaluate()  # row 0 of a fresh run, or the row a stop / kill lost after its checkpoint
             after_eval_save()
         consumed = []  # the files of the batches drawn since the last update, in order (a no-sample batch included)
         while current_step < total_steps:
+            stop.check(current_step)  # a boundary: after the last step's eval / save (or the resume's first row)
             if stop_after_step is not None and current_step >= stop_after_step:
                 break  # at the top of the loop: the last update, its eval row and its save are done
             if probe is not None:
@@ -1015,12 +1085,16 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
             log(f"step {current_step} | " + " | ".join(f"{h} {results[h].loss.item():.4f}" for h in HEADS if h in results)
                 + f" | lr {last_update['lr']!r} games {last_update['games']}" + trace)
             consumed = []
+            updates_here += 1
             if current_step % MPS_MEMORY_EVERY == 0:
                 log_mps_memory()
+            if updates_here == MPS_WARM_UPDATES:
+                log_mps_memory(" (warm)")
             if probe is not None:
                 probe.mark("log")
             if window is not None:
                 window.step_end(current_step)
+            stop.check(current_step)  # a boundary: the update is committed and logged, its eval / save not run
 
             if is_eval_step(current_step):
                 evaluate() if window is None else window.timed("eval", current_step, evaluate)
@@ -1046,6 +1120,8 @@ def _train(model_name: str, total_steps: int, run_dir: str, log: RunLog, eval_ev
         else:
             log("no checkpoint: the stop came inside an optimizer update")
         raise
+    finally:
+        stop.restore()
     log_mps_memory(" (final)")
     phase_stop()
     log("Training completed.")
@@ -1081,6 +1157,7 @@ def run_header(args) -> str:
             f"{args.batch_mode}, device {args.device})"
             + (f", stop after step {args.stop_after_step}" if args.stop_after_step is not None else "")
             + (f", lr cycle games {args.lr_cycle_games}" if args.lr_cycle_games is not None else "")
+            + (f", lr cycles {args.lr_cycles}" if args.lr_cycles is not None else "")
             + (", phase timing" if args.phase_timing else "")
             + (f", measure window {args.measure_window[0]},{args.measure_window[1]}" if args.measure_window else "")
             + (f", data workers {DATA_WORKERS if args.data_workers is None else args.data_workers}, data prefetch "
@@ -1148,6 +1225,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr-cycle-games", type=positive_int, default=None, metavar="N",
                         help=f"games of one pass of the corpus, for the LR schedule (default {LR_CYCLE_GAMES:,}, only "
                              "on the corpus it was counted on; T-067); a run-identity key: a resume needs the same N")
+    parser.add_argument("--lr-cycles", type=positive_int, default=None, metavar="N",
+                        help=f"passes of the corpus the LR cosine spans (default {LR_CYCLES}; horizon N x the cycle "
+                             "games; T-068); a run-identity key: a resume needs the same N")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -1178,12 +1258,16 @@ if __name__ == "__main__":
     os.makedirs(run_dir, exist_ok=True)
     log = RunLog(os.path.join(run_dir, "train.log"))
     log(run_header(args))
+    if restore_sigint():
+        log("SIGINT was ignored (a background job of a non-interactive shell): restored; a SIGINT stops the run "
+            "with a checkpoint")
 
     def _run():
         train(args.model_name, args.max_steps, run_dir, log, args.eval_every, args.save_every,
               args.expect_prior_ce, args.expect_shanten, args.embd_size, args.n_layers, args.row0_tol,
               args.batch_mode, args.position_sizes, args.device, args.stop_after_step, args.phase_timing,
-              args.measure_window, args.data_workers, args.data_prefetch, args.torch_threads, args.lr_cycle_games)
+              args.measure_window, args.data_workers, args.data_prefetch, args.torch_threads, args.lr_cycle_games,
+              args.lr_cycles)
 
     if args.profile:
         pr = cProfile.Profile()

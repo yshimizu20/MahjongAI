@@ -13,6 +13,10 @@ Stop bound (T-056): --stop-after-step stops after update K with a checkpoint of 
 and no worker left; the resume ends equal to the unbroken run. T-067 (T4): K is past the LR warmup, inside the cosine
 over games read; the resume's LR series (step lines), counters, sample identities, RNG and weights are exact, and a
 resume that counts g from the checkpoint (the negative control) fails the comparison.
+SIGINT (T-068): a SIGINT inside an optimizer update, or inside an eval, stops the run at the next step boundary with
+a checkpoint of that step, and the resume ends equal to the unbroken run (LR series, counters, rows, weights); a second
+SIGINT while that stop is pending interrupts at once (no checkpoint inside the update, as an interrupt did before; the
+same injection without the deferred handler is the negative control).
 Counters: every eval row's per-source-epoch counters (games, rows in / out per head) equal an independent reference
 over the trainer's loader order (prepare_batches per game, the plain-Python emit rule).
 Identity: batch mode, sizes and device are run-identity keys; a config without them reads as games mode on the CPU."""
@@ -21,10 +25,13 @@ import multiprocessing
 import os
 import re
 import shutil
+import signal
 import sys
+import time
 
 import pytest
 import torch
+from torch.optim.optimizer import register_optimizer_step_pre_hook
 
 from MahjongAI import supervised_learning as SL
 from MahjongAI.agents.encoder_conv import TransformerTensorProcessor
@@ -329,6 +336,145 @@ def test_an_interrupt_after_the_commit_never_saves_a_half_finished_update(tmp_pa
     _run(tmp_path, monkeypatch, module_data_root, "b")
     assert "resuming at step 4;" in open(tmp_path / "b.log").read()
     assert_runs_equal(unbroken, tmp_path / "b", (8, 12))
+
+
+# ---------------------------------------------------------------- SIGINT: a stop at the step boundary (T-068)
+
+
+@pytest.fixture
+def sigint_default():
+    """SIGINT on Python's KeyboardInterrupt handler for the test, as the CLI's restore_sigint leaves it (an xdist
+    worker may start with another one); the previous handler back after."""
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    yield
+    signal.signal(signal.SIGINT, previous)
+
+
+def send_sigint():
+    """A real SIGINT to this process, then a wait (<= 5 s) until its Python handler has run: the trainer's SigintStop
+    records the request; the default handler raises KeyboardInterrupt from inside the wait."""
+    handler = signal.getsignal(signal.SIGINT)
+    seen = getattr(handler, "requested", False)
+    os.kill(os.getpid(), signal.SIGINT)
+    deadline = time.monotonic() + 5
+    while getattr(handler, "requested", False) == seen:  # the loop's backward jumps run the pending handler
+        assert time.monotonic() < deadline, "the SIGINT handler did not run"
+
+
+class SigintInUpdate:
+    """`signals` SIGINTs from inside the trainer's n-th optimizer.step() call (a global step pre-hook: after the
+    update's LR is set, before the weights change), the window in which a KeyboardInterrupt saves no checkpoint. Only
+    the trainer's AdamW counts (the prior fit steps an LBFGS before it)."""
+
+    def __init__(self, n: int, signals: int = 1):
+        self.n, self.signals, self.calls, self.sent = n, signals, 0, 0
+
+    def __enter__(self):
+        self.handle = register_optimizer_step_pre_hook(self._hook)
+        return self
+
+    def __exit__(self, *exc):
+        self.handle.remove()
+
+    def _hook(self, optimizer, args, kwargs):
+        if not isinstance(optimizer, torch.optim.AdamW):
+            return
+        self.calls += 1
+        if self.calls == self.n:
+            for _ in range(self.signals):
+                self.sent += 1
+                send_sigint()
+
+
+def assert_equal_through(a, b, step):
+    """b's rows, step lines (LR and games read included) and step_<step>.pt equal the unbroken run a's, up to `step`."""
+    rows_a = [r for r in SL.Metrics(str(a / "metrics.jsonl")).read()[1] if r["step"] <= step]
+    _assert_equal(rows_a, SL.Metrics(str(b / "metrics.jsonl")).read()[1], "rows")
+    lines_a = {k: v for k, v in step_lines(run_log(a)).items() if k <= step}
+    assert sorted(lines_a) == list(range(1, step + 1)) and step_lines(run_log(b)) == lines_a
+    _assert_equal(torch.load(a / "checkpoints" / f"step_{step}.pt", weights_only=True),
+                  torch.load(b / "checkpoints" / f"step_{step}.pt", weights_only=True), f"step_{step}.pt")
+
+
+def test_the_sigint_stop_handler(sigint_default):
+    """install() takes SIGINT over the default handler; the first SIGINT only records the request, check() raises it
+    at a boundary, a second SIGINT raises at once; restore() puts the default back. An ignored SIGINT stays ignored."""
+    stop = SL.SigintStop()
+    assert stop.install() is stop and signal.getsignal(signal.SIGINT) is stop
+    stop.check(3)  # nothing requested: no stop
+    send_sigint()
+    assert stop.requested
+    with pytest.raises(KeyboardInterrupt, match="step boundary of step 4"):
+        stop.check(4)
+    with pytest.raises(KeyboardInterrupt, match="a second SIGINT while a stop was pending"):
+        send_sigint()
+    stop.restore()
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ignored = SL.SigintStop().install()
+    assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN and ignored.previous is None
+    ignored.restore()
+    assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+
+
+def test_a_sigint_inside_an_update_stops_at_that_step_and_resumes_to_the_unbroken_run(
+        tmp_path, monkeypatch, module_data_root, unbroken, sigint_default):
+    """A SIGINT inside update 7's optimizer.step(): the update finishes, the run stops after its commit and log with
+    step_7.pt (not an eval or save step); the resume (3 updates, to --stop-after-step 10) ends equal to the unbroken
+    run: LR series and games read (step lines), rows with their counters, step_10.pt (weights, optimizer, RNG)."""
+    with SigintInUpdate(7) as sigint:
+        with pytest.raises(KeyboardInterrupt, match="step boundary of step 7"):
+            _run(tmp_path, monkeypatch, module_data_root, "b")
+    assert sigint.sent == 1 and signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    log = open(tmp_path / "b.log").read()
+    assert "STOP at step 7: KeyboardInterrupt: SIGINT: the stop requested" in log and "no checkpoint" not in log
+    assert sorted(os.listdir(tmp_path / "b" / "checkpoints")) == ["step_4.pt", "step_7.pt"]
+    assert sorted(step_lines(tmp_path / "b.log")) == list(range(1, 8))
+    _run(tmp_path, monkeypatch, module_data_root, "b", stop_after_step=10)
+    assert "resuming at step 7;" in open(tmp_path / "b.log").read()
+    assert_equal_through(unbroken, tmp_path / "b", 10)
+
+
+def test_a_sigint_inside_an_eval_stops_after_the_row_and_resumes_to_the_unbroken_run(
+        tmp_path, monkeypatch, module_data_root, unbroken, sigint_default):
+    """A SIGINT inside row 5's validation pass: row 5 is written, the run stops right after it with step_5.pt (not a
+    save step); the resume keeps row 5 and ends equal to the unbroken run at --stop-after-step 10."""
+    evaluate, calls = SL.ValSet.evaluate, [0]
+
+    def evaluate_with_sigint(self, model):
+        calls[0] += 1
+        if calls[0] == 2:  # rows 0, 5
+            send_sigint()
+        return evaluate(self, model)
+
+    with monkeypatch.context() as m:
+        m.setattr(SL.ValSet, "evaluate", evaluate_with_sigint)
+        with pytest.raises(KeyboardInterrupt, match="step boundary of step 5"):
+            _run(tmp_path, monkeypatch, module_data_root, "b")
+    assert "STOP at step 5: KeyboardInterrupt: SIGINT" in open(tmp_path / "b.log").read()
+    assert [r["step"] for r in SL.Metrics(str(tmp_path / "b" / "metrics.jsonl")).read()[1]] == [0, 5]
+    assert sorted(os.listdir(tmp_path / "b" / "checkpoints")) == ["step_4.pt", "step_5.pt"]
+    _run(tmp_path, monkeypatch, module_data_root, "b", stop_after_step=10)
+    assert "resuming at step 5;" in open(tmp_path / "b.log").read()
+    assert_equal_through(unbroken, tmp_path / "b", 10)
+
+
+@pytest.mark.parametrize("case", ["second_sigint", "no_deferral"])
+def test_an_interrupt_inside_an_update_saves_no_checkpoint(tmp_path, monkeypatch, module_data_root, sigint_default,
+                                                           case):
+    """second_sigint: two SIGINTs inside update 2's optimizer.step(): the second interrupts at once (the escape hatch),
+    inside the update, so no checkpoint. no_deferral (the negative control of the tests above): one SIGINT with the
+    handler of before T-068 (SigintStop not installed) interrupts inside the update, so the injection lands where a
+    stop saves nothing."""
+    if case == "no_deferral":
+        monkeypatch.setattr(SL.SigintStop, "install", lambda self: self)
+    with SigintInUpdate(2, signals=2 if case == "second_sigint" else 1) as sigint:
+        with pytest.raises(KeyboardInterrupt, match="a second SIGINT" if case == "second_sigint" else None):
+            _run(tmp_path, monkeypatch, module_data_root, "b")
+    assert sigint.sent == (2 if case == "second_sigint" else 1)
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    assert "no checkpoint: the stop came inside an optimizer update" in open(tmp_path / "b.log").read()
+    assert os.listdir(tmp_path / "b" / "checkpoints") == [] and sorted(step_lines(tmp_path / "b.log")) == [1]
 
 
 @pytest.mark.parametrize("where", ["after_the_row_append", "inside_the_peak_reset"])
